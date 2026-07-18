@@ -2241,7 +2241,6 @@ class GRPOTrainer(_BaseTrainer):
         agg_prompt_lengths = self.accelerator.gather(prompt_lengths)
         agg_completion_lengths = self.accelerator.gather(completion_lengths)
         total_prompt_tokens = agg_prompt_lengths.sum()
-        total_completion_tokens = agg_completion_lengths.sum()  # = num_items_in_batch, required for the DAPO loss
 
         # Identify sequences that terminated with EOS and log their lengths
         eos_and_pad = [self._tokenizer.eos_token_id, self._tokenizer.pad_token_id]
@@ -2261,15 +2260,9 @@ class GRPOTrainer(_BaseTrainer):
         self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
         self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
 
-        # When truncated completions are masked, they contribute neither tokens nor loss. Keep them
-        # out of DAPO's active-token denominator as well; otherwise the surviving completions are
-        # silently down-weighted by masked tokens.
-        if self.mask_truncated_completions:
-            total_completion_tokens = agg_completion_lengths[~agg_is_truncated].sum().clamp(min=1)
-
         # Log the metrics
         if mode == "train":
-            self.state.num_input_tokens_seen += (total_prompt_tokens + total_completion_tokens).item()
+            self.state.num_input_tokens_seen += (total_prompt_tokens + agg_completion_lengths.sum()).item()
         self._metrics[mode]["num_tokens"] = [self.state.num_input_tokens_seen]
 
         # Log completion lengths, mean, min, max
@@ -2287,17 +2280,7 @@ class GRPOTrainer(_BaseTrainer):
             )
             self._metrics[mode]["tools/failure_frequency"].append(failure_frequency)
 
-        return (
-            prompt_ids,
-            completion_ids,
-            tool_mask,
-            completions,
-            total_completion_tokens,
-            logprobs,
-            extra_fields,
-            images,
-            tool_images,
-        )
+        return prompt_ids, completion_ids, tool_mask, completions, logprobs, extra_fields, images, tool_images
 
     def _enforce_vllm_policy_parity(self, mode: str, mean_delta: float, token_count: int) -> None:
         """Fail the first training rollout when vLLM and the actor are not the same policy."""
@@ -2413,7 +2396,6 @@ class GRPOTrainer(_BaseTrainer):
             completion_ids_list,
             tool_mask_list,
             completions,
-            num_items_in_batch,
             sampling_per_token_logps_list,
             extra_fields,
             images,
@@ -2495,6 +2477,9 @@ class GRPOTrainer(_BaseTrainer):
             # Also mask tool_mask for consistency in multi-turn training
             if tool_mask is not None:
                 tool_mask = tool_mask * (~is_truncated).unsqueeze(1).int()
+
+        loss_mask = completion_mask if tool_mask is None else completion_mask * tool_mask
+        num_items_in_batch = self.accelerator.gather(loss_mask.sum()).sum()
 
         # Concatenate prompt_mask with completion_mask for logit computation
         prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # (B, P+C)
@@ -3313,7 +3298,7 @@ class GRPOTrainer(_BaseTrainer):
             policy_loss = loss.detach()
             loss = loss / normalizer
         elif self.loss_type in ["cispo", "dapo", "vespo"]:
-            normalizer = inputs["num_items_in_batch"] / self.accelerator.num_processes
+            normalizer = inputs["num_items_in_batch"].clamp(min=1.0) / self.accelerator.num_processes
             loss = (per_token_loss * mask).sum() / normalizer
             policy_loss = loss.detach()
         elif self.loss_type == "luspo":
