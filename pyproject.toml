@@ -30,7 +30,10 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "accelerate>=1.4.0",
-    "datasets>=4.7.0",  # Support Json type and on_mixed_types="use_json"
+    # 4.7's Json dtype is useful for dataset-authoring scripts, but the trainer
+    # runtime remains compatible with 4.6.1. Keep the upper bound aligned with
+    # Verifiers so TRL can consume native rollout traces in one environment.
+    "datasets>=4.6.1,<4.7.0",
     "jinja2",
     "packaging>20.0",
     "transformers>=4.56.2",
