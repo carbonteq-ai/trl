@@ -286,12 +286,14 @@ class TestGRPOTrainer(TrlTestCase):
             vllm_speculative_config=speculative,
             vllm_engine_kwargs={"skip_mm_profiling": True},
             vllm_weight_name_prefix="language_model.",
+            vllm_weight_sync_mode="full",
             report_to="none",
         )
 
         assert config.vllm_speculative_config == speculative
         assert config.vllm_engine_kwargs == {"skip_mm_profiling": True}
         assert config.vllm_weight_name_prefix == "language_model."
+        assert config.vllm_weight_sync_mode == "full"
 
     def test_init_minimal(self):
         # Test that GRPOTrainer can be instantiated with only model, reward_model and train_dataset

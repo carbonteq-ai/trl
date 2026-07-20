@@ -17,6 +17,7 @@
 import logging
 import math
 import os
+import tempfile
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
@@ -41,6 +42,7 @@ from .vllm_client import VLLMClient
 
 if is_vllm_available():
     from vllm import LLM, RequestOutput, SamplingParams
+    from vllm.lora.request import LoRARequest
     from vllm.sampling_params import StructuredOutputsParams
 
 
@@ -180,6 +182,11 @@ class VLLMGeneration:
         weight_name_prefix (`str`, *optional*):
             Prefix added to parameter names before weight synchronization. Use this when the vLLM model keeps a
             composite-model namespace around the text model while the training model exposes the text model directly.
+        weight_sync_mode (`str`, *optional*, defaults to `"full"`):
+            How colocated vLLM receives current policy weights. `"full"` merges PEFT adapters and synchronizes model
+            parameters. `"lora"` keeps vLLM's base weights unchanged and reloads the active PEFT LoRA adapter through
+            vLLM's native dynamic-LoRA path. The latter avoids copying packed 4-bit parameter storage into vLLM and
+            is supported only for PEFT LoRA models in colocated mode.
         model_impl (`str`, *optional*, defaults to `"auto"`):
             Model implementation to use for vLLM.
             - "auto" will try to use the vLLM implementation, if it exists, and fall back to the Transformers
@@ -253,6 +260,7 @@ class VLLMGeneration:
         speculative_config: dict | None = None,
         engine_kwargs: dict | None = None,
         weight_name_prefix: str | None = None,
+        weight_sync_mode: str = "full",
         model_impl: str = "auto",
         trust_remote_code: bool = False,
         # Generation configuration
@@ -292,6 +300,18 @@ class VLLMGeneration:
         if weight_name_prefix is not None and (not weight_name_prefix or not weight_name_prefix.endswith(".")):
             raise ValueError("weight_name_prefix must be a non-empty module prefix ending with `.`")
         self.weight_name_prefix = weight_name_prefix
+        if weight_sync_mode not in {"full", "lora"}:
+            raise ValueError("weight_sync_mode must be either `full` or `lora`")
+        if weight_sync_mode == "lora":
+            if mode != "colocate":
+                raise ValueError("LoRA weight synchronization is supported only in colocated vLLM mode")
+            if not is_peft_model(model):
+                raise ValueError("LoRA weight synchronization requires a PEFT model")
+            if weight_name_prefix is not None:
+                raise ValueError("weight_name_prefix does not apply to LoRA weight synchronization")
+        self.weight_sync_mode = weight_sync_mode
+        self._lora_directory = None
+        self._lora_request = None
         self.model_impl = model_impl
         self.trust_remote_code = trust_remote_code
 
@@ -384,11 +404,27 @@ class VLLMGeneration:
                 "quantization": quantization,
                 "trust_remote_code": self.trust_remote_code,
             }
+            if self.weight_sync_mode == "lora":
+                max_rank = max(config.r for config in model.peft_config.values())
+                supported_ranks = (1, 8, 16, 32, 64, 128, 256, 320, 512)
+                try:
+                    max_lora_rank = next(rank for rank in supported_ranks if rank >= max_rank)
+                except StopIteration as error:
+                    raise ValueError(f"vLLM does not support LoRA rank {max_rank}") from error
+                llm_kwargs.update({"enable_lora": True, "max_lora_rank": max_lora_rank})
             conflicts = sorted(set(llm_kwargs).intersection(self.engine_kwargs))
             if conflicts:
                 raise ValueError(f"vLLM engine kwargs cannot override TRL-controlled arguments: {', '.join(conflicts)}")
             llm_kwargs.update(self.engine_kwargs)
             self.llm = LLM(**llm_kwargs)
+            if self.weight_sync_mode == "lora":
+                self._lora_directory = tempfile.TemporaryDirectory(prefix="trl-vllm-lora-")
+                self._lora_request = LoRARequest(
+                    "trl-training-policy",
+                    1,
+                    self._lora_directory.name,
+                    load_inplace=True,
+                )
             if self.enable_sleep_mode:
                 self.llm.sleep(level=2)
         else:
@@ -471,6 +507,12 @@ class VLLMGeneration:
 
         Handles FSDP, DeepSpeed, PEFT weight synchronization.
         """
+        if self.weight_sync_mode == "lora":
+            # The base weights are immutable in this mode. Persist only the active adapter in PEFT's native format;
+            # LoRARequest(load_inplace=True) reloads the same adapter ID on the next generation call.
+            self.model.save_pretrained(self._lora_directory.name, safe_serialization=True)
+            return
+
         # Wake up vLLM weights before loading to ensure device memory is mapped. Without this, load_weights() writes to
         # freed/unmapped memory when sleep mode is active, which crashes on backends with strict physical memory
         # management (e.g., Ascend NPU). See https://github.com/huggingface/trl/issues/5142
@@ -702,7 +744,12 @@ class VLLMGeneration:
                 torch.distributed.barrier(device_ids=[accelerator.local_process_index])
 
             with profiler:
-                all_outputs = self.llm.generate(vllm_prompts, sampling_params=sampling_params, use_tqdm=False)
+                all_outputs = self.llm.generate(
+                    vllm_prompts,
+                    sampling_params=sampling_params,
+                    use_tqdm=False,
+                    lora_request=self._lora_request,
+                )
 
             all_prompt_ids = [output.prompt_token_ids for output in all_outputs]
             all_completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]

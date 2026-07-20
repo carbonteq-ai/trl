@@ -178,6 +178,10 @@ class GRPOConfig(_BaseConfig):
             Prefix added to every training-model parameter name before synchronizing weights into vLLM. This supports
             text-only training models whose vLLM implementation retains a composite-model namespace, such as
             `"language_model."`. The prefix must end with `"."`.
+        vllm_weight_sync_mode (`str`, *optional*, defaults to `"full"`):
+            Colocated weight synchronization mode. `"full"` synchronizes merged model parameters. `"lora"` keeps
+            vLLM's base weights unchanged and dynamically reloads the active PEFT LoRA adapter. Use `"lora"` for
+            QLoRA policies because packed 4-bit parameter storage is not a full-precision weight tensor.
 
         > Parameters that control generation acceleration powered by transformers continuous batching
 
@@ -635,6 +639,13 @@ class GRPOConfig(_BaseConfig):
         metadata={
             "help": "Prefix added to training parameter names before vLLM weight synchronization. If provided, it "
             "must end with `.`."
+        },
+    )
+    vllm_weight_sync_mode: str = field(
+        default="full",
+        metadata={
+            "help": "Colocated vLLM weight synchronization mode: `full` for model parameters or `lora` for the "
+            "active PEFT LoRA adapter."
         },
     )
     vllm_structured_outputs_regex: str | None = field(
