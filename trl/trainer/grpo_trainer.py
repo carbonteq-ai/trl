@@ -125,10 +125,11 @@ logger = get_logger(__name__)
 # accept **kwargs.
 RewardFunc = str | PreTrainedModel | Callable[..., list[float | None]]
 
-# What we call a rollout function is a callable that takes prompts (list) and the trainer instance as parameters and
-# returns a dict of generation results. Those results must include "prompt_ids", "completion_ids", and "logprobs"
-# fields. Any extra fields (per-completion) are forwarded to the reward functions.
-RolloutFunc = Callable[[list[str], "GRPOTrainer"], dict[str, Any]]
+# What we call a rollout function is a callable that takes prompts (list), the trainer instance, and the aligned raw
+# dataset rows as parameters and returns a dict of generation results. Those results must include "prompt_ids",
+# "completion_ids", and "logprobs" fields. Any extra fields (per-completion) are forwarded to the reward functions.
+# The raw rows preserve stable task identity for environment-driven rollouts without smuggling metadata into prompts.
+RolloutFunc = Callable[..., dict[str, Any]]
 
 
 class _SupportsReset(Protocol):
@@ -250,12 +251,14 @@ class GRPOTrainer(_BaseTrainer):
             use and that it has been fine-tuned for tool calling.
         rollout_func (`RolloutFunc`, *optional*):
             Function to use for generating completions. It receives the list of prompts allocated to the current
-            process and the trainer instance. It must return a dict with `"prompt_ids"`, `"completion_ids"`, and
-            `"logprobs"` fields, and can optionally return `"logprob_token_ids"` (same shape as `"logprobs"`). Any
-            other fields are forwarded to the reward functions. The function receives the raw per-process prompt slice
-            with no duplication; it is responsible for returning the correct number of completions per prompt (see
-            `num_generations` / `num_generations_eval` on the trainer). This feature is experimental and may change or
-            be removed at any time without prior notice.
+            process, the trainer instance, and an `inputs` keyword containing the aligned raw dataset rows. It must
+            return a dict with `"prompt_ids"`, `"completion_ids"`, and `"logprobs"` fields, and can optionally return
+            `"logprob_token_ids"` (same shape as `"logprobs"`). Any other fields are forwarded to the reward functions.
+            The raw rows let an environment-driven rollout preserve stable task identity without encoding it into the
+            model-visible prompt. The function receives the raw per-process prompt slice with no duplication; it is
+            responsible for returning the correct number of completions per prompt (see `num_generations` /
+            `num_generations_eval` on the trainer). This feature is experimental and may change or be removed at any
+            time without prior notice.
         environment_factory (`EnvironmentFactory` or `dict[str, EnvironmentFactory]`, *optional*):
             A callable that creates and returns an environment instance, or a dictionary mapping environment names to
             such callables. The environment class should define methods that can be invoked as tools during generation.
@@ -2000,7 +2003,7 @@ class GRPOTrainer(_BaseTrainer):
 
         return tool_mask, completions, completion_ids, logprobs, tool_call_count, tool_failure_count, tool_images
 
-    def _generate(self, prompts: list):
+    def _generate(self, prompts: list, inputs: list[dict[str, Any]] | None = None):
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
@@ -2017,7 +2020,7 @@ class GRPOTrainer(_BaseTrainer):
             # Pass prompts to rollout_func preserving structured messages.
             # Chat templating must happen inside rollout_func, at the backend boundary, so that
             # multimodal content (images, typed content blocks) is not lost before rollout logic runs.
-            output = self.rollout_func(prompts, self)
+            output = self.rollout_func(prompts, self, inputs=inputs)
             required_keys = {"prompt_ids", "completion_ids", "logprobs"}
             missing_keys = required_keys - output.keys()
             if missing_keys:
@@ -2096,7 +2099,13 @@ class GRPOTrainer(_BaseTrainer):
 
         # Identify sequences that terminated with EOS and log their lengths
         eos_and_pad = [self._tokenizer.eos_token_id, self._tokenizer.pad_token_id]
-        is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids], device=device)
+        rollout_is_truncated = extra_fields.get("is_truncated")
+        if rollout_is_truncated is not None:
+            if len(rollout_is_truncated) != len(completion_ids):
+                raise ValueError("rollout_func is_truncated must align with completion_ids")
+            is_truncated = torch.tensor(rollout_is_truncated, dtype=torch.bool, device=device)
+        else:
+            is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids], device=device)
         agg_is_truncated = self.accelerator.gather(is_truncated)
         self._metrics[mode]["completions/clipped_ratio"].append(agg_is_truncated.float().mean().item())
         term_completion_lengths = agg_completion_lengths[~agg_is_truncated]
@@ -2230,7 +2239,7 @@ class GRPOTrainer(_BaseTrainer):
             extra_fields,
             images,
             tool_images,
-        ) = self._generate(prompts)
+        ) = self._generate(prompts, inputs=inputs)
         if images is None:
             images = dataset_images  # restore dataset images (rollout_func path returns None)
 
@@ -2277,8 +2286,14 @@ class GRPOTrainer(_BaseTrainer):
 
         # If mask_truncated_completions is enabled, zero out truncated completions for attention and loss masking
         if self.mask_truncated_completions:
-            eos_and_pad = [self._tokenizer.eos_token_id, self._tokenizer.pad_token_id]
-            is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device)
+            rollout_is_truncated = extra_fields.pop("is_truncated", None)
+            if rollout_is_truncated is not None:
+                if len(rollout_is_truncated) != len(completion_ids_list):
+                    raise ValueError("rollout_func is_truncated must align with completion_ids")
+                is_truncated = torch.tensor(rollout_is_truncated, dtype=torch.bool, device=device)
+            else:
+                eos_and_pad = [self._tokenizer.eos_token_id, self._tokenizer.pad_token_id]
+                is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device)
             # Mask completion_mask for attention masking
             completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
             # Also mask tool_mask for consistency in multi-turn training
