@@ -23,7 +23,7 @@ import types
 from collections.abc import Mapping, Sequence, Sized
 from contextlib import contextmanager
 from importlib.metadata import version
-from itertools import accumulate
+from itertools import accumulate, product
 from typing import TypeVar
 
 import numpy as np
@@ -495,19 +495,24 @@ def entropy_from_logits(logits: torch.Tensor, chunk_size: int = 128) -> torch.Te
             Entropy values with shape `logits.shape[:-1]`.
     """
     original_shape = logits.shape[:-1]  # all dims except num_classes
-    num_classes = logits.shape[-1]
+    if logits.ndim == 1:
+        logps = F.log_softmax(logits, dim=-1)
+        return -(torch.exp(logps) * logps).sum(-1)
 
-    # Flatten all leading dimensions into one
-    flat_logits = logits.reshape(-1, num_classes)
-
+    # A sequence slice such as logits[..., :-1, :] is not contiguous across
+    # batches. Reshaping it can therefore allocate a full-vocabulary copy
+    # before chunking, defeating this function's memory bound. Select each
+    # contiguous row matrix first, then chunk its rows.
+    prefix_shape = logits.shape[:-2]
+    prefix_indices = product(*(range(size) for size in prefix_shape)) if prefix_shape else [()]
     entropies = []
-    for chunk in flat_logits.split(chunk_size, dim=0):
-        logps = F.log_softmax(chunk, dim=-1)
-        chunk_entropy = -(torch.exp(logps) * logps).sum(-1)
-        entropies.append(chunk_entropy)
+    for index in prefix_indices:
+        matrix = logits[index] if index else logits
+        for chunk in matrix.split(chunk_size, dim=0):
+            logps = F.log_softmax(chunk, dim=-1)
+            entropies.append(-(torch.exp(logps) * logps).sum(-1))
 
-    entropies = torch.cat(entropies, dim=0)
-    return entropies.reshape(original_shape)
+    return torch.cat(entropies, dim=0).reshape(original_shape)
 
 
 def print_prompt_completions_sample(
