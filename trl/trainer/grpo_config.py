@@ -165,6 +165,11 @@ class GRPOConfig(_BaseConfig):
         vllm_enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Enable vLLM sleep mode to offload weights/cache during the optimizer step. Keeps GPU memory usage low, but
             waking the engine adds host–device transfer latency.
+        vllm_speculative_config (`dict`, *optional*):
+            Engine-level speculative decoding configuration for colocated vLLM. For example,
+            `{"method": "qwen3_next_mtp", "num_speculative_tokens": 2}` enables native MTP on a compatible Qwen
+            model. This is ignored in server mode, where speculative decoding belongs to the separately launched
+            server.
 
         > Parameters that control generation acceleration powered by transformers continuous batching
 
@@ -601,6 +606,13 @@ class GRPOConfig(_BaseConfig):
         metadata={
             "help": "Enable vLLM sleep mode to offload weights/cache during the optimizer step. Keeps GPU memory "
             "usage low, but waking the engine adds host–device transfer latency."
+        },
+    )
+    vllm_speculative_config: dict | None = field(
+        default=None,
+        metadata={
+            "help": "Engine-level speculative decoding configuration for colocated vLLM. In server mode this must "
+            "be configured on the server instead."
         },
     )
     vllm_structured_outputs_regex: str | None = field(
