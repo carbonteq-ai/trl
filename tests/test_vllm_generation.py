@@ -115,6 +115,17 @@ def test_colocated_lora_sync_exports_adapter_without_merging_base_weights(monkey
     monkeypatch.setattr(vllm_generation, "is_vllm_available", lambda: True)
     monkeypatch.setattr(vllm_generation, "is_peft_model", lambda value: value is model)
     monkeypatch.setattr(vllm_generation, "LLM", FakeLLM, raising=False)
+    monkeypatch.setattr(
+        vllm_generation,
+        "LoRARequest",
+        lambda name, identifier, path, *, load_inplace: SimpleNamespace(
+            lora_name=name,
+            lora_int_id=identifier,
+            lora_path=path,
+            load_inplace=load_inplace,
+        ),
+        raising=False,
+    )
 
     generation = VLLMGeneration(
         model=model,
@@ -129,6 +140,58 @@ def test_colocated_lora_sync_exports_adapter_without_merging_base_weights(monkey
     assert model.saved == [(generation._lora_directory.name, True)]
     assert generation._lora_request.lora_path == generation._lora_directory.name
     assert generation._lora_request.load_inplace is True
+
+
+def test_colocated_lora_wake_does_not_reload_immutable_quantized_base(monkeypatch):
+    calls = []
+    generation = object.__new__(VLLMGeneration)
+    generation.mode = "colocate"
+    generation.enable_sleep_mode = True
+    generation.weight_sync_mode = "lora"
+    generation.llm = SimpleNamespace(
+        wake_up=lambda *, tags: calls.append(("wake_up", tags)),
+        collective_rpc=lambda method: calls.append(("collective_rpc", method)),
+    )
+    monkeypatch.setattr(vllm_generation, "empty_cache", lambda: calls.append(("empty_cache",)))
+
+    generation._wake_weights_for_generation()
+
+    assert calls == [("empty_cache",), ("wake_up", ["weights"])]
+
+
+def test_colocated_full_weight_wake_retains_reload_workaround(monkeypatch):
+    calls = []
+    generation = object.__new__(VLLMGeneration)
+    generation.mode = "colocate"
+    generation.enable_sleep_mode = True
+    generation.weight_sync_mode = "full"
+    generation.llm = SimpleNamespace(
+        wake_up=lambda *, tags: calls.append(("wake_up", tags)),
+        collective_rpc=lambda method: calls.append(("collective_rpc", method)),
+    )
+    monkeypatch.setattr(vllm_generation, "empty_cache", lambda: calls.append(("empty_cache",)))
+
+    generation._wake_weights_for_generation()
+
+    assert calls == [
+        ("empty_cache",),
+        ("wake_up", ["weights"]),
+        ("collective_rpc", "reload_weights"),
+    ]
+
+
+@pytest.mark.parametrize(("sync_mode", "expected_level"), [("lora", 1), ("full", 2)])
+def test_colocated_sleep_level_preserves_native_lora_base(sync_mode, expected_level):
+    calls = []
+    generation = object.__new__(VLLMGeneration)
+    generation.mode = "colocate"
+    generation.enable_sleep_mode = True
+    generation.weight_sync_mode = sync_mode
+    generation.llm = SimpleNamespace(sleep=lambda *, level: calls.append(level))
+
+    generation._sleep_colocated_engine()
+
+    assert calls == [expected_level]
 
 
 def test_lora_sync_rejects_unsupported_execution_shapes(monkeypatch):
