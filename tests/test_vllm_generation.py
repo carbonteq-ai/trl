@@ -79,3 +79,79 @@ def test_weight_name_prefix_is_applied_at_the_vllm_boundary():
         ("language_model.model.layers.0.weight", "tensor"),
         ("language_model.model.norm.weight", "tensor-2"),
     ]
+
+
+def test_colocated_lora_sync_exports_adapter_without_merging_base_weights(monkeypatch):
+    captured = {}
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    class FakePeftModel:
+        name_or_path = "model"
+        peft_config = {"default": SimpleNamespace(r=8)}
+
+        def __init__(self):
+            self.saved = []
+
+        def named_modules(self):
+            return []
+
+        def save_pretrained(self, path, safe_serialization):
+            self.saved.append((path, safe_serialization))
+
+        def merge_adapter(self):
+            raise AssertionError("LoRA sync must not merge packed base weights")
+
+    model = FakePeftModel()
+    accelerator = SimpleNamespace(
+        state=SimpleNamespace(deepspeed_plugin=None, fsdp_plugin=None),
+        num_processes=1,
+        process_index=0,
+        local_process_index=0,
+        wait_for_everyone=lambda: None,
+    )
+    monkeypatch.setattr(vllm_generation, "is_vllm_available", lambda: True)
+    monkeypatch.setattr(vllm_generation, "is_peft_model", lambda value: value is model)
+    monkeypatch.setattr(vllm_generation, "LLM", FakeLLM, raising=False)
+
+    generation = VLLMGeneration(
+        model=model,
+        accelerator=accelerator,
+        processing_class=object(),
+        weight_sync_mode="lora",
+    )
+    generation.sync_weights()
+
+    assert captured["enable_lora"] is True
+    assert captured["max_lora_rank"] == 8
+    assert model.saved == [(generation._lora_directory.name, True)]
+    assert generation._lora_request.lora_path == generation._lora_directory.name
+    assert generation._lora_request.load_inplace is True
+
+
+def test_lora_sync_rejects_unsupported_execution_shapes(monkeypatch):
+    class FakeModel:
+        name_or_path = "model"
+
+        def named_modules(self):
+            return []
+
+    accelerator = SimpleNamespace(
+        state=SimpleNamespace(deepspeed_plugin=None, fsdp_plugin=None),
+        num_processes=1,
+        process_index=0,
+        local_process_index=0,
+        wait_for_everyone=lambda: None,
+    )
+    monkeypatch.setattr(vllm_generation, "is_vllm_available", lambda: True)
+    monkeypatch.setattr(vllm_generation, "is_peft_model", lambda _: False)
+
+    with pytest.raises(ValueError, match="requires a PEFT model"):
+        VLLMGeneration(
+            model=FakeModel(),
+            accelerator=accelerator,
+            processing_class=object(),
+            weight_sync_mode="lora",
+        )
