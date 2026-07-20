@@ -171,6 +171,9 @@ class VLLMGeneration:
         enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Whether to enable sleep mode for the engine to offload weights/cache during the optimizer step. Keeps GPU
             memory usage low, but waking the engine adds host–device transfer latency.
+        speculative_config (`dict`, *optional*):
+            Engine-level speculative decoding configuration for colocated vLLM. This value is forwarded to `LLM` and
+            is ignored in server mode, whose engine must be configured when the server is launched.
         model_impl (`str`, *optional*, defaults to `"auto"`):
             Model implementation to use for vLLM.
             - "auto" will try to use the vLLM implementation, if it exists, and fall back to the Transformers
@@ -241,6 +244,7 @@ class VLLMGeneration:
         max_model_length: int | None = None,
         max_num_seqs: int | None = None,
         enable_sleep_mode: bool = False,
+        speculative_config: dict | None = None,
         model_impl: str = "auto",
         trust_remote_code: bool = False,
         # Generation configuration
@@ -275,6 +279,7 @@ class VLLMGeneration:
         self.max_model_length = max_model_length
         self.max_num_seqs = max_num_seqs
         self.enable_sleep_mode = enable_sleep_mode
+        self.speculative_config = speculative_config
         self.model_impl = model_impl
         self.trust_remote_code = trust_remote_code
 
@@ -355,6 +360,7 @@ class VLLMGeneration:
                 max_model_len=self.max_model_length,
                 max_num_seqs=self.max_num_seqs,
                 enable_sleep_mode=self.enable_sleep_mode,
+                speculative_config=self.speculative_config,
                 model_impl=self.model_impl,
                 distributed_executor_backend="external_launcher",
                 # Feed identical seed for tp groups to ensure sampling results are the same across workers

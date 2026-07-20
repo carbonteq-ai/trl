@@ -275,6 +275,20 @@ class TestTransformersContinuousBatchingContract:
 
 
 class TestGRPOTrainer(TrlTestCase):
+    def test_config_accepts_colocated_vllm_speculative_config(self):
+        speculative = {"method": "qwen3_next_mtp", "num_speculative_tokens": 2}
+
+        config = GRPOConfig(
+            output_dir=self.tmp_dir,
+            use_vllm=True,
+            vllm_mode="colocate",
+            vllm_enable_sleep_mode=True,
+            vllm_speculative_config=speculative,
+            report_to="none",
+        )
+
+        assert config.vllm_speculative_config == speculative
+
     def test_init_minimal(self):
         # Test that GRPOTrainer can be instantiated with only model, reward_model and train_dataset
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
