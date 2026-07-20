@@ -215,7 +215,37 @@ class TestGRPORolloutDispatch:
         assert result[0] == [[1]]  # prompt_ids
         assert result[1] == [[2]]  # completion_ids
         assert result[2] == [[1]]  # tool_mask (from env_mask)
-        trainer.rollout_func.assert_called_once_with(["prompt"], trainer)
+        trainer.rollout_func.assert_called_once_with(["prompt"], trainer, inputs=None)
+
+    def test_generate_passes_aligned_dataset_rows_to_rollout_func(self):
+        trainer = self._make_trainer()
+        trainer.rollout_func = MagicMock(
+            return_value={
+                "prompt_ids": [[1]],
+                "completion_ids": [[2]],
+                "logprobs": [[-0.1]],
+            }
+        )
+        inputs = [{"prompt": "prompt", "example_id": "task/1"}]
+
+        trainer._generate(["prompt"], inputs=inputs)
+
+        trainer.rollout_func.assert_called_once_with(["prompt"], trainer, inputs=inputs)
+
+    def test_generate_uses_rollout_truncation_state(self):
+        trainer = self._make_trainer()
+        trainer.rollout_func = MagicMock(
+            return_value={
+                "prompt_ids": [[1]],
+                "completion_ids": [[7]],
+                "logprobs": [[-0.1]],
+                "is_truncated": [False],
+            }
+        )
+
+        trainer._generate(["prompt"])
+
+        assert trainer._metrics["train"]["completions/clipped_ratio"] == [0.0]
 
     def test_generate_rollout_func_syncs_vllm_weights_when_needed(self):
         trainer = self._make_trainer()
@@ -228,7 +258,7 @@ class TestGRPORolloutDispatch:
 
         trainer.vllm_generation.sync_weights.assert_called_once()
         assert trainer._last_loaded_step == trainer.state.global_step
-        trainer.rollout_func.assert_called_once_with(["prompt"], trainer)
+        trainer.rollout_func.assert_called_once_with(["prompt"], trainer, inputs=None)
 
     def test_generate_rollout_func_raises_when_required_keys_are_missing(self):
         trainer = self._make_trainer()
