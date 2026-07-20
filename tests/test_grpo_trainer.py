@@ -284,10 +284,12 @@ class TestGRPOTrainer(TrlTestCase):
             vllm_mode="colocate",
             vllm_enable_sleep_mode=True,
             vllm_speculative_config=speculative,
+            vllm_engine_kwargs={"skip_mm_profiling": True},
             report_to="none",
         )
 
         assert config.vllm_speculative_config == speculative
+        assert config.vllm_engine_kwargs == {"skip_mm_profiling": True}
 
     def test_init_minimal(self):
         # Test that GRPOTrainer can be instantiated with only model, reward_model and train_dataset

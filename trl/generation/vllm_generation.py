@@ -174,6 +174,9 @@ class VLLMGeneration:
         speculative_config (`dict`, *optional*):
             Engine-level speculative decoding configuration for colocated vLLM. This value is forwarded to `LLM` and
             is ignored in server mode, whose engine must be configured when the server is launched.
+        engine_kwargs (`dict`, *optional*):
+            Additional non-conflicting `LLM` engine arguments for colocated mode. Arguments controlled directly by
+            this adapter cannot be overridden. This value is ignored in server mode.
         model_impl (`str`, *optional*, defaults to `"auto"`):
             Model implementation to use for vLLM.
             - "auto" will try to use the vLLM implementation, if it exists, and fall back to the Transformers
@@ -245,6 +248,7 @@ class VLLMGeneration:
         max_num_seqs: int | None = None,
         enable_sleep_mode: bool = False,
         speculative_config: dict | None = None,
+        engine_kwargs: dict | None = None,
         model_impl: str = "auto",
         trust_remote_code: bool = False,
         # Generation configuration
@@ -280,6 +284,7 @@ class VLLMGeneration:
         self.max_num_seqs = max_num_seqs
         self.enable_sleep_mode = enable_sleep_mode
         self.speculative_config = speculative_config
+        self.engine_kwargs = engine_kwargs or {}
         self.model_impl = model_impl
         self.trust_remote_code = trust_remote_code
 
@@ -353,25 +358,30 @@ class VLLMGeneration:
                         raise ValueError("vLLM does not support in-flight 8-bit quantization.")
 
             # Build LLM initialization kwargs
-            self.llm = LLM(
-                model=model.name_or_path,
-                tensor_parallel_size=self.tensor_parallel_size,
-                gpu_memory_utilization=self.gpu_memory_utilization,
-                max_model_len=self.max_model_length,
-                max_num_seqs=self.max_num_seqs,
-                enable_sleep_mode=self.enable_sleep_mode,
-                speculative_config=self.speculative_config,
-                model_impl=self.model_impl,
-                distributed_executor_backend="external_launcher",
+            llm_kwargs = {
+                "model": model.name_or_path,
+                "tensor_parallel_size": self.tensor_parallel_size,
+                "gpu_memory_utilization": self.gpu_memory_utilization,
+                "max_model_len": self.max_model_length,
+                "max_num_seqs": self.max_num_seqs,
+                "enable_sleep_mode": self.enable_sleep_mode,
+                "speculative_config": self.speculative_config,
+                "model_impl": self.model_impl,
+                "distributed_executor_backend": "external_launcher",
                 # Feed identical seed for tp groups to ensure sampling results are the same across workers
-                seed=accelerator.process_index // self.tensor_parallel_size,
+                "seed": accelerator.process_index // self.tensor_parallel_size,
                 # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
-                max_num_batched_tokens=4096,
+                "max_num_batched_tokens": 4096,
                 # Important so temperature scaling/logit tweaking affects the TIS log probs
-                logprobs_mode="processed_logprobs",
-                quantization=quantization,
-                trust_remote_code=self.trust_remote_code,
-            )
+                "logprobs_mode": "processed_logprobs",
+                "quantization": quantization,
+                "trust_remote_code": self.trust_remote_code,
+            }
+            conflicts = sorted(set(llm_kwargs).intersection(self.engine_kwargs))
+            if conflicts:
+                raise ValueError(f"vLLM engine kwargs cannot override TRL-controlled arguments: {', '.join(conflicts)}")
+            llm_kwargs.update(self.engine_kwargs)
+            self.llm = LLM(**llm_kwargs)
             if self.enable_sleep_mode:
                 self.llm.sleep(level=2)
         else:
