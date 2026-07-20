@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from trl.generation import vllm_generation
 from trl.generation.vllm_generation import VLLMGeneration
 
@@ -33,6 +35,16 @@ def test_colocated_engine_receives_speculative_config(monkeypatch):
         accelerator=accelerator,
         processing_class=object(),
         speculative_config=speculative,
+        engine_kwargs={"skip_mm_profiling": True},
     )
 
     assert captured["speculative_config"] == speculative
+    assert captured["skip_mm_profiling"] is True
+
+    with pytest.raises(ValueError, match="cannot override TRL-controlled"):
+        VLLMGeneration(
+            model=FakeModel(),
+            accelerator=accelerator,
+            processing_class=object(),
+            engine_kwargs={"model": "other"},
+        )

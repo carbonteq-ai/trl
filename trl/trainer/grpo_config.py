@@ -170,6 +170,10 @@ class GRPOConfig(_BaseConfig):
             `{"method": "qwen3_next_mtp", "num_speculative_tokens": 2}` enables native MTP on a compatible Qwen
             model. This is ignored in server mode, where speculative decoding belongs to the separately launched
             server.
+        vllm_engine_kwargs (`dict`, *optional*):
+            Additional colocated vLLM `LLM` engine arguments that TRL does not expose directly, such as
+            `{"skip_mm_profiling": True}` for a text-only run of a multimodal model. Keys already controlled by TRL
+            cannot be overridden. This is ignored in server mode, where engine arguments belong to the server.
 
         > Parameters that control generation acceleration powered by transformers continuous batching
 
@@ -612,6 +616,13 @@ class GRPOConfig(_BaseConfig):
         default=None,
         metadata={
             "help": "Engine-level speculative decoding configuration for colocated vLLM. In server mode this must "
+            "be configured on the server instead."
+        },
+    )
+    vllm_engine_kwargs: dict | None = field(
+        default=None,
+        metadata={
+            "help": "Additional non-conflicting LLM engine arguments for colocated vLLM. In server mode these must "
             "be configured on the server instead."
         },
     )

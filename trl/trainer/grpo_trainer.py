@@ -1014,6 +1014,7 @@ class GRPOTrainer(_BaseTrainer):
                 * args.steps_per_generation,
                 enable_sleep_mode=args.vllm_enable_sleep_mode,
                 speculative_config=args.vllm_speculative_config,
+                engine_kwargs=args.vllm_engine_kwargs,
                 model_impl=args.vllm_model_impl,
                 trust_remote_code=args.trust_remote_code,
                 # Generation configuration
