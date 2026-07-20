@@ -177,6 +177,9 @@ class VLLMGeneration:
         engine_kwargs (`dict`, *optional*):
             Additional non-conflicting `LLM` engine arguments for colocated mode. Arguments controlled directly by
             this adapter cannot be overridden. This value is ignored in server mode.
+        weight_name_prefix (`str`, *optional*):
+            Prefix added to parameter names before weight synchronization. Use this when the vLLM model keeps a
+            composite-model namespace around the text model while the training model exposes the text model directly.
         model_impl (`str`, *optional*, defaults to `"auto"`):
             Model implementation to use for vLLM.
             - "auto" will try to use the vLLM implementation, if it exists, and fall back to the Transformers
@@ -249,6 +252,7 @@ class VLLMGeneration:
         enable_sleep_mode: bool = False,
         speculative_config: dict | None = None,
         engine_kwargs: dict | None = None,
+        weight_name_prefix: str | None = None,
         model_impl: str = "auto",
         trust_remote_code: bool = False,
         # Generation configuration
@@ -285,6 +289,9 @@ class VLLMGeneration:
         self.enable_sleep_mode = enable_sleep_mode
         self.speculative_config = speculative_config
         self.engine_kwargs = engine_kwargs or {}
+        if weight_name_prefix is not None and (not weight_name_prefix or not weight_name_prefix.endswith(".")):
+            raise ValueError("weight_name_prefix must be a non-empty module prefix ending with `.`")
+        self.weight_name_prefix = weight_name_prefix
         self.model_impl = model_impl
         self.trust_remote_code = trust_remote_code
 
@@ -402,6 +409,8 @@ class VLLMGeneration:
 
     def _push_param_to_vllm(self, name: str, param) -> None:
         """Push a single parameter tensor to the vLLM engine (server or colocate mode)."""
+        if self.weight_name_prefix is not None and not name.startswith(self.weight_name_prefix):
+            name = f"{self.weight_name_prefix}{name}"
         if self.mode == "server" and self.accelerator.is_main_process:
             self.vllm_client.update_named_param(name, param)
         elif self.mode == "colocate":

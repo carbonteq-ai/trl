@@ -174,6 +174,10 @@ class GRPOConfig(_BaseConfig):
             Additional colocated vLLM `LLM` engine arguments that TRL does not expose directly, such as
             `{"skip_mm_profiling": True}` for a text-only run of a multimodal model. Keys already controlled by TRL
             cannot be overridden. This is ignored in server mode, where engine arguments belong to the server.
+        vllm_weight_name_prefix (`str`, *optional*):
+            Prefix added to every training-model parameter name before synchronizing weights into vLLM. This supports
+            text-only training models whose vLLM implementation retains a composite-model namespace, such as
+            `"language_model."`. The prefix must end with `"."`.
 
         > Parameters that control generation acceleration powered by transformers continuous batching
 
@@ -624,6 +628,13 @@ class GRPOConfig(_BaseConfig):
         metadata={
             "help": "Additional non-conflicting LLM engine arguments for colocated vLLM. In server mode these must "
             "be configured on the server instead."
+        },
+    )
+    vllm_weight_name_prefix: str | None = field(
+        default=None,
+        metadata={
+            "help": "Prefix added to training parameter names before vLLM weight synchronization. If provided, it "
+            "must end with `.`."
         },
     )
     vllm_structured_outputs_regex: str | None = field(

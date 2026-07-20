@@ -48,3 +48,34 @@ def test_colocated_engine_receives_speculative_config(monkeypatch):
             processing_class=object(),
             engine_kwargs={"model": "other"},
         )
+
+    with pytest.raises(ValueError, match="ending with"):
+        VLLMGeneration(
+            model=FakeModel(),
+            accelerator=accelerator,
+            processing_class=object(),
+            weight_name_prefix="language_model",
+        )
+
+
+def test_weight_name_prefix_is_applied_at_the_vllm_boundary():
+    captured = []
+    loader = SimpleNamespace(load_weights=lambda weights: captured.extend(weights))
+    generation = object.__new__(VLLMGeneration)
+    generation.mode = "colocate"
+    generation.weight_name_prefix = "language_model."
+    generation.llm = SimpleNamespace(
+        llm_engine=SimpleNamespace(
+            model_executor=SimpleNamespace(
+                driver_worker=SimpleNamespace(model_runner=SimpleNamespace(model=loader))
+            )
+        )
+    )
+
+    generation._push_param_to_vllm("model.layers.0.weight", "tensor")
+    generation._push_param_to_vllm("language_model.model.norm.weight", "tensor-2")
+
+    assert captured == [
+        ("language_model.model.layers.0.weight", "tensor"),
+        ("language_model.model.norm.weight", "tensor-2"),
+    ]
