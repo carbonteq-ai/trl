@@ -645,7 +645,8 @@ class GRPOConfig(_BaseConfig):
         default="full",
         metadata={
             "help": "Colocated vLLM weight synchronization mode: `full` for model parameters or `lora` for the "
-            "active PEFT LoRA adapter."
+            "active PEFT LoRA adapter. With sleep mode enabled, `lora` uses level-1 sleep so an immutable quantized "
+            "base can be restored without unsupported checkpoint reloading."
         },
     )
     vllm_structured_outputs_regex: str | None = field(

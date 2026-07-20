@@ -425,8 +425,7 @@ class VLLMGeneration:
                     self._lora_directory.name,
                     load_inplace=True,
                 )
-            if self.enable_sleep_mode:
-                self.llm.sleep(level=2)
+            self._sleep_colocated_engine()
         else:
             raise ValueError(f"vllm_mode must be either 'server' or 'colocate', got '{self.mode}'.")
 
@@ -567,6 +566,36 @@ class VLLMGeneration:
         elif self.mode == "colocate":
             self.llm.reset_prefix_cache()
 
+    def _wake_weights_for_generation(self) -> None:
+        """Restore colocated weights without reloading an immutable LoRA base model."""
+        if self.mode != "colocate" or not self.enable_sleep_mode:
+            return
+
+        empty_cache()  # required to avoid OOM in some cases
+        self.llm.wake_up(tags=["weights"])
+        if self.weight_sync_mode == "lora":
+            # Native LoRA synchronization never mutates the vLLM base model. Level-1 sleep restores its CPU-backed
+            # allocations on wake, and the adapter is refreshed separately by LoRARequest(load_inplace=True). Calling
+            # reload_weights here is both unnecessary and unsupported by vLLM's bitsandbytes loader.
+            return
+
+        # Work around https://github.com/vllm-project/vllm/issues/29341 for full-parameter synchronization.
+        try:
+            self.llm.collective_rpc("reload_weights")
+        except NotImplementedError:
+            # Non-CUDA vLLM backends (e.g., vllm-ascend's NPUWorkerV1), don't implement reload_weights.
+            pass
+
+    def _sleep_colocated_engine(self) -> None:
+        """Release colocated memory using the level compatible with the synchronization strategy."""
+        if self.mode != "colocate" or not self.enable_sleep_mode:
+            return
+        # Full synchronization can reconstruct discarded weights from the trainer, so it retains vLLM's level-2
+        # behavior. Native LoRA synchronization keeps the quantized base immutable; level 1 preserves a CPU backup
+        # because vLLM cannot reload a bitsandbytes checkpoint after level 2 discards those allocations.
+        level = 1 if self.weight_sync_mode == "lora" else 2
+        self.llm.sleep(level=level)
+
     def generate(
         self,
         prompts: list[list[int]],
@@ -603,16 +632,8 @@ class VLLMGeneration:
         repetition_penalty = self.repetition_penalty
         max_completion_length = self.max_completion_length
 
-        # Wake up colocated vLLM weights if needed (idempotent if already awake from sync_weights)
-        if self.mode == "colocate" and self.enable_sleep_mode:
-            empty_cache()  # required to avoid OOM in some cases
-            self.llm.wake_up(tags=["weights"])
-            # Work around for https://github.com/vllm-project/vllm/issues/29341
-            try:
-                self.llm.collective_rpc("reload_weights")
-            except NotImplementedError:
-                # Non-CUDA vLLM backends (e.g., vllm-ascend's NPUWorkerV1), don't implement reload_weights
-                pass
+        # Wake up colocated vLLM weights if needed (idempotent if already awake from sync_weights).
+        self._wake_weights_for_generation()
 
         # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
         if self.mode == "server":
@@ -770,7 +791,6 @@ class VLLMGeneration:
                 logprobs = all_logprobs
                 logprob_token_ids = all_logprob_token_ids
 
-            if self.enable_sleep_mode:
-                self.llm.sleep(level=2)
+            self._sleep_colocated_engine()
 
         return prompt_ids, completion_ids, logprobs, logprob_token_ids
