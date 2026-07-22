@@ -119,13 +119,14 @@ def _external_rollout_slice():
         "prompts": torch.tensor([[10, 11]], dtype=torch.long),
         "prompt_attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
         "messages": [[{"role": "user", "content": "question"}]],
+        "rollout_inputs": [{"example_id": "example-1"}],
     }
 
 
 def test_external_rollout_preserves_sparse_multiturn_tokens_and_prompt_boundary():
     def rollout_func(prompts, trainer, inputs):
         assert prompts == [[{"role": "user", "content": "question"}]]
-        assert inputs == [{"prompt_ids": [10, 11], "input": prompts[0]}]
+        assert inputs == [{"example_id": "example-1", "prompt_ids": [10, 11], "input": prompts[0]}]
         return {
             "prompt_ids": [[10, 11]],
             "prompt_lengths": [2],

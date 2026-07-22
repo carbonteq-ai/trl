@@ -240,6 +240,7 @@ class _DistillationCollator:
         all_labels: list[list[int]] = []
         all_prompt_ids: list[list[int]] = []
         all_messages: list[list[dict[str, Any]]] = []
+        all_rollout_inputs: list[dict[str, Any]] = []
 
         for example in examples:
             messages = example[self.messages_key]
@@ -294,6 +295,7 @@ class _DistillationCollator:
             all_labels.append(labels)
             all_prompt_ids.append(list(prompt_ids))
             all_messages.append(messages)
+            all_rollout_inputs.append(dict(example))
 
         # Convert to tensors and left-pad
         pad_id = self.tokenizer.pad_token_id
@@ -332,6 +334,7 @@ class _DistillationCollator:
         }
         if self.preserve_messages:
             batch["messages"] = all_messages
+            batch["rollout_inputs"] = all_rollout_inputs
         return batch
 
 
@@ -927,6 +930,7 @@ class DistillationTrainer(_BaseTrainer):
         for slice_idx in on_policy_indices:
             slice_inputs = slices[slice_idx]
             messages = slice_inputs.get("messages")
+            source_inputs = slice_inputs.get("rollout_inputs")
             prompt_mask = slice_inputs.get("prompt_attention_mask")
             for row_idx, prompt in enumerate(slice_inputs["prompts"]):
                 if prompt_mask is not None:
@@ -936,7 +940,9 @@ class DistillationTrainer(_BaseTrainer):
                 prompt_ids = prompt.tolist()
                 structured_prompt = messages[row_idx] if messages is not None else prompt_ids
                 prompts.append(structured_prompt)
-                rollout_inputs.append({"prompt_ids": prompt_ids, "input": structured_prompt})
+                rollout_input = dict(source_inputs[row_idx]) if source_inputs is not None else {}
+                rollout_input.update({"prompt_ids": prompt_ids, "input": structured_prompt})
+                rollout_inputs.append(rollout_input)
                 local_slice_indices.append(slice_idx)
 
         output = self.rollout_func(prompts, self, inputs=rollout_inputs)
