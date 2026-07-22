@@ -50,6 +50,9 @@ from ...trainer.utils import RepeatSampler, create_model_from_path, disable_drop
 from .distillation_config import DistillationConfig
 
 
+RolloutFunc = Callable[..., dict[str, Any]]
+
+
 if is_liger_kernel_available():
     from liger_kernel.chunked_loss import LigerFusedLinearJSDLoss
 
@@ -220,20 +223,23 @@ class _DistillationCollator:
         max_prompt_length: int,
         messages_key: str = "messages",
         ignore_index: int = -100,
+        preserve_messages: bool = False,
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.max_prompt_length = max_prompt_length
         self.messages_key = messages_key
         self.ignore_index = ignore_index
+        self.preserve_messages = preserve_messages
 
         if tokenizer.pad_token_id is None:
             raise ValueError("The tokenizer does not have a pad token. Please set `pad_token_id` in the tokenizer.")
 
-    def __call__(self, examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+    def __call__(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
         all_input_ids: list[list[int]] = []
         all_labels: list[list[int]] = []
         all_prompt_ids: list[list[int]] = []
+        all_messages: list[list[dict[str, Any]]] = []
 
         for example in examples:
             messages = example[self.messages_key]
@@ -287,6 +293,7 @@ class _DistillationCollator:
             all_input_ids.append(input_ids)
             all_labels.append(labels)
             all_prompt_ids.append(list(prompt_ids))
+            all_messages.append(messages)
 
         # Convert to tensors and left-pad
         pad_id = self.tokenizer.pad_token_id
@@ -316,13 +323,16 @@ class _DistillationCollator:
             padding_value=0,
         )
 
-        return {
+        batch: dict[str, Any] = {
             "input_ids": input_ids_t,
             "attention_mask": attention_mask_t,
             "labels": labels_t,
             "prompts": prompts_t,
             "prompt_attention_mask": prompt_mask_t,
         }
+        if self.preserve_messages:
+            batch["messages"] = all_messages
+        return batch
 
 
 class _RepeatBatchDataLoader:
@@ -362,6 +372,7 @@ class DistillationTrainer(_BaseTrainer):
     - On-policy / off-policy mixing via `lmbda` (buffered across gradient accumulation)
     - Local teacher model or external teacher via vLLM server
     - Student on-policy generation via vLLM or model.generate()
+    - Exact-token external environment rollouts via `rollout_func`
     - Liger kernel for memory-efficient fused JSD loss
     """
 
@@ -400,6 +411,7 @@ class DistillationTrainer(_BaseTrainer):
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         peft_config: Optional["PeftConfig"] = None,
+        rollout_func: RolloutFunc | None = None,
     ):
         if args is None:
             args = DistillationConfig(output_dir="tmp_distillation")
@@ -476,6 +488,7 @@ class DistillationTrainer(_BaseTrainer):
                 tokenizer=processing_class,
                 max_length=args.max_length,
                 max_prompt_length=args.max_prompt_length,
+                preserve_messages=rollout_func is not None,
             )
 
         # ── Liger fused JSD loss ──
@@ -596,6 +609,7 @@ class DistillationTrainer(_BaseTrainer):
         self.reverse_kl_top_1_mode = args.reverse_kl_top_1_mode
         self.loss_top_k = args.loss_top_k
         self.loss_add_tail = args.loss_add_tail
+        self.rollout_func = rollout_func
 
         # ── Buffer state ──
         self._buffered_inputs = None
@@ -692,6 +706,8 @@ class DistillationTrainer(_BaseTrainer):
 
     def _compute_prompt_length(self, inputs: dict[str, torch.Tensor | Any]) -> int:
         """Compute the earliest prompt boundary that still includes every completion token in the batch."""
+        if inputs.get("prompt_length") is not None:
+            return int(inputs["prompt_length"])
         if inputs.get("labels") is not None:
             attention_mask = inputs["attention_mask"]
             labels = inputs["labels"]
@@ -854,6 +870,9 @@ class DistillationTrainer(_BaseTrainer):
     @profiling_decorator
     def _generate_student_completions(self, slices: list[dict[str, torch.Tensor | Any]], on_policy_indices: list[int]):
         """Generate completions from the student model for on-policy training."""
+        if self.rollout_func is not None:
+            self._generate_with_rollout_func(slices, on_policy_indices)
+            return
         if not self.use_vllm:
             self._generate_with_model(slices, on_policy_indices)
             return
@@ -893,6 +912,144 @@ class DistillationTrainer(_BaseTrainer):
         self._store_completions_in_buffer(
             slices, on_policy_indices, local_slice_indices, local_prompts, completion_ids
         )
+
+    def _generate_with_rollout_func(
+        self,
+        slices: list[dict[str, torch.Tensor | Any]],
+        on_policy_indices: list[int],
+    ) -> None:
+        """Generate exact-token environment rollouts through an external callback."""
+        prompts: list[Any] = []
+        rollout_inputs: list[dict[str, Any]] = []
+        local_slice_indices: list[int] = []
+        pad_token_id = self.processing_class.pad_token_id
+
+        for slice_idx in on_policy_indices:
+            slice_inputs = slices[slice_idx]
+            messages = slice_inputs.get("messages")
+            prompt_mask = slice_inputs.get("prompt_attention_mask")
+            for row_idx, prompt in enumerate(slice_inputs["prompts"]):
+                if prompt_mask is not None:
+                    prompt = prompt[prompt_mask[row_idx].bool()]
+                elif pad_token_id is not None:
+                    prompt = prompt[prompt != pad_token_id]
+                prompt_ids = prompt.tolist()
+                structured_prompt = messages[row_idx] if messages is not None else prompt_ids
+                prompts.append(structured_prompt)
+                rollout_inputs.append({"prompt_ids": prompt_ids, "input": structured_prompt})
+                local_slice_indices.append(slice_idx)
+
+        output = self.rollout_func(prompts, self, inputs=rollout_inputs)
+        required_keys = {
+            "prompt_ids",
+            "prompt_lengths",
+            "completion_ids",
+            "completion_loss_mask",
+            "logprobs",
+        }
+        missing_keys = required_keys - output.keys()
+        if missing_keys:
+            raise ValueError(f"rollout_func must return keys {sorted(missing_keys)} in its output dict.")
+
+        expected = len(prompts)
+        for key in required_keys:
+            if len(output[key]) != expected:
+                raise ValueError(f"rollout_func field {key!r} must contain {expected} items, got {len(output[key])}.")
+
+        rollout_ids = output.get("rollout_ids")
+        if rollout_ids is not None:
+            if len(rollout_ids) != expected:
+                raise ValueError("rollout_func rollout_ids must align with generated items.")
+            if len(set(rollout_ids)) != len(rollout_ids):
+                raise ValueError("rollout_func rollout_ids must be unique.")
+
+        normalized: list[dict[str, Any]] = []
+        for idx in range(expected):
+            prompt_ids = list(output["prompt_ids"][idx])
+            completion_ids = list(output["completion_ids"][idx])
+            completion_loss_mask = [bool(value) for value in output["completion_loss_mask"][idx]]
+            logprobs = list(output["logprobs"][idx])
+            prompt_length = output["prompt_lengths"][idx]
+            if not isinstance(prompt_length, int) or prompt_length <= 0:
+                raise ValueError("rollout_func prompt_lengths must contain positive integers.")
+            if prompt_length != len(prompt_ids):
+                raise ValueError("rollout_func prompt_lengths must equal the corresponding prompt_ids length.")
+            if not prompt_ids or not completion_ids:
+                raise ValueError("rollout_func must return non-empty prompt_ids and completion_ids.")
+            if len(completion_ids) > self.generation_config.max_new_tokens:
+                raise ValueError("rollout_func completion_ids exceed max_completion_length.")
+            if len(completion_loss_mask) != len(completion_ids):
+                raise ValueError("rollout_func completion_loss_mask must align with completion_ids.")
+            if len(logprobs) != len(completion_ids):
+                raise ValueError("rollout_func logprobs must align with completion_ids.")
+            if not any(completion_loss_mask):
+                raise ValueError("rollout_func completion_loss_mask must select at least one token.")
+            normalized.append(
+                {
+                    "prompt_ids": prompt_ids,
+                    "completion_ids": completion_ids,
+                    "completion_loss_mask": completion_loss_mask,
+                    "logprobs": logprobs,
+                }
+            )
+
+        device = self.accelerator.device
+        pad_id = pad_token_id if pad_token_id is not None else 0
+        for slice_idx in on_policy_indices:
+            items = [item for item, owner in zip(normalized, local_slice_indices, strict=True) if owner == slice_idx]
+            prompt_width = max(len(item["prompt_ids"]) for item in items)
+            completion_width = max(len(item["completion_ids"]) for item in items)
+            input_rows = []
+            attention_rows = []
+            label_rows = []
+            prompt_mask_rows = []
+            logprob_rows = []
+            loss_mask_rows = []
+            prompt_texts = []
+            completion_texts = []
+
+            for item in items:
+                prompt_padding = prompt_width - len(item["prompt_ids"])
+                completion_padding = completion_width - len(item["completion_ids"])
+                prompt_row = [pad_id] * prompt_padding + item["prompt_ids"]
+                completion_row = item["completion_ids"] + [pad_id] * completion_padding
+                loss_mask = item["completion_loss_mask"] + [False] * completion_padding
+                labels = [-100] * prompt_width + [
+                    token if keep else -100 for token, keep in zip(completion_row, loss_mask, strict=True)
+                ]
+                input_rows.append(prompt_row + completion_row)
+                attention_rows.append(
+                    [0] * prompt_padding
+                    + [1] * len(item["prompt_ids"])
+                    + [1] * len(item["completion_ids"])
+                    + [0] * completion_padding
+                )
+                label_rows.append(labels)
+                prompt_mask_rows.append([0] * prompt_padding + [1] * len(item["prompt_ids"]))
+                logprob_rows.append(item["logprobs"] + [0.0] * completion_padding)
+                loss_mask_rows.append(loss_mask)
+                prompt_texts.append(self.processing_class.decode(item["prompt_ids"], skip_special_tokens=False))
+                completion_texts.append(
+                    self.processing_class.decode(item["completion_ids"], skip_special_tokens=False)
+                )
+
+            updated = dict(slices[slice_idx])
+            updated["input_ids"] = torch.tensor(input_rows, dtype=torch.long, device=device)
+            updated["attention_mask"] = torch.tensor(attention_rows, dtype=torch.long, device=device)
+            updated["labels"] = torch.tensor(label_rows, dtype=torch.long, device=device)
+            updated["prompts"] = updated["input_ids"][:, :prompt_width]
+            updated["prompt_attention_mask"] = torch.tensor(prompt_mask_rows, dtype=torch.long, device=device)
+            updated["prompt_length"] = prompt_width
+            updated["sampling_logprobs"] = torch.tensor(logprob_rows, dtype=torch.float32, device=device)
+            updated["completion_loss_mask"] = torch.tensor(loss_mask_rows, dtype=torch.bool, device=device)
+            if rollout_ids is not None:
+                updated["rollout_ids"] = [
+                    rollout_id
+                    for rollout_id, owner in zip(rollout_ids, local_slice_indices, strict=True)
+                    if owner == slice_idx
+                ]
+            self._buffered_inputs[slice_idx] = updated
+            self._buffered_text_logs[slice_idx] = (prompt_texts, completion_texts)
 
     def _generate_with_model(self, slices: list[dict[str, torch.Tensor | Any]], on_policy_indices: list[int]):
         """Fallback generation using model.generate() (no vLLM)."""
@@ -1334,8 +1491,11 @@ class DistillationTrainer(_BaseTrainer):
             if comp_len == 0:
                 completion_offsets.append(0)
                 continue
-            completion_start = int(torch.nonzero(sample_mask, as_tuple=False)[0].item())
-            completion_offsets.append(completion_start - aligned_prompt_length)
+            if inputs.get("prompt_length") is not None:
+                completion_offsets.append(0)
+            else:
+                completion_start = int(torch.nonzero(sample_mask, as_tuple=False)[0].item())
+                completion_offsets.append(completion_start - aligned_prompt_length)
 
         # Size the output tensors to tightly fit the teacher logprobs. Using the full padded
         # sequence length would include padding positions with -inf teacher logprobs, producing

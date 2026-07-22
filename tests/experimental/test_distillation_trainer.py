@@ -95,6 +95,105 @@ class RecordingTeacherClient:
         return self.result
 
 
+class TinyDecodeTokenizer:
+    pad_token_id = 0
+
+    @staticmethod
+    def decode(token_ids, skip_special_tokens=False):
+        return " ".join(str(token_id) for token_id in token_ids)
+
+
+def _external_rollout_trainer(rollout_func):
+    trainer = MagicMock()
+    trainer.rollout_func = rollout_func
+    trainer.processing_class = TinyDecodeTokenizer()
+    trainer.accelerator.device = torch.device("cpu")
+    trainer.generation_config.max_new_tokens = 8
+    trainer._buffered_inputs = [None]
+    trainer._buffered_text_logs = [None]
+    return trainer
+
+
+def _external_rollout_slice():
+    return {
+        "prompts": torch.tensor([[10, 11]], dtype=torch.long),
+        "prompt_attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
+        "messages": [[{"role": "user", "content": "question"}]],
+    }
+
+
+def test_external_rollout_preserves_sparse_multiturn_tokens_and_prompt_boundary():
+    def rollout_func(prompts, trainer, inputs):
+        assert prompts == [[{"role": "user", "content": "question"}]]
+        assert inputs == [{"prompt_ids": [10, 11], "input": prompts[0]}]
+        return {
+            "prompt_ids": [[10, 11]],
+            "prompt_lengths": [2],
+            "completion_ids": [[20, 30, 21]],
+            "completion_loss_mask": [[True, False, True]],
+            "logprobs": [[-0.1, 0.0, -0.2]],
+            "rollout_ids": ["rollout-1"],
+        }
+
+    trainer = _external_rollout_trainer(rollout_func)
+    DistillationTrainer._generate_with_rollout_func(trainer, [_external_rollout_slice()], [0])
+
+    buffered = trainer._buffered_inputs[0]
+    assert buffered["input_ids"].tolist() == [[10, 11, 20, 30, 21]]
+    assert buffered["attention_mask"].tolist() == [[1, 1, 1, 1, 1]]
+    assert buffered["labels"].tolist() == [[-100, -100, 20, -100, 21]]
+    assert buffered["completion_loss_mask"].tolist() == [[True, False, True]]
+    assert buffered["sampling_logprobs"].tolist()[0] == pytest.approx([-0.1, 0.0, -0.2])
+    assert buffered["prompt_length"] == 2
+    assert buffered["rollout_ids"] == ["rollout-1"]
+    assert DistillationTrainer._compute_prompt_length(trainer, buffered) == 2
+
+    sequences, prompt_lengths, completion_lengths = build_teacher_request_inputs(
+        buffered["input_ids"],
+        buffered["attention_mask"],
+        prompt_attention_mask=buffered["prompt_attention_mask"],
+        labels=buffered["labels"],
+    )
+    assert sequences == [[10, 11, 20, 30, 21]]
+    assert prompt_lengths == [2]
+    assert completion_lengths == [3]
+
+
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        ({"prompt_lengths": []}, "must contain 1 items"),
+        ({"prompt_lengths": [1]}, "must equal"),
+        ({"completion_loss_mask": [[True]]}, "must align"),
+        ({"completion_loss_mask": [[False, False, False]]}, "must select at least one"),
+        ({"rollout_ids": ["same", "same"]}, "must align"),
+    ],
+)
+def test_external_rollout_rejects_malformed_results(update, message):
+    output = {
+        "prompt_ids": [[10, 11]],
+        "prompt_lengths": [2],
+        "completion_ids": [[20, 30, 21]],
+        "completion_loss_mask": [[True, False, True]],
+        "logprobs": [[-0.1, 0.0, -0.2]],
+    }
+    output.update(update)
+    trainer = _external_rollout_trainer(lambda *args, **kwargs: output)
+
+    with pytest.raises(ValueError, match=message):
+        DistillationTrainer._generate_with_rollout_func(trainer, [_external_rollout_slice()], [0])
+
+
+def test_generate_student_completions_uses_default_model_path_without_rollout_func():
+    trainer = MagicMock()
+    trainer.rollout_func = None
+    trainer.use_vllm = False
+
+    DistillationTrainer._generate_student_completions.__wrapped__(trainer, [{}], [0])
+
+    trainer._generate_with_model.assert_called_once_with([{}], [0])
+
+
 def _ragged_server_response():
     # Two samples with completion lengths 1 and 3 respectively; matches the wire format
     # of VLLMClient.get_sequence_logprobs (per-sample shape (comp_len, top_k=1)).
@@ -262,6 +361,33 @@ def test_build_teacher_request_inputs(
 
 
 class TestGetTeacherTokenLogprobsFromServer(TrlTestCase):
+    def test_explicit_prompt_boundary_keeps_sparse_multiturn_positions_aligned(self):
+        mock_self = MagicMock()
+        mock_self.teacher_client.get_sequence_logprobs = MagicMock(
+            return_value={
+                "logprobs": [[[-1.0], [-2.0], [-3.0]]],
+                "logprob_token_ids": [[[20], [30], [21]]],
+                "actual_logprobs": [[[-1.0], [-2.0], [-3.0]]],
+            }
+        )
+        mock_self.loss_top_k = 1
+        mock_self.temperature = 1.0
+        inputs = {
+            "input_ids": torch.tensor([[10, 11, 20, 30, 21]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1, 1]]),
+            "prompt_attention_mask": torch.tensor([[1, 1]]),
+            "prompt_length": 2,
+            "labels": torch.tensor([[-100, -100, 20, -100, 21]]),
+        }
+
+        out = DistillationTrainer._get_teacher_token_logprobs_from_server(mock_self, inputs, aligned_prompt_length=2)
+
+        torch.testing.assert_close(out["actual_logprobs"], torch.tensor([[-1.0, -2.0, -3.0]]))
+        assert out["topk_token_ids"].squeeze(-1).tolist() == [[20, 30, 21]]
+        call = mock_self.teacher_client.get_sequence_logprobs.call_args.kwargs
+        assert call["sequences"] == [[10, 11, 20, 30, 21]]
+        assert call["prompt_lengths"] == [2]
+
     def test_variable_lengths_use_neg_inf_sentinel_at_padding(self):
         mock_self = MagicMock()
         mock_self.teacher_client.get_sequence_logprobs = MagicMock(return_value=_ragged_server_response())

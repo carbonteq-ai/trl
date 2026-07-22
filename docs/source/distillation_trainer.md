@@ -92,6 +92,38 @@ When using the teacher server:
 - `reverse_kl_top_1_mode="argmax"` is not supported
 - Liger kernel is not supported
 
+### Using external environment rollouts
+
+Pass `rollout_func` when an external environment owns student interaction. The
+callback receives structured prompts, the trainer, and tokenized input records.
+It must return exact token ids rather than decoded text:
+
+```python
+def rollout_func(prompts, trainer, inputs):
+    trajectories = environment.run(prompts, policy=trainer.model)
+    return {
+        "prompt_ids": [trajectory.prompt_ids for trajectory in trajectories],
+        "prompt_lengths": [len(trajectory.prompt_ids) for trajectory in trajectories],
+        "completion_ids": [trajectory.completion_ids for trajectory in trajectories],
+        "completion_loss_mask": [trajectory.model_token_mask for trajectory in trajectories],
+        "logprobs": [trajectory.sampling_logprobs for trajectory in trajectories],
+        "rollout_ids": [trajectory.id for trajectory in trajectories],
+    }
+
+trainer = DistillationTrainer(
+    model=student,
+    args=config,
+    train_dataset=prompt_dataset,
+    rollout_func=rollout_func,
+)
+```
+
+`completion_ids` may include tool or environment tokens needed as context for
+later student turns. Set the corresponding `completion_loss_mask` entries to
+`False`; the trainer keeps those tokens in the sequence while excluding them
+from the distillation loss. `logprobs` must align with every completion token,
+and each optional `rollout_id` must be unique within the generated batch.
+
 ### Expected dataset type
 
 The dataset should be formatted as a [conversational](dataset_formats#conversational) [language modeling](dataset_formats#language-modeling) dataset:
