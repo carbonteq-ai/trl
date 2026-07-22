@@ -524,7 +524,11 @@ class VLLMGeneration:
                 self.engine_kwargs.get("kv_cache_dtype", "")
             ).startswith("turboquant_")
             if observe_runtime_metrics:
-                llm_kwargs["disable_log_stats"] = False
+                requested_log_stats = self.engine_kwargs.get("disable_log_stats")
+                if requested_log_stats is True:
+                    raise ValueError("runtime metric collection requires vLLM disable_log_stats=False")
+                if requested_log_stats is None:
+                    llm_kwargs["disable_log_stats"] = False
             if self.weight_sync_mode == "lora":
                 max_rank = max(config.r for config in model.peft_config.values())
                 supported_ranks = (1, 8, 16, 32, 64, 128, 256, 320, 512)
