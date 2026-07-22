@@ -55,6 +55,33 @@ _SPEC_DECODE_COUNTERS = {
     "vllm:spec_decode_num_accepted_tokens": "accepted_tokens",
 }
 
+_KV_CACHE_CAPACITY_METRIC = "rollout/kv_cache_capacity_tokens"
+_KV_CACHE_PEAK_USAGE_METRIC = "rollout/kv_cache_peak_usage_ratio"
+
+
+class _KvCachePeakTracker:
+    """Retain the exact peak scheduler-reported KV-cache usage for one generation call."""
+
+    def __init__(self) -> None:
+        self.peak_usage_ratio = 0.0
+
+    def record(self, scheduler_stats, iteration_stats, mm_cache_stats=None, engine_idx=0) -> None:
+        del iteration_stats, mm_cache_stats, engine_idx
+        if scheduler_stats is not None:
+            self.peak_usage_ratio = max(self.peak_usage_ratio, float(scheduler_stats.kv_cache_usage))
+
+    def reset(self) -> None:
+        self.peak_usage_ratio = 0.0
+
+    def log(self) -> None:
+        pass
+
+    def log_engine_initialized(self) -> None:
+        pass
+
+    def record_sleep_state(self, sleep=0, level=0) -> None:
+        del sleep, level
+
 
 def _compute_spec_decode_counter_delta(
     current: dict[str, float], previous: dict[str, float]
@@ -92,17 +119,24 @@ def _accumulate_spec_decode_metrics(
         "rollout/spec_num_draft_tokens",
         "rollout/spec_num_accepted_tokens",
     )
-    totals = {
-        name: (buffer.get(name, [0.0])[-1] if buffer.get(name) else 0.0) + metrics.get(name, 0.0)
-        for name in counter_names
-    }
-    for name, value in totals.items():
-        buffer[name] = [value]
-    drafts = totals["rollout/spec_num_drafts"]
-    draft_tokens = totals["rollout/spec_num_draft_tokens"]
-    accepted_tokens = totals["rollout/spec_num_accepted_tokens"]
-    buffer["rollout/spec_accept_rate"] = [accepted_tokens / draft_tokens if draft_tokens > 0 else 0.0]
-    buffer["rollout/spec_accept_length"] = [1.0 + accepted_tokens / drafts if drafts > 0 else 0.0]
+    if any(name in metrics for name in counter_names):
+        totals = {
+            name: (buffer.get(name, [0.0])[-1] if buffer.get(name) else 0.0) + metrics.get(name, 0.0)
+            for name in counter_names
+        }
+        for name, value in totals.items():
+            buffer[name] = [value]
+        drafts = totals["rollout/spec_num_drafts"]
+        draft_tokens = totals["rollout/spec_num_draft_tokens"]
+        accepted_tokens = totals["rollout/spec_num_accepted_tokens"]
+        buffer["rollout/spec_accept_rate"] = [accepted_tokens / draft_tokens if draft_tokens > 0 else 0.0]
+        buffer["rollout/spec_accept_length"] = [1.0 + accepted_tokens / drafts if drafts > 0 else 0.0]
+
+    if _KV_CACHE_CAPACITY_METRIC in metrics:
+        buffer[_KV_CACHE_CAPACITY_METRIC] = [metrics[_KV_CACHE_CAPACITY_METRIC]]
+    if _KV_CACHE_PEAK_USAGE_METRIC in metrics:
+        prior_peak = buffer.get(_KV_CACHE_PEAK_USAGE_METRIC, [0.0])[-1]
+        buffer[_KV_CACHE_PEAK_USAGE_METRIC] = [max(prior_peak, metrics[_KV_CACHE_PEAK_USAGE_METRIC])]
 
 
 def _apply_turboquant_compatibility_patch() -> tuple[str, ...]:
@@ -404,6 +438,8 @@ class VLLMGeneration:
         self.generation_kwargs = generation_kwargs or {}
         self.last_generation_metrics: dict[str, float] = {}
         self._spec_decode_counter_snapshot: dict[str, float] = {}
+        self._kv_cache_capacity_tokens: float | None = None
+        self._kv_cache_peak_tracker: _KvCachePeakTracker | None = None
 
         self._init_vllm()
 
@@ -484,6 +520,11 @@ class VLLMGeneration:
                 "quantization": quantization,
                 "trust_remote_code": self.trust_remote_code,
             }
+            observe_runtime_metrics = self.speculative_config is not None or str(
+                self.engine_kwargs.get("kv_cache_dtype", "")
+            ).startswith("turboquant_")
+            if observe_runtime_metrics:
+                llm_kwargs["disable_log_stats"] = False
             if self.weight_sync_mode == "lora":
                 max_rank = max(config.r for config in model.peft_config.values())
                 supported_ranks = (1, 8, 16, 32, 64, 128, 256, 320, 512)
@@ -499,6 +540,15 @@ class VLLMGeneration:
                 _apply_turboquant_compatibility_patch()
             llm_kwargs.update(self.engine_kwargs)
             self.llm = LLM(**llm_kwargs)
+            if observe_runtime_metrics:
+                cache_config = self.llm.llm_engine.vllm_config.cache_config
+                capacity = getattr(cache_config, "kv_cache_size_tokens", None)
+                if isinstance(capacity, int) and capacity > 0:
+                    self._kv_cache_capacity_tokens = float(capacity)
+                logger_manager = self.llm.llm_engine.logger_manager
+                if logger_manager is not None:
+                    self._kv_cache_peak_tracker = _KvCachePeakTracker()
+                    logger_manager.stat_loggers.append(self._kv_cache_peak_tracker)
             if self.weight_sync_mode == "lora":
                 self._lora_directory = tempfile.TemporaryDirectory(prefix="trl-vllm-lora-")
                 self._lora_request = LoRARequest(
@@ -678,20 +728,26 @@ class VLLMGeneration:
         level = 1 if self.weight_sync_mode == "lora" else 2
         self.llm.sleep(level=level)
 
-    def _collect_spec_decode_metrics(self) -> None:
-        """Snapshot optional aggregate MTP counters before a colocated engine sleeps."""
+    def _collect_generation_metrics(self) -> None:
+        """Snapshot optional MTP and KV-cache runtime metrics before the engine sleeps."""
         self.last_generation_metrics = {}
-        if self.mode != "colocate" or self.speculative_config is None or not hasattr(self.llm, "get_metrics"):
+        if self.mode != "colocate":
             return
-        current: dict[str, float] = {}
-        for metric in self.llm.get_metrics():
-            normalized_name = _SPEC_DECODE_COUNTERS.get(getattr(metric, "name", ""))
-            value = getattr(metric, "value", None)
-            if normalized_name is not None and isinstance(value, (int, float)):
-                current[normalized_name] = current.get(normalized_name, 0.0) + float(value)
-        self.last_generation_metrics, self._spec_decode_counter_snapshot = _compute_spec_decode_counter_delta(
-            current, self._spec_decode_counter_snapshot
-        )
+        if self.speculative_config is not None and hasattr(self.llm, "get_metrics"):
+            current: dict[str, float] = {}
+            for metric in self.llm.get_metrics():
+                normalized_name = _SPEC_DECODE_COUNTERS.get(getattr(metric, "name", ""))
+                value = getattr(metric, "value", None)
+                if normalized_name is not None and isinstance(value, (int, float)):
+                    current[normalized_name] = current.get(normalized_name, 0.0) + float(value)
+            spec_metrics, self._spec_decode_counter_snapshot = _compute_spec_decode_counter_delta(
+                current, self._spec_decode_counter_snapshot
+            )
+            self.last_generation_metrics.update(spec_metrics)
+        if self._kv_cache_capacity_tokens is not None:
+            self.last_generation_metrics[_KV_CACHE_CAPACITY_METRIC] = self._kv_cache_capacity_tokens
+        if self._kv_cache_peak_tracker is not None:
+            self.last_generation_metrics[_KV_CACHE_PEAK_USAGE_METRIC] = self._kv_cache_peak_tracker.peak_usage_ratio
 
     def generate(
         self,
@@ -862,6 +918,8 @@ class VLLMGeneration:
                 torch.distributed.barrier(device_ids=[accelerator.local_process_index])
 
             with profiler:
+                if self._kv_cache_peak_tracker is not None:
+                    self._kv_cache_peak_tracker.reset()
                 all_outputs = self.llm.generate(
                     vllm_prompts,
                     sampling_params=sampling_params,
@@ -888,7 +946,7 @@ class VLLMGeneration:
                 logprobs = all_logprobs
                 logprob_token_ids = all_logprob_token_ids
 
-            self._collect_spec_decode_metrics()
+            self._collect_generation_metrics()
             self._sleep_colocated_engine()
 
         return prompt_ids, completion_ids, logprobs, logprob_token_ids

@@ -35,12 +35,15 @@ def test_speculative_counters_are_reported_as_per_generation_deltas():
     assert snapshot == {"drafts": 14.0, "draft_tokens": 28.0, "accepted_tokens": 21.0}
 
 
-def test_colocated_generation_collects_vllm_speculative_metrics():
+def test_colocated_generation_collects_vllm_runtime_metrics():
     generation = object.__new__(VLLMGeneration)
     generation.mode = "colocate"
     generation.speculative_config = {"method": "mtp", "num_speculative_tokens": 1}
     generation.last_generation_metrics = {}
     generation._spec_decode_counter_snapshot = {}
+    generation._kv_cache_capacity_tokens = 4096.0
+    generation._kv_cache_peak_tracker = vllm_generation._KvCachePeakTracker()
+    generation._kv_cache_peak_tracker.peak_usage_ratio = 0.625
     generation.llm = SimpleNamespace(
         get_metrics=lambda: [
             SimpleNamespace(name="vllm:spec_decode_num_drafts", value=4),
@@ -50,7 +53,7 @@ def test_colocated_generation_collects_vllm_speculative_metrics():
         ]
     )
 
-    generation._collect_spec_decode_metrics()
+    generation._collect_generation_metrics()
 
     assert generation.last_generation_metrics == {
         "rollout/spec_num_drafts": 4.0,
@@ -58,7 +61,21 @@ def test_colocated_generation_collects_vllm_speculative_metrics():
         "rollout/spec_num_accepted_tokens": 6.0,
         "rollout/spec_accept_rate": 0.75,
         "rollout/spec_accept_length": 2.5,
+        "rollout/kv_cache_capacity_tokens": 4096.0,
+        "rollout/kv_cache_peak_usage_ratio": 0.625,
     }
+
+
+def test_kv_cache_peak_tracker_retains_maximum_scheduler_sample():
+    tracker = vllm_generation._KvCachePeakTracker()
+
+    tracker.record(SimpleNamespace(kv_cache_usage=0.25), None)
+    tracker.record(SimpleNamespace(kv_cache_usage=0.75), None)
+    tracker.record(SimpleNamespace(kv_cache_usage=0.5), None)
+
+    assert tracker.peak_usage_ratio == 0.75
+    tracker.reset()
+    assert tracker.peak_usage_ratio == 0.0
 
 
 def test_speculative_turn_metrics_accumulate_as_step_totals():
@@ -93,12 +110,34 @@ def test_speculative_turn_metrics_accumulate_as_step_totals():
     }
 
 
+def test_kv_cache_runtime_metrics_keep_capacity_and_step_peak():
+    buffer = {}
+
+    _accumulate_spec_decode_metrics(
+        buffer,
+        {"rollout/kv_cache_capacity_tokens": 4096.0, "rollout/kv_cache_peak_usage_ratio": 0.4},
+    )
+    _accumulate_spec_decode_metrics(
+        buffer,
+        {"rollout/kv_cache_capacity_tokens": 4096.0, "rollout/kv_cache_peak_usage_ratio": 0.7},
+    )
+
+    assert buffer == {
+        "rollout/kv_cache_capacity_tokens": [4096.0],
+        "rollout/kv_cache_peak_usage_ratio": [0.7],
+    }
+
+
 def test_colocated_engine_receives_speculative_config(monkeypatch):
     captured = {}
 
     class FakeLLM:
         def __init__(self, **kwargs):
             captured.update(kwargs)
+            self.llm_engine = SimpleNamespace(
+                vllm_config=SimpleNamespace(cache_config=SimpleNamespace(kv_cache_size_tokens=2048)),
+                logger_manager=SimpleNamespace(stat_loggers=[]),
+            )
 
     class FakeModel:
         name_or_path = "model"
