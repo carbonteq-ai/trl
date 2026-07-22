@@ -69,7 +69,7 @@ from ..chat_template_utils import (
 from ..data_utils import apply_chat_template, is_conversational, prepare_multimodal_messages
 from ..distributed import DistributedBackend
 from ..extras.profiling import profiling_context, profiling_decorator
-from ..generation.vllm_generation import VLLMGeneration
+from ..generation.vllm_generation import VLLMGeneration, _accumulate_spec_decode_metrics
 from ..import_utils import is_jmespath_available, is_liger_kernel_available
 from ..models import prepare_deepspeed, prepare_fsdp, unwrap_model_for_generation
 from ..models.utils import _ForwardRedirection, disable_gradient_checkpointing
@@ -1664,6 +1664,7 @@ class GRPOTrainer(_BaseTrainer):
                 num_generations=num_generations,
                 profiler=profiling_context(self, "vLLM.generate"),
             )
+            _accumulate_spec_decode_metrics(self._metrics[mode], self.vllm_generation.last_generation_metrics)
             # vLLM returns per-token top-k logprobs; keep only the top-1 (sampled token) logprob
             logprobs = [[lp[0] for lp in seq] for seq in logprobs]
 

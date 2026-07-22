@@ -41,7 +41,7 @@ from transformers.trainer_utils import EvalPrediction, seed_worker
 from transformers.utils import is_liger_kernel_available, is_peft_available, is_rich_available
 
 from ...extras.profiling import profiling_decorator
-from ...generation.vllm_generation import VLLMGeneration
+from ...generation.vllm_generation import VLLMGeneration, _accumulate_spec_decode_metrics
 from ...import_utils import is_vllm_available
 from ...models import prepare_deepspeed
 from ...models.utils import _ForwardRedirection, unwrap_model_for_generation
@@ -679,6 +679,8 @@ class DistillationTrainer(_BaseTrainer):
                 max_model_length=args.vllm_max_model_length,
                 max_num_seqs=args.per_device_train_batch_size * args.gradient_accumulation_steps,
                 enable_sleep_mode=args.vllm_enable_sleep_mode,
+                speculative_config=args.vllm_speculative_config,
+                engine_kwargs=args.vllm_engine_kwargs,
                 model_impl=args.vllm_model_impl,
                 trust_remote_code=args.trust_remote_code,
                 temperature=args.temperature,
@@ -910,6 +912,7 @@ class DistillationTrainer(_BaseTrainer):
         _, completion_ids, _, _ = self.vllm_generation.generate(
             prompts=prompt_ids_list, images=None, num_generations=self.num_generations
         )
+        _accumulate_spec_decode_metrics(self._metrics["train"], self.vllm_generation.last_generation_metrics)
 
         # Process completions into the buffer
         self._store_completions_in_buffer(
@@ -1081,6 +1084,8 @@ class DistillationTrainer(_BaseTrainer):
                 images=None,
                 num_generations=1,
             )
+            mode = "train" if self.model.training else "eval"
+            _accumulate_spec_decode_metrics(self._metrics[mode], self.vllm_generation.last_generation_metrics)
             if logprobs is None:
                 raise RuntimeError("vLLM must return sampled-token logprobs for external distillation rollouts")
             return completion_ids, [[float(token_logprobs[0]) for token_logprobs in row] for row in logprobs]

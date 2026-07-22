@@ -139,6 +139,11 @@ class DistillationConfig(_BaseConfig):
             Frequency (in training steps) to synchronize student model weights to the vLLM engine.
         vllm_enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Enable vLLM sleep mode to offload student weights during the optimizer step.
+        vllm_speculative_config (`dict`, *optional*):
+            Speculative decoding configuration forwarded to the colocated vLLM engine. For example,
+            `{"method": "mtp", "num_speculative_tokens": 1}` enables a compatible model's native MTP head.
+        vllm_engine_kwargs (`dict`, *optional*):
+            Additional non-conflicting keyword arguments forwarded to the colocated `vllm.LLM` constructor.
 
         > Parameters that control logging
 
@@ -152,7 +157,12 @@ class DistillationConfig(_BaseConfig):
             Number of completions to print. If `None`, all completions are logged.
     """
 
-    _VALID_DICT_FIELDS = _BaseConfig._VALID_DICT_FIELDS + ["model_init_kwargs", "teacher_model_init_kwargs"]
+    _VALID_DICT_FIELDS = _BaseConfig._VALID_DICT_FIELDS + [
+        "model_init_kwargs",
+        "teacher_model_init_kwargs",
+        "vllm_speculative_config",
+        "vllm_engine_kwargs",
+    ]
 
     # Model
     model_init_kwargs: dict[str, Any] | str | None = field(
@@ -354,6 +364,14 @@ class DistillationConfig(_BaseConfig):
     vllm_enable_sleep_mode: bool = field(
         default=False,
         metadata={"help": "Enable vLLM sleep mode to offload student weights during the optimizer step."},
+    )
+    vllm_speculative_config: dict | None = field(
+        default=None,
+        metadata={"help": "Speculative decoding configuration for the colocated vLLM engine."},
+    )
+    vllm_engine_kwargs: dict | None = field(
+        default=None,
+        metadata={"help": "Additional non-conflicting keyword arguments for the colocated vLLM engine."},
     )
 
     # W&B

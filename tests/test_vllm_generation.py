@@ -3,7 +3,94 @@ from types import SimpleNamespace
 import pytest
 
 from trl.generation import vllm_generation
-from trl.generation.vllm_generation import VLLMGeneration
+from trl.generation.vllm_generation import (
+    VLLMGeneration,
+    _accumulate_spec_decode_metrics,
+    _compute_spec_decode_counter_delta,
+)
+
+
+def test_speculative_counters_are_reported_as_per_generation_deltas():
+    first, snapshot = _compute_spec_decode_counter_delta(
+        {"drafts": 10.0, "draft_tokens": 20.0, "accepted_tokens": 15.0}, {}
+    )
+    second, snapshot = _compute_spec_decode_counter_delta(
+        {"drafts": 14.0, "draft_tokens": 28.0, "accepted_tokens": 21.0}, snapshot
+    )
+
+    assert first == {
+        "rollout/spec_num_drafts": 10.0,
+        "rollout/spec_num_draft_tokens": 20.0,
+        "rollout/spec_num_accepted_tokens": 15.0,
+        "rollout/spec_accept_rate": 0.75,
+        "rollout/spec_accept_length": 2.5,
+    }
+    assert second == {
+        "rollout/spec_num_drafts": 4.0,
+        "rollout/spec_num_draft_tokens": 8.0,
+        "rollout/spec_num_accepted_tokens": 6.0,
+        "rollout/spec_accept_rate": 0.75,
+        "rollout/spec_accept_length": 2.5,
+    }
+    assert snapshot == {"drafts": 14.0, "draft_tokens": 28.0, "accepted_tokens": 21.0}
+
+
+def test_colocated_generation_collects_vllm_speculative_metrics():
+    generation = object.__new__(VLLMGeneration)
+    generation.mode = "colocate"
+    generation.speculative_config = {"method": "mtp", "num_speculative_tokens": 1}
+    generation.last_generation_metrics = {}
+    generation._spec_decode_counter_snapshot = {}
+    generation.llm = SimpleNamespace(
+        get_metrics=lambda: [
+            SimpleNamespace(name="vllm:spec_decode_num_drafts", value=4),
+            SimpleNamespace(name="vllm:spec_decode_num_draft_tokens", value=8),
+            SimpleNamespace(name="vllm:spec_decode_num_accepted_tokens", value=6),
+            SimpleNamespace(name="vllm:unrelated", value=100),
+        ]
+    )
+
+    generation._collect_spec_decode_metrics()
+
+    assert generation.last_generation_metrics == {
+        "rollout/spec_num_drafts": 4.0,
+        "rollout/spec_num_draft_tokens": 8.0,
+        "rollout/spec_num_accepted_tokens": 6.0,
+        "rollout/spec_accept_rate": 0.75,
+        "rollout/spec_accept_length": 2.5,
+    }
+
+
+def test_speculative_turn_metrics_accumulate_as_step_totals():
+    buffer = {}
+    _accumulate_spec_decode_metrics(
+        buffer,
+        {
+            "rollout/spec_num_drafts": 4.0,
+            "rollout/spec_num_draft_tokens": 8.0,
+            "rollout/spec_num_accepted_tokens": 6.0,
+            "rollout/spec_accept_rate": 0.75,
+            "rollout/spec_accept_length": 2.5,
+        },
+    )
+    _accumulate_spec_decode_metrics(
+        buffer,
+        {
+            "rollout/spec_num_drafts": 2.0,
+            "rollout/spec_num_draft_tokens": 4.0,
+            "rollout/spec_num_accepted_tokens": 2.0,
+            "rollout/spec_accept_rate": 0.5,
+            "rollout/spec_accept_length": 2.0,
+        },
+    )
+
+    assert buffer == {
+        "rollout/spec_num_drafts": [6.0],
+        "rollout/spec_num_draft_tokens": [12.0],
+        "rollout/spec_num_accepted_tokens": [8.0],
+        "rollout/spec_accept_rate": [2 / 3],
+        "rollout/spec_accept_length": [1 + 8 / 6],
+    }
 
 
 def test_colocated_engine_receives_speculative_config(monkeypatch):

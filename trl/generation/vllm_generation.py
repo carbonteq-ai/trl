@@ -18,8 +18,9 @@ import logging
 import math
 import os
 import tempfile
+from collections.abc import MutableMapping
 from contextlib import nullcontext
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from accelerate.utils import broadcast_object_list, gather_object, is_peft_model
@@ -47,6 +48,83 @@ if is_vllm_available():
 
 
 logger = logging.getLogger(__name__)
+
+_SPEC_DECODE_COUNTERS = {
+    "vllm:spec_decode_num_drafts": "drafts",
+    "vllm:spec_decode_num_draft_tokens": "draft_tokens",
+    "vllm:spec_decode_num_accepted_tokens": "accepted_tokens",
+}
+
+
+def _compute_spec_decode_counter_delta(
+    current: dict[str, float], previous: dict[str, float]
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Convert vLLM process-lifetime counters into metrics for one generation call."""
+    if not current:
+        return {}, previous
+    delta = {
+        name: value - previous.get(name, 0.0) if value >= previous.get(name, 0.0) else value
+        for name, value in current.items()
+    }
+    drafts = delta.get("drafts", 0.0)
+    draft_tokens = delta.get("draft_tokens", 0.0)
+    accepted_tokens = delta.get("accepted_tokens", 0.0)
+    return (
+        {
+            "rollout/spec_num_drafts": drafts,
+            "rollout/spec_num_draft_tokens": draft_tokens,
+            "rollout/spec_num_accepted_tokens": accepted_tokens,
+            "rollout/spec_accept_rate": accepted_tokens / draft_tokens if draft_tokens > 0 else 0.0,
+            "rollout/spec_accept_length": 1.0 + accepted_tokens / drafts if drafts > 0 else 0.0,
+        },
+        current,
+    )
+
+
+def _accumulate_spec_decode_metrics(
+    buffer: MutableMapping[str, list[float]], metrics: dict[str, float]
+) -> None:
+    """Accumulate turn-local counters into one step total with weighted rates."""
+    if not metrics:
+        return
+    counter_names = (
+        "rollout/spec_num_drafts",
+        "rollout/spec_num_draft_tokens",
+        "rollout/spec_num_accepted_tokens",
+    )
+    totals = {
+        name: (buffer.get(name, [0.0])[-1] if buffer.get(name) else 0.0) + metrics.get(name, 0.0)
+        for name in counter_names
+    }
+    for name, value in totals.items():
+        buffer[name] = [value]
+    drafts = totals["rollout/spec_num_drafts"]
+    draft_tokens = totals["rollout/spec_num_draft_tokens"]
+    accepted_tokens = totals["rollout/spec_num_accepted_tokens"]
+    buffer["rollout/spec_accept_rate"] = [accepted_tokens / draft_tokens if draft_tokens > 0 else 0.0]
+    buffer["rollout/spec_accept_length"] = [1.0 + accepted_tokens / drafts if drafts > 0 else 0.0]
+
+
+def _apply_turboquant_compatibility_patch() -> tuple[str, ...]:
+    """Preserve TurboQuant's quantized cache marker in affected vLLM builds."""
+    from vllm.v1.kv_cache_interface import KVQuantMode, TQFullAttentionSpec, get_kv_quant_mode
+
+    if get_kv_quant_mode("turboquant_k8v4") != KVQuantMode.NONE:
+        return ()
+    if getattr(TQFullAttentionSpec, "_trl_quant_marker_patch", False):
+        return ("turboquant-quant-marker",)
+
+    inherited_post_init: Any = TQFullAttentionSpec.__post_init__
+
+    def tq_post_init(self: Any) -> None:
+        inherited_post_init(self)
+        if self.kv_quant_mode == KVQuantMode.NONE:
+            object.__setattr__(self, "kv_quant_mode", KVQuantMode.FP8_PER_TENSOR)
+
+    spec_class: Any = TQFullAttentionSpec
+    spec_class.__post_init__ = tq_post_init
+    spec_class._trl_quant_marker_patch = True
+    return ("turboquant-quant-marker",)
 
 
 def empty_cache() -> None:
@@ -324,6 +402,8 @@ class VLLMGeneration:
         self.max_completion_length = max_completion_length
         self.logprobs = logprobs
         self.generation_kwargs = generation_kwargs or {}
+        self.last_generation_metrics: dict[str, float] = {}
+        self._spec_decode_counter_snapshot: dict[str, float] = {}
 
         self._init_vllm()
 
@@ -415,6 +495,8 @@ class VLLMGeneration:
             conflicts = sorted(set(llm_kwargs).intersection(self.engine_kwargs))
             if conflicts:
                 raise ValueError(f"vLLM engine kwargs cannot override TRL-controlled arguments: {', '.join(conflicts)}")
+            if str(self.engine_kwargs.get("kv_cache_dtype", "")).startswith("turboquant_"):
+                _apply_turboquant_compatibility_patch()
             llm_kwargs.update(self.engine_kwargs)
             self.llm = LLM(**llm_kwargs)
             if self.weight_sync_mode == "lora":
@@ -595,6 +677,21 @@ class VLLMGeneration:
         # because vLLM cannot reload a bitsandbytes checkpoint after level 2 discards those allocations.
         level = 1 if self.weight_sync_mode == "lora" else 2
         self.llm.sleep(level=level)
+
+    def _collect_spec_decode_metrics(self) -> None:
+        """Snapshot optional aggregate MTP counters before a colocated engine sleeps."""
+        self.last_generation_metrics = {}
+        if self.mode != "colocate" or self.speculative_config is None or not hasattr(self.llm, "get_metrics"):
+            return
+        current: dict[str, float] = {}
+        for metric in self.llm.get_metrics():
+            normalized_name = _SPEC_DECODE_COUNTERS.get(getattr(metric, "name", ""))
+            value = getattr(metric, "value", None)
+            if normalized_name is not None and isinstance(value, (int, float)):
+                current[normalized_name] = current.get(normalized_name, 0.0) + float(value)
+        self.last_generation_metrics, self._spec_decode_counter_snapshot = _compute_spec_decode_counter_delta(
+            current, self._spec_decode_counter_snapshot
+        )
 
     def generate(
         self,
@@ -791,6 +888,7 @@ class VLLMGeneration:
                 logprobs = all_logprobs
                 logprob_token_ids = all_logprob_token_ids
 
+            self._collect_spec_decode_metrics()
             self._sleep_colocated_engine()
 
         return prompt_ids, completion_ids, logprobs, logprob_token_ids

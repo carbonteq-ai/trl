@@ -207,6 +207,7 @@ def test_external_rollout_single_turn_uses_vllm_exact_tokens_and_sampled_logprob
         [[[-0.1], [-0.2]]],
         None,
     )
+    trainer.vllm_generation.last_generation_metrics = {}
 
     completion_ids, logprobs = DistillationTrainer._generate_single_turn(trainer, [[10, 11]])
 
@@ -269,6 +270,20 @@ def test_distillation_config_rejects_liger_with_teacher_server(tmp_path):
             teacher_model_server_url="http://localhost:8000",
             use_liger_kernel=True,
         )
+
+
+def test_distillation_config_accepts_colocated_vllm_engine_options(tmp_path):
+    speculative = {"method": "mtp", "num_speculative_tokens": 1}
+    config = DistillationConfig(
+        **_make_distillation_config_kwargs(tmp_path),
+        use_vllm=True,
+        vllm_mode="colocate",
+        vllm_speculative_config=speculative,
+        vllm_engine_kwargs={"kv_cache_dtype": "turboquant_k8v4"},
+    )
+
+    assert config.vllm_speculative_config == speculative
+    assert config.vllm_engine_kwargs == {"kv_cache_dtype": "turboquant_k8v4"}
 
 
 def test_distillation_config_rejects_invalid_reverse_kl_top_1_mode(tmp_path):

@@ -1,0 +1,103 @@
+# CarbonTeq TRL fork ledger
+
+This file records the maintained delta between `carbonteq-ai/trl` and
+`huggingface/trl`. Generic trainer and runtime changes belong here; project
+model selections, environment policy, and qualification evidence belong in the
+consuming post-training framework.
+
+## Upstream base
+
+- Upstream repository: `git@github.com:huggingface/trl.git`
+- Upstream base: `95809b942eb5d11d0b06d749510d88be99230b73` (`Release: v1.8 (#6346)`)
+- CarbonTeq remote: `git@github.com:carbonteq-ai/trl.git`
+- Published consumer commit: `9c01e51243aed3c88d1f726bd6dab59843b62a9b`
+- Current development branch: `codex/verifiers-distillation-rollouts`
+
+The post-training framework's executable pin is in
+`../rl/packages/train/pyproject.toml` and `../rl/uv.lock`. Do not describe a
+working-tree change as published support or update that immutable pin before
+the fork commit is pushed.
+
+## Maintained delta
+
+The fork currently maintains:
+
+- vLLM 0.24 and 0.25 dependency compatibility;
+- `datasets 4.6` compatibility for Verifiers integration;
+- memory-efficient entropy metrics for non-contiguous slices;
+- colocated GRPO vLLM speculative configuration and guarded engine kwargs;
+- model weight-name prefixes, native LoRA synchronization, and compatible
+  sleep/wake behavior for quantized bases;
+- exact-token Verifiers rollout hooks and dataset identity for GRPO and
+  experimental on-policy distillation;
+- candidate support for native MTP and KV-cache dtypes in on-policy
+  distillation, plus normalized per-generation speculative-decoding metrics;
+- a candidate vLLM 0.25.1 TurboQuant cache-marker compatibility guard which
+  activates only when the installed build still reports no TurboQuant
+  quantization mode.
+
+Native MTP here means rollout acceleration through the model's bundled draft
+head. It does not add an MTP auxiliary training loss. TurboQuant changes only
+the rollout KV cache; it does not quantize trainable actor weights.
+
+## Compatibility constraints
+
+The candidate MTP and TurboQuant additions apply to colocated vLLM engines.
+External server mode must receive equivalent options when the server process is
+launched. The shared vLLM constructor rejects engine kwargs which attempt to
+override TRL-owned model, lifecycle, synchronization, or sampling arguments.
+
+The current consumer resolves Python 3.12, Torch 2.11, Transformers 5.14, and
+vLLM 0.25.1. On the local Ampere GPU, TurboQuant K8V4 requires an FP16 rollout
+copy. The consumer adapter selects that dtype when K8V4 is requested.
+
+TurboQuant is configuration-supported but not Qwen 3.5 quality-qualified: its
+32K matched recall gate remains open. MTP and TurboQuant must be qualified
+independently before testing their combination.
+
+The consuming framework qualified the candidate native-MTP GRPO path with
+Qwen 3.5 0.8B at a 32K engine window on an 8 GiB GPU. The two-step run used
+physical microbatch one plus gradient accumulation two, completed four original
+AutomationBench trajectories, synchronized the post-update LoRA adapter, and
+recorded non-zero MTP acceptance in both steps. A follow-up run verified that
+turn-local vLLM counters are summed into step totals and rates are recomputed
+from those totals. This evidence does not qualify on-policy distillation or
+TurboQuant quality.
+
+## Regression tests
+
+From this repository, run:
+
+    uv run pytest tests/test_vllm_generation.py tests/test_grpo_trainer.py \
+      tests/experimental/test_distillation_trainer.py
+
+For the focused candidate delta, run:
+
+    uv run pytest tests/test_vllm_generation.py tests/test_grpo_trainer.py \
+      tests/experimental/test_distillation_trainer.py \
+      -k 'speculative or vllm_boundary or lora or colocated_vllm_engine_options'
+
+Run Ruff and the repository's standard test suite before publishing. The
+developer environment does not include vLLM by default; validate the guarded
+TurboQuant marker in the consumer's pinned vLLM 0.25.1 environment as a release
+gate.
+
+## Rebase procedure
+
+Fetch `upstream`, identify the new immutable upstream base, and create a fresh
+`codex/` branch. Reapply the maintained deltas in small groups, starting with
+dependency compatibility, then shared vLLM lifecycle changes, then trainer
+hooks. Run the focused tests after each group and the full suite at the end.
+Check whether upstream now exposes equivalent speculative configuration,
+engine kwargs, distillation hooks, MTP telemetry, or a native TurboQuant mode;
+drop local changes whose behavior is upstream and retain regression coverage.
+Update this base, delta, constraints, and published commit only after the new
+branch is validated and pushed.
+
+## Publication checklist
+
+Before updating a consumer pin, record a clean fork commit, push it to the
+CarbonTeq remote, run the focused regression suite, run the consumer adapter
+tests, and execute the relevant GPU qualification. The consumer page at
+`../rl/docs/tooling/trl/README.md` owns the selected models, operating values,
+run evidence, and outstanding release gates.
