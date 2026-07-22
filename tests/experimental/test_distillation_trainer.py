@@ -194,6 +194,31 @@ def test_generate_student_completions_uses_default_model_path_without_rollout_fu
     trainer._generate_with_model.assert_called_once_with([{}], [0])
 
 
+def test_external_rollout_single_turn_uses_vllm_exact_tokens_and_sampled_logprobs():
+    trainer = MagicMock()
+    trainer.use_vllm = True
+    trainer.state.global_step = 3
+    trainer._last_vllm_sync_step = 2
+    trainer.vllm_sync_frequency = 1
+    trainer.vllm_generation.generate.return_value = (
+        None,
+        [[20, 21]],
+        [[[-0.1], [-0.2]]],
+        None,
+    )
+
+    completion_ids, logprobs = DistillationTrainer._generate_single_turn(trainer, [[10, 11]])
+
+    assert completion_ids == [[20, 21]]
+    assert logprobs[0] == pytest.approx([-0.1, -0.2])
+    trainer.vllm_generation.sync_weights.assert_called_once_with()
+    trainer.vllm_generation.generate.assert_called_once_with(
+        prompts=[[10, 11]],
+        images=None,
+        num_generations=1,
+    )
+
+
 def _ragged_server_response():
     # Two samples with completion lengths 1 and 3 respectively; matches the wire format
     # of VLLMClient.get_sequence_logprobs (per-sample shape (comp_len, top_k=1)).

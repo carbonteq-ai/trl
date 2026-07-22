@@ -682,7 +682,7 @@ class DistillationTrainer(_BaseTrainer):
                 top_p=args.top_p,
                 top_k=args.top_k,
                 max_completion_length=args.max_completion_length,
-                logprobs=None,
+                logprobs=0 if rollout_func is not None else None,
             )
             self.vllm_sync_frequency = args.vllm_sync_frequency
             self._last_vllm_sync_step = -1
@@ -1050,6 +1050,62 @@ class DistillationTrainer(_BaseTrainer):
                 ]
             self._buffered_inputs[slice_idx] = updated
             self._buffered_text_logs[slice_idx] = (prompt_texts, completion_texts)
+
+    def _generate_single_turn(
+        self,
+        prompt_ids: list[list[int]],
+        images: Any = None,
+        multimodal_fields: dict[str, Any] | None = None,
+    ) -> tuple[list[list[int]], list[list[float]]]:
+        """Generate one sampled completion per exact-token prompt for an external rollout."""
+        if images is not None or multimodal_fields:
+            raise NotImplementedError("distillation rollout_func generation currently supports text-only prompts")
+        if not prompt_ids or any(not prompt for prompt in prompt_ids):
+            raise ValueError("distillation rollout prompts must contain exact token ids")
+
+        if self.use_vllm:
+            if (
+                self.state.global_step != self._last_vllm_sync_step
+                and self.state.global_step % self.vllm_sync_frequency == 0
+            ):
+                self.vllm_generation.sync_weights()
+                self._last_vllm_sync_step = self.state.global_step
+            _, completion_ids, logprobs, _ = self.vllm_generation.generate(
+                prompts=prompt_ids,
+                images=None,
+                num_generations=1,
+            )
+            if logprobs is None:
+                raise RuntimeError("vLLM must return sampled-token logprobs for external distillation rollouts")
+            return completion_ids, [[float(token_logprobs[0]) for token_logprobs in row] for row in logprobs]
+
+        completions: list[list[int]] = []
+        sampled_logprobs: list[list[float]] = []
+        with unwrap_model_for_generation(
+            self.model, self.accelerator, generation_kwargs=self.generation_kwargs
+        ) as unwrapped_model:
+            with torch.no_grad():
+                for prompt in prompt_ids:
+                    prompt_tensor = torch.tensor([prompt], dtype=torch.long, device=self.accelerator.device)
+                    generated = unwrapped_model.generate(
+                        input_ids=prompt_tensor,
+                        attention_mask=torch.ones_like(prompt_tensor),
+                        generation_config=self.generation_config,
+                        return_dict_in_generate=True,
+                        output_scores=True,
+                    )
+                    completion = generated.sequences[0, len(prompt) :].tolist()
+                    if not completion:
+                        raise RuntimeError("student generation returned an empty completion")
+                    if len(generated.scores) != len(completion):
+                        raise RuntimeError("student generation scores do not align with completion token ids")
+                    logprobs = [
+                        float(F.log_softmax(score[0], dim=-1)[token_id].item())
+                        for score, token_id in zip(generated.scores, completion, strict=True)
+                    ]
+                    completions.append(completion)
+                    sampled_logprobs.append(logprobs)
+        return completions, sampled_logprobs
 
     def _generate_with_model(self, slices: list[dict[str, torch.Tensor | Any]], on_policy_indices: list[int]):
         """Fallback generation using model.generate() (no vLLM)."""
