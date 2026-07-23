@@ -344,6 +344,10 @@ class GRPOConfig(_BaseConfig):
             Maximum number of tool-calling turns when training an agent. If `None`, there is no limit and generation
             stops when the model generates a response turn with no tool calls or when the total response length reaches
             `max_model_length`.
+        logits_chunk_size (`int`, *optional*):
+            Maximum number of sequence positions projected through the language-model head at once when computing
+            per-token log probabilities. This reduces peak memory for long completions with large vocabularies without
+            changing the resulting log probabilities. If `None`, all requested positions are projected together.
         vllm_importance_sampling_correction (`bool`, *optional*, defaults to `True`):
             Whether to apply Importance Sampling (IS) to correct for the mismatch between vLLM completion logprobs and
             recomputed training logprobs. If set to `False`, no IS is applied regardless of
@@ -955,6 +959,13 @@ class GRPOConfig(_BaseConfig):
             "response length reaches `max_model_length`."
         },
     )
+    logits_chunk_size: int | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum sequence positions per language-model-head projection when computing per-token "
+            "log probabilities. Reduces peak memory for long completions without changing the objective."
+        },
+    )
     vllm_importance_sampling_correction: bool = field(
         default=True,
         metadata={
@@ -1144,6 +1155,9 @@ class GRPOConfig(_BaseConfig):
                 "GRPO requires at least 2 generations per prompt to calculate the advantages. You provided "
                 f"{self.num_generations}, which is less than the minimum required."
             )
+
+        if self.logits_chunk_size is not None and self.logits_chunk_size < 1:
+            raise ValueError("logits_chunk_size must be a positive integer when provided.")
 
         if self.vllm_importance_sampling_cap is not None:
             warnings.warn(

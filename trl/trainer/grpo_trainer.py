@@ -742,6 +742,7 @@ class GRPOTrainer(_BaseTrainer):
         self.vllm_importance_sampling_mode = args.vllm_importance_sampling_mode
         self.vllm_importance_sampling_clip_max = args.vllm_importance_sampling_clip_max
         self.vllm_importance_sampling_clip_min = args.vllm_importance_sampling_clip_min
+        self.logits_chunk_size = args.logits_chunk_size
         self.use_liger_kernel = args.use_liger_kernel
         self.loss_type = args.loss_type
         self.multi_objective_aggregation = args.multi_objective_aggregation
@@ -1371,32 +1372,60 @@ class GRPOTrainer(_BaseTrainer):
             if compute_aux_loss:
                 model_inputs["output_router_logits"] = True
 
-            outputs = model(**model_inputs)
-            logits = outputs.logits
-            # Exclude the last value: it corresponds to the next token pred
-            logits = logits[:, :-1, :]  # (B, L-1, H)
-            # Only keep the last logits_to_keep. For model that support logits_to_keep, this is a no-op.
-            logits = logits[:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
-            # Divide logits by sampling temperature.
-            # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-            logits.div_(self.temperature)
             completion_ids = input_ids_batch[:, -logits_to_keep:]
-            logps = selective_log_softmax(logits, completion_ids)  # compute logprobs
-            all_logps.append(logps)
+            if self.logits_chunk_size is not None:
+                if compute_aux_loss:
+                    raise ValueError("logits_chunk_size is not supported with router auxiliary loss")
+                unwrapped_model = self.accelerator.unwrap_model(model)
+                last_hidden_state = self._get_last_hidden_state(
+                    unwrapped_model,
+                    input_ids_batch,
+                    attention_mask_batch,
+                    logits_to_keep,
+                )
+                lm_head = unwrapped_model.get_output_embeddings()
+                chunk_logps = []
+                chunk_entropies = []
+                for chunk_start in range(0, logits_to_keep, self.logits_chunk_size):
+                    chunk_end = min(chunk_start + self.logits_chunk_size, logits_to_keep)
+                    logits = lm_head(last_hidden_state[:, chunk_start:chunk_end, :])
+                    logits.div_(self.temperature)
+                    chunk_ids = completion_ids[:, chunk_start:chunk_end]
+                    chunk_logps.append(selective_log_softmax(logits, chunk_ids))
+                    if compute_entropy:
+                        if self._entropy_bonus_enabled:
+                            chunk_entropies.append(entropy_from_logits(logits))
+                        else:
+                            with torch.no_grad():
+                                chunk_entropies.append(entropy_from_logits(logits))
+                all_logps.append(torch.cat(chunk_logps, dim=1))
+                if compute_entropy:
+                    all_entropies.append(torch.cat(chunk_entropies, dim=1))
+            else:
+                outputs = model(**model_inputs)
+                logits = outputs.logits
+                # Exclude the last value: it corresponds to the next token pred
+                logits = logits[:, :-1, :]  # (B, L-1, H)
+                # Only keep the last logits_to_keep. For model that support logits_to_keep, this is a no-op.
+                logits = logits[:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
+                # Divide logits by sampling temperature.
+                # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
+                logits.div_(self.temperature)
+                all_logps.append(selective_log_softmax(logits, completion_ids))
 
-            if compute_entropy:
-                # The entropy bonus is a differentiable loss term, so entropies must carry grad when it is
-                # active. Otherwise they only feed logging and the top_entropy_quantile mask (neither
-                # differentiable), so we skip grad to avoid retaining the memory-heavy full-vocab softmax.
-                if self._entropy_bonus_enabled:
-                    entropies = entropy_from_logits(logits)
-                else:
-                    with torch.no_grad():
+                if compute_entropy:
+                    # The entropy bonus is a differentiable loss term, so entropies must carry grad when it is
+                    # active. Otherwise they only feed logging and the top_entropy_quantile mask (neither
+                    # differentiable), so we skip grad to avoid retaining the memory-heavy full-vocab softmax.
+                    if self._entropy_bonus_enabled:
                         entropies = entropy_from_logits(logits)
-                all_entropies.append(entropies)
+                    else:
+                        with torch.no_grad():
+                            entropies = entropy_from_logits(logits)
+                    all_entropies.append(entropies)
 
-            if compute_aux_loss:
-                all_aux_losses.append(outputs.aux_loss)
+                if compute_aux_loss:
+                    all_aux_losses.append(outputs.aux_loss)
 
         logps = torch.cat(all_logps, dim=0)
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
