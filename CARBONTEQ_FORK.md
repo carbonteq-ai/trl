@@ -38,7 +38,14 @@ The fork currently maintains:
 - an optional GRPO log-probability projection chunk size in
   `trl/trainer/grpo_config.py`, with the chunked LM-head projection in
   `trl/trainer/grpo_trainer.py` and numerical-equivalence coverage in
-  `tests/test_grpo_trainer.py`.
+  `tests/test_grpo_trainer.py`;
+- bounded DAPO dynamic sampling in `GRPOTrainer`, which retains informative
+  prompt groups, refills only missing groups from sequential candidate batches,
+  recomputes the global token normalizer after filtering, and refuses partial
+  training batches;
+- an opt-in `rollout_func` contract for finite, token-aligned precomputed
+  advantages. This supports hierarchical agentic estimators without moving
+  environment or algorithm ownership into TRL.
 
 Native MTP here means rollout acceleration through the model's bundled draft
 head. It does not add an MTP auxiliary training loss. TurboQuant changes only
@@ -71,6 +78,19 @@ framework currently combines it with Liger's fused GRPO loss for the
 single-GPU profile. Liger remains a consumer/runtime choice rather than a fork
 default.
 
+DAPO dynamic sampling is opt-in and text-only. Each process must own complete
+prompt groups so selection never splits a reward-normalization group across
+ranks. `dynamic_sampling_max_batches` bounds rollout work; exhausting it raises
+instead of silently changing the optimizer batch size. The implementation does
+not incorporate Dr. GRPO, GSPO, or mixed-policy guidance under the DAPO name;
+those methods use different estimators or policy sources.
+
+`use_precomputed_advantages=True` requires `rollout_func`, rejects Liger, and
+requires one finite advantage value per completion token. Reward computation
+still runs for filtering and evidence; only the policy-loss advantage is
+replaced. Dynamic sampling may use this path with the ordinary clipped loss,
+while ordinary GRPO cannot enable dynamic sampling accidentally.
+
 TurboQuant is configuration-supported but not Qwen 3.5 quality-qualified: its
 32K matched recall gate remains open. MTP and TurboQuant must be qualified
 independently before testing their combination.
@@ -101,6 +121,14 @@ For the chunked projection specifically, run:
 
     uv run pytest tests/test_grpo_trainer.py \
       -k test_logits_chunking_matches_unchunked_logprobs_and_entropy
+
+For DAPO dynamic sampling specifically, run:
+
+    uv run pytest tests/test_dapo_dynamic_sampling.py
+
+For token-aligned agentic advantages specifically, run:
+
+    uv run pytest tests/test_sampo_precomputed_advantages.py
 
 Run Ruff and the repository's standard test suite before publishing. The
 developer environment does not include vLLM by default; validate the guarded

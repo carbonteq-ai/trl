@@ -132,6 +132,28 @@ $$
 
 To use this formulation, set `loss_type="dapo"` in [`GRPOConfig`].
 
+#### DAPO dynamic sampling
+
+DAPO dynamic sampling removes prompt groups whose rewards are all equal because those groups have no relative learning
+signal. Enable it with `dynamic_sampling=True`. The trainer retains every informative group already generated and
+draws candidates only to fill the missing rows; it does not regenerate the whole batch when one group is uninformative.
+`dynamic_sampling_max_batches` bounds the additional rollout work and raises an error if a complete training batch
+cannot be formed. `dynamic_sampling_reward_std_epsilon` can exclude groups whose reward variance is non-zero but too
+small to be useful.
+
+Dynamic sampling currently supports text-only datasets and requires each process's generation batch to contain complete
+prompt groups. These constraints are validated before or at trainer startup instead of producing partial or
+cross-process groups.
+
+#### Precomputed token advantages
+
+Custom multi-turn rollout systems can set `use_precomputed_advantages=True` and
+return `precomputed_advantages` from `rollout_func`. The field must contain one
+finite value per completion token for every rollout. The trainer continues to
+compute rewards and group statistics for logging and dynamic filtering, but
+uses the supplied token-aligned values in the clipped policy loss. This option
+requires the standard PyTorch loss path; the Liger kernel does not support it.
+
 Furthermore, it was demonstrated in the paper [Understanding R1-Zero-Like Training: A Critical Perspective](https://huggingface.co/papers/2503.20783) that the initial GRPO formulation introduces a response length bias. They show that while the DAPO formulation reduces this bias, it does not eliminate it completely. To fully remove this bias, they propose dividing by a constant instead of the sequence length, resulting in the following formulation:
 
 $$

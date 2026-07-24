@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import warnings
 from dataclasses import dataclass, field
 from typing import Any
@@ -289,6 +290,17 @@ class GRPOConfig(_BaseConfig):
             - `"vespo"`: Variational Sequence-Level Soft Policy Optimization. Replaces hard clipping with a smooth,
               asymmetric Gamma weighting function applied directly to sequence-level importance weights. Introduced in
               the [VESPO paper](https://huggingface.co/papers/2602.10693).
+        dynamic_sampling (`bool`, *optional*, defaults to `False`):
+            Whether to keep only prompt groups whose rewards have non-zero variance and draw replacement prompt groups
+            until the generation batch is full. This is the dynamic sampling component of
+            [DAPO](https://huggingface.co/papers/2503.14476). Valid prompt groups are retained; only missing groups are
+            refilled.
+        dynamic_sampling_max_batches (`int`, *optional*, defaults to `10`):
+            Maximum number of candidate generation batches evaluated for one optimizer generation batch when dynamic
+            sampling is enabled. Training raises an error instead of silently using a partial batch when this limit is
+            exhausted.
+        dynamic_sampling_reward_std_epsilon (`float`, *optional*, defaults to `0.0`):
+            Minimum within-group reward standard deviation required to retain a prompt group during dynamic sampling.
         mask_truncated_completions (`bool`, *optional*, defaults to `False`):
             When enabled, truncated completions are excluded from the loss calculation, preventing them from being
             incorrectly penalized and introducing noise during training. According to the
@@ -870,6 +882,28 @@ class GRPOConfig(_BaseConfig):
             "the [VESPO paper](https://huggingface.co/papers/2602.10693)."
         },
     )
+    dynamic_sampling: bool = field(
+        default=False,
+        metadata={
+            "help": "Keep prompt groups with non-zero reward variance and refill only missing groups, as introduced "
+            "by DAPO."
+        },
+    )
+    dynamic_sampling_max_batches: int = field(
+        default=10,
+        metadata={"help": "Maximum candidate generation batches used to fill one dynamic-sampling training batch."},
+    )
+    dynamic_sampling_reward_std_epsilon: float = field(
+        default=0.0,
+        metadata={"help": "Minimum within-group reward standard deviation retained by dynamic sampling."},
+    )
+    use_precomputed_advantages: bool = field(
+        default=False,
+        metadata={
+            "help": "Use token-aligned advantages returned by rollout_func instead of trainer-computed scalar "
+            "group advantages. Intended for hierarchical agentic objectives such as SAMPO."
+        },
+    )
     mask_truncated_completions: bool = field(
         default=False,
         metadata={
@@ -1155,6 +1189,32 @@ class GRPOConfig(_BaseConfig):
                 "GRPO requires at least 2 generations per prompt to calculate the advantages. You provided "
                 f"{self.num_generations}, which is less than the minimum required."
             )
+
+        if self.dynamic_sampling:
+            if self.loss_type != "dapo" and not self.use_precomputed_advantages:
+                raise ValueError(
+                    "dynamic_sampling requires loss_type='dapo' unless rollout_func supplies precomputed advantages"
+                )
+            if self.multi_objective_aggregation != "sum_then_normalize" or self.scale_rewards not in ["group", "none"]:
+                raise ValueError(
+                    "dynamic_sampling requires sum_then_normalize aggregation and group-local reward statistics"
+                )
+            if self.dynamic_sampling_max_batches < 1:
+                raise ValueError("dynamic_sampling_max_batches must be a positive integer")
+            if (
+                not math.isfinite(self.dynamic_sampling_reward_std_epsilon)
+                or self.dynamic_sampling_reward_std_epsilon < 0
+            ):
+                raise ValueError("dynamic_sampling_reward_std_epsilon must be a finite non-negative number")
+            local_generation_batch_size = self.generation_batch_size // num_processes
+            if local_generation_batch_size % self.num_generations != 0:
+                raise ValueError(
+                    "dynamic_sampling requires each process's generation batch to contain complete prompt groups; "
+                    f"generation_batch_size / world_size ({local_generation_batch_size}) must be divisible by "
+                    f"num_generations ({self.num_generations})"
+                )
+        if self.use_precomputed_advantages and self.use_liger_kernel:
+            raise ValueError("use_precomputed_advantages is not supported by the Liger GRPO kernel")
 
         if self.logits_chunk_size is not None and self.logits_chunk_size < 1:
             raise ValueError("logits_chunk_size must be a positive integer when provided.")

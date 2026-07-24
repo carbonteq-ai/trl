@@ -125,6 +125,22 @@ logger = get_logger(__name__)
 # accept **kwargs.
 RewardFunc = str | PreTrainedModel | Callable[..., list[float | None]]
 
+
+def _validate_precomputed_advantages(
+    advantages: Any,
+    completion_ids: list[list[int]],
+) -> list[list[float]]:
+    if not isinstance(advantages, list) or len(advantages) != len(completion_ids):
+        raise ValueError("rollout_func precomputed_advantages must align with completion_ids")
+    validated = []
+    for values, ids in zip(advantages, completion_ids, strict=True):
+        if not isinstance(values, list) or len(values) != len(ids):
+            raise ValueError("each precomputed_advantages row must align with its completion_ids row")
+        if any(isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) for value in values):
+            raise ValueError("precomputed_advantages must contain only finite numbers")
+        validated.append([float(value) for value in values])
+    return validated
+
 # What we call a rollout function is a callable that takes prompts (list), the trainer instance, and the aligned raw
 # dataset rows as parameters and returns a dict of generation results. Those results must include "prompt_ids",
 # "completion_ids", and "logprobs" fields. Any extra fields (per-completion) are forwarded to the reward functions.
@@ -547,6 +563,9 @@ class GRPOTrainer(_BaseTrainer):
                 stacklevel=2,
             )
         self.rollout_func = rollout_func
+        self.use_precomputed_advantages = args.use_precomputed_advantages
+        if self.use_precomputed_advantages and rollout_func is None:
+            raise ValueError("use_precomputed_advantages requires rollout_func")
         if environment_factory is not None and os.environ.get("TRL_EXPERIMENTAL_SILENCE", "0") != "1":
             warnings.warn(
                 "You are using 'environment_factory', which is an experimental feature. This API may change or be "
@@ -810,6 +829,9 @@ class GRPOTrainer(_BaseTrainer):
 
         # Datasets
         self.shuffle_dataset = args.shuffle_dataset
+        self.dynamic_sampling = args.dynamic_sampling
+        self.dynamic_sampling_max_batches = args.dynamic_sampling_max_batches
+        self.dynamic_sampling_reward_std_epsilon = args.dynamic_sampling_reward_std_epsilon
 
         if train_dataset is None:
             raise ValueError("`train_dataset` is required")
@@ -1142,10 +1164,11 @@ class GRPOTrainer(_BaseTrainer):
     # Maintenance note: This method is a copy-paste of the original `Trainer.get_train_dataloader` with only one line
     # modification.
     def get_train_dataloader(self):
+        candidate_multiplier = self.dynamic_sampling_max_batches if self.dynamic_sampling else 1
         return self._get_dataloader(
             dataset=self.train_dataset,
             description="Training",
-            batch_size=self._train_batch_size * self.args.steps_per_generation,  # < this is the change
+            batch_size=self._train_batch_size * self.args.steps_per_generation * candidate_multiplier,
             sampler_fn=self._get_train_sampler,
             is_training=True,
         )
@@ -1179,10 +1202,11 @@ class GRPOTrainer(_BaseTrainer):
         #                                          ...
         if dataset is None:
             dataset = self.train_dataset
+        candidate_multiplier = self.dynamic_sampling_max_batches if self.dynamic_sampling else 1
         return RepeatSampler(
             data_source=dataset,
             mini_repeat_count=self.num_generations,
-            batch_size=self.args.generation_batch_size // self.num_generations,
+            batch_size=self.args.generation_batch_size // self.num_generations * candidate_multiplier,
             repeat_count=self.num_iterations * self.args.steps_per_generation,
             shuffle=self.shuffle_dataset,
             seed=self.args.seed,
@@ -1463,7 +1487,10 @@ class GRPOTrainer(_BaseTrainer):
             generate_every = self.args.steps_per_generation * self.num_iterations
             if self._step % generate_every == 0 or self._buffered_inputs is None:
                 # self._buffered_inputs=None can occur when resuming from a checkpoint
-                generation_batch = self._generate_and_score_completions(generation_batch)
+                if self.dynamic_sampling:
+                    generation_batch = self._prepare_dynamic_sampling_inputs(generation_batch)
+                else:
+                    generation_batch = self._generate_and_score_completions(generation_batch)
                 generation_batch = split_pixel_values_by_grid(generation_batch)
                 generation_batch = shuffle_sequence_dict(generation_batch)
                 generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
@@ -1474,6 +1501,103 @@ class GRPOTrainer(_BaseTrainer):
             # local generation batch == local eval batch
             inputs = self._generate_and_score_completions(generation_batch)
         return inputs
+
+    def _prepare_dynamic_sampling_inputs(
+        self, candidate_inputs: list[dict[str, torch.Tensor | Any]]
+    ) -> dict[str, torch.Tensor | Any]:
+        """Retain informative prompt groups and refill the generation batch from bounded candidates."""
+        if any("image" in row or "images" in row for row in candidate_inputs):
+            raise NotImplementedError("dynamic sampling currently supports text-only GRPO datasets")
+
+        target_size = len(candidate_inputs) // self.dynamic_sampling_max_batches
+        if target_size == 0 or len(candidate_inputs) % self.dynamic_sampling_max_batches != 0:
+            raise RuntimeError("dynamic sampling received an incomplete candidate generation batch")
+
+        retained_batches = []
+        retained_count = 0
+        candidate_batches_used = 0
+        candidate_count = 0
+        for candidate_batch in (
+            candidate_inputs[index : index + target_size] for index in range(0, len(candidate_inputs), target_size)
+        ):
+            scored_batch = self._generate_and_score_completions(candidate_batch)
+            group_reward_std = scored_batch.pop("group_reward_std")
+            keep = group_reward_std > self.dynamic_sampling_reward_std_epsilon
+            candidate_batches_used += 1
+            candidate_count += len(keep)
+            if keep.any():
+                retained_batches.append(self._select_dynamic_sampling_rows(scored_batch, keep))
+                retained_count += int(keep.sum().item())
+
+            local_ready = torch.tensor(retained_count >= target_size, device=self.accelerator.device)
+            if self.accelerator.gather(local_ready).all():
+                break
+
+        local_ready = torch.tensor(retained_count >= target_size, device=self.accelerator.device)
+        all_ready = self.accelerator.gather(local_ready)
+        if not all_ready.all():
+            retained_counts = self.accelerator.gather(
+                torch.tensor(retained_count, device=self.accelerator.device)
+            ).tolist()
+            raise RuntimeError(
+                "dynamic sampling exhausted "
+                f"{self.dynamic_sampling_max_batches} candidate batches before every process filled its generation "
+                f"batch; retained rows by process: {retained_counts}"
+            )
+
+        batch = self._concatenate_dynamic_sampling_batches(retained_batches)
+        batch = self._select_dynamic_sampling_rows(
+            batch, torch.arange(len(batch["completion_ids"]), device=self.accelerator.device) < target_size
+        )
+        local_tokens = batch["completion_mask"].sum()
+        batch["num_items_in_batch"] = self.accelerator.gather(local_tokens).sum()
+        self._metrics["train"]["dynamic_sampling/candidate_batches"].append(candidate_batches_used)
+        self._metrics["train"]["dynamic_sampling/retained_fraction"].append(retained_count / candidate_count)
+        return batch
+
+    @staticmethod
+    def _select_dynamic_sampling_rows(
+        batch: dict[str, torch.Tensor | Any], keep: torch.Tensor
+    ) -> dict[str, torch.Tensor | Any]:
+        selected = {}
+        indices = keep.nonzero(as_tuple=False).flatten().tolist()
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                selected[key] = value if value.ndim == 0 else value[keep]
+            elif isinstance(value, list):
+                selected[key] = [value[index] for index in indices]
+            else:
+                selected[key] = value
+        return selected
+
+    def _concatenate_dynamic_sampling_batches(
+        self, batches: list[dict[str, torch.Tensor | Any]]
+    ) -> dict[str, torch.Tensor | Any]:
+        if not batches:
+            raise RuntimeError("dynamic sampling did not retain any prompt group")
+        concatenated = {}
+        for key in batches[0]:
+            values = [batch[key] for batch in batches]
+            first = values[0]
+            if isinstance(first, torch.Tensor):
+                if first.ndim == 0:
+                    concatenated[key] = first
+                elif first.ndim == 1 or all(value.shape[1:] == first.shape[1:] for value in values):
+                    concatenated[key] = torch.cat(values)
+                elif first.ndim == 2:
+                    padding_value = self._tokenizer.pad_token_id if key == "prompt_ids" else 0
+                    padding_side = "left" if key in {"prompt_ids", "prompt_mask"} else "right"
+                    rows = [row for value in values for row in value]
+                    concatenated[key] = pad(rows, padding_value=padding_value, padding_side=padding_side)
+                else:
+                    raise NotImplementedError(
+                        f"dynamic sampling cannot concatenate variable-shaped tensor field {key!r}"
+                    )
+            elif isinstance(first, list):
+                concatenated[key] = [item for value in values for item in value]
+            else:
+                concatenated[key] = first
+        return concatenated
 
     def _log_completion_extra(self, column: str, values: list):
         """
@@ -2296,6 +2420,20 @@ class GRPOTrainer(_BaseTrainer):
         completion_mask = pad(
             completion_mask, padding_value=0, padding_side="right", pad_to_multiple_of=self.pad_to_multiple_of
         ).to(device=device)
+        precomputed_advantages = extra_fields.pop("precomputed_advantages", None)
+        if self.use_precomputed_advantages:
+            if precomputed_advantages is None:
+                raise ValueError("rollout_func must return precomputed_advantages when configured")
+            validated_advantages = _validate_precomputed_advantages(precomputed_advantages, completion_ids_list)
+            advantage_rows = [torch.tensor(values, dtype=torch.float32) for values in validated_advantages]
+            precomputed_advantages = pad(
+                advantage_rows,
+                padding_value=0.0,
+                padding_side="right",
+                pad_to_multiple_of=self.pad_to_multiple_of,
+            ).to(device=device)
+        elif precomputed_advantages is not None:
+            raise ValueError("rollout_func returned precomputed_advantages without enabling the option")
         if sampling_per_token_logps_list is not None:
             sampling_per_token_logps = [torch.tensor(logps) for logps in sampling_per_token_logps_list]
             sampling_per_token_logps = pad(
@@ -2640,6 +2778,9 @@ class GRPOTrainer(_BaseTrainer):
         )
         all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
         advantages = advantages[process_slice]
+        local_group_reward_std = std_rewards[process_slice]
+        if self.use_precomputed_advantages:
+            advantages = precomputed_advantages
 
         # Calculate mean reward per function, but only for samples where the function was applied (non-NaN values)
         for i, reward_func_name in enumerate(self.reward_func_names):
@@ -2658,7 +2799,10 @@ class GRPOTrainer(_BaseTrainer):
         self._logs["completion"].extend(gather_object(completions_text))
         for i, name in enumerate(self.reward_func_names):
             self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
-        self._logs["advantages"].extend(all_process_advantages.tolist())
+        if self.use_precomputed_advantages:
+            self._logs["advantages"].extend(gather_object(advantages.mean(dim=1).tolist()))
+        else:
+            self._logs["advantages"].extend(all_process_advantages.tolist())
 
         # Flush user-logged extra columns (from log_extra), gathering across processes.
         # Keys must be sorted so that all ranks call gather_object in the same order, otherwise values
@@ -2724,6 +2868,8 @@ class GRPOTrainer(_BaseTrainer):
             "advantages": advantages,
             "num_items_in_batch": num_items_in_batch,
         }
+        if self.dynamic_sampling and mode == "train":
+            output["group_reward_std"] = local_group_reward_std
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
         if self.use_vllm and self.vllm_importance_sampling_correction:
