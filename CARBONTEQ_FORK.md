@@ -10,8 +10,8 @@ consuming post-training framework.
 - Upstream repository: `git@github.com:huggingface/trl.git`
 - Upstream base: `95809b942eb5d11d0b06d749510d88be99230b73` (`Release: v1.8 (#6346)`)
 - CarbonTeq remote: `git@github.com:carbonteq-ai/trl.git`
-- Published consumer commit: `5c50c69f2d9b25dc2ce729d030f7cabb144d8431`
-- Current development branch: `codex/grpo-runtime-counters`
+- Published implementation commit: `76dd120e88437cfa44c27fc5b17f4fed68ebfd91`
+- Current development branch: `codex/dapo-dynamic-sampling`
 
 The post-training framework's executable pin is in
 `../rl/packages/train/pyproject.toml` and `../rl/uv.lock`. Do not describe a
