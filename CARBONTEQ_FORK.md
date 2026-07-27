@@ -49,6 +49,18 @@ The fork currently maintains:
 - an opt-in `rollout_func` contract for finite, token-aligned precomputed
   advantages. This supports hierarchical agentic estimators without moving
   environment or algorithm ownership into TRL.
+- a post-generation `num_items_in_batch` count in experimental
+  `DistillationTrainer`. The base `Trainer` counts this from the raw,
+  pre-generation dataloader batch, whose labels are prompt-only for on-policy
+  rows (the completion does not exist until generation fills it in). That
+  always counted to zero for a fully on-policy accumulation window, so the
+  divergence loss divided a finite JSD sum by zero and every parameter's
+  gradient came back non-finite on the very first optimizer step. `_fill_buffer`
+  now recomputes the count from the buffered labels after generation and
+  stamps it onto every micro-slice, and `compute_loss` prefers that stamped
+  value over the Trainer-level parameter — the same pattern
+  `GRPOTrainer._generate_and_score_completions` already uses for its own
+  post-generation count.
 
 Native MTP here means rollout acceleration through the model's bundled draft
 head. It does not add an MTP auxiliary training loss. TurboQuant changes only
@@ -138,6 +150,11 @@ For DAPO dynamic sampling specifically, run:
 For token-aligned agentic advantages specifically, run:
 
     uv run pytest tests/test_sampo_precomputed_advantages.py
+
+For the on-policy `num_items_in_batch` fix specifically, run:
+
+    uv run pytest tests/experimental/test_distillation_trainer.py \
+      -k num_items_in_batch
 
 Run Ruff and the repository's standard test suite before publishing. The
 developer environment does not include vLLM by default; validate the guarded

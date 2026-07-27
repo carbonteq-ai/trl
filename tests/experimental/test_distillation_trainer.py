@@ -762,6 +762,56 @@ class TestDistillationTrainer(TrlTestCase):
         assert teacher_client.calls[0]["top_logprobs"] == 1
         torch.testing.assert_close(local_loss, server_loss)
 
+    def test_on_policy_rollout_func_stamps_nonzero_num_items_in_batch(self):
+        """Regression test: on-policy `rollout_func` rows are prompt-only in the raw dataset
+        (labels are all -100 because the completion doesn't exist until generation happens), so
+        the Trainer's default pre-generation `num_items_in_batch` count is always zero and
+        `_reduce_divergence_loss` divides a finite JSD sum by zero, producing NaN gradients on the
+        very first optimizer step. `_fill_buffer` must recompute the count from the post-generation
+        buffered labels instead of trusting the Trainer's pre-generation default."""
+        dataset = Dataset.from_list([{"messages": [{"role": "user", "content": "Hello"}]}] * 4)
+
+        def rollout_func(prompts, trainer, *, inputs):
+            del trainer, prompts
+            prompt_ids = [row["prompt_ids"] for row in inputs]
+            completion_ids = [[7, 8, 9] for _ in inputs]
+            return {
+                "prompt_ids": prompt_ids,
+                "prompt_lengths": [len(p) for p in prompt_ids],
+                "completion_ids": completion_ids,
+                "completion_loss_mask": [[True, True, True] for _ in inputs],
+                "logprobs": [[0.0, 0.0, 0.0] for _ in inputs],
+                "rollout_ids": [f"trace-{i}" for i in range(len(inputs))],
+            }
+
+        training_args = self._make_args(lmbda=1.0, per_device_train_batch_size=2, max_steps=1)
+        trainer = DistillationTrainer(
+            model=self.model_id,
+            teacher_model=self.model_id,
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=self.tokenizer,
+            rollout_func=rollout_func,
+        )
+
+        recorded = {}
+        original_compute_loss = trainer.compute_loss
+
+        def spy_compute_loss(model, inputs, return_outputs=False, num_items_in_batch=None):
+            recorded["stashed"] = inputs.get("num_items_in_batch")
+            return original_compute_loss(
+                model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
+            )
+
+        trainer.compute_loss = spy_compute_loss
+        train_result = trainer.train()
+
+        # The bug this guards against: `recorded["stashed"]` used to be absent (falling back to the
+        # Trainer's pre-generation count of 0), which forced `jsd_sum / 0` and NaN gradients.
+        assert recorded["stashed"] is not None
+        assert int(recorded["stashed"]) > 0
+        assert math.isfinite(train_result.metrics["train_loss"])
+
 
 class TestDistillationTrainerServerPath(TrlTestCase):
     @classmethod

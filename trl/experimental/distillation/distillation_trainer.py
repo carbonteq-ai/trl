@@ -873,6 +873,26 @@ class DistillationTrainer(_BaseTrainer):
             self._textual_logs["prompt"].extend(gather_object(on_policy_prompts))
             self._textual_logs["completion"].extend(gather_object(on_policy_completions))
 
+        # The Trainer's default `num_items_in_batch` is counted from the raw pre-generation dataloader
+        # batch (see `Trainer._get_num_items_in_batch`), whose labels are prompt-only for on-policy rows
+        # (the completion doesn't exist until generation fills the buffer above). That always counts to
+        # zero for a fully on-policy accumulation window, so `_reduce_divergence_loss` divides a finite
+        # JSD sum by zero and every parameter's gradient comes back non-finite. Recompute the count from
+        # the buffered labels — which now reflect real generated completions — and stamp it onto every
+        # micro-slice, the same way `GRPOTrainer._generate_and_score_completions` computes
+        # `num_items_in_batch` post-generation instead of trusting the Trainer's pre-generation default.
+        local_valid_tokens = sum(
+            int((buffered["labels"] != -100).sum())
+            for buffered in self._buffered_inputs
+            if buffered is not None and buffered.get("labels") is not None
+        )
+        num_items_in_batch = self.accelerator.gather(
+            torch.tensor(local_valid_tokens, device=self.accelerator.device)
+        ).sum().clamp_min(1)
+        for buffered in self._buffered_inputs:
+            if buffered is not None:
+                buffered["num_items_in_batch"] = num_items_in_batch
+
     @profiling_decorator
     def _generate_student_completions(self, slices: list[dict[str, torch.Tensor | Any]], on_policy_indices: list[int]):
         """Generate completions from the student model for on-policy training."""
@@ -1710,6 +1730,9 @@ class DistillationTrainer(_BaseTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         self._raise_if_local_teacher_tokenizer_mismatch()
+        # Prefer the post-generation count `_fill_buffer` stamps onto the buffered inputs: the
+        # Trainer-level parameter reflects labels counted before on-policy generation filled them in.
+        num_items_in_batch = inputs.get("num_items_in_batch", num_items_in_batch)
 
         if self.use_liger_loss:
             loss = self._compute_liger_loss(model, inputs, num_items_in_batch=num_items_in_batch)
