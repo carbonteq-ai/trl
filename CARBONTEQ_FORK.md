@@ -10,7 +10,7 @@ consuming post-training framework.
 - Upstream repository: `git@github.com:huggingface/trl.git`
 - Upstream base: `95809b942eb5d11d0b06d749510d88be99230b73` (`Release: v1.8 (#6346)`)
 - CarbonTeq remote: `git@github.com:carbonteq-ai/trl.git`
-- Published implementation commit: `76dd120e88437cfa44c27fc5b17f4fed68ebfd91`
+- Published implementation commit: `ffb5e9ba74f166ddac05c1185f9d698e964c296b`
 - Current development branch: `codex/distillation-lora-sync`
 
 The post-training framework's executable pin is in
