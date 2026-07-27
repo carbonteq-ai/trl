@@ -1,3 +1,4 @@
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,26 @@ from trl.generation.vllm_generation import (
     _accumulate_spec_decode_metrics,
     _compute_spec_decode_counter_delta,
 )
+
+
+_DISTRIBUTED_ENVIRONMENT_VARIABLES = (
+    "RANK",
+    "LOCAL_RANK",
+    "WORLD_SIZE",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+)
+
+
+@pytest.fixture(autouse=True)
+def restore_distributed_environment():
+    original_environment = {name: os.environ.get(name) for name in _DISTRIBUTED_ENVIRONMENT_VARIABLES}
+    yield
+    for name, value in original_environment.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 def test_speculative_counters_are_reported_as_per_generation_deltas():
@@ -231,9 +252,7 @@ def test_weight_name_prefix_is_applied_at_the_vllm_boundary():
     generation.weight_name_prefix = "language_model."
     generation.llm = SimpleNamespace(
         llm_engine=SimpleNamespace(
-            model_executor=SimpleNamespace(
-                driver_worker=SimpleNamespace(model_runner=SimpleNamespace(model=loader))
-            )
+            model_executor=SimpleNamespace(driver_worker=SimpleNamespace(model_runner=SimpleNamespace(model=loader)))
         )
     )
 

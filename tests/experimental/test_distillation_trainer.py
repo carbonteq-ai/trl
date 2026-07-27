@@ -278,12 +278,33 @@ def test_distillation_config_accepts_colocated_vllm_engine_options(tmp_path):
         **_make_distillation_config_kwargs(tmp_path),
         use_vllm=True,
         vllm_mode="colocate",
+        vllm_weight_sync_mode="lora",
         vllm_speculative_config=speculative,
         vllm_engine_kwargs={"kv_cache_dtype": "turboquant_k8v4"},
     )
 
     assert config.vllm_speculative_config == speculative
     assert config.vllm_engine_kwargs == {"kv_cache_dtype": "turboquant_k8v4"}
+    assert config.vllm_weight_sync_mode == "lora"
+
+
+@pytest.mark.parametrize("value", ["adapter", "", "FULL"])
+def test_distillation_config_rejects_invalid_vllm_weight_sync_mode(tmp_path, value):
+    with pytest.raises(ValueError, match="vllm_weight_sync_mode must be either"):
+        DistillationConfig(
+            **_make_distillation_config_kwargs(tmp_path),
+            vllm_weight_sync_mode=value,
+        )
+
+
+def test_distillation_config_rejects_lora_weight_sync_in_server_mode(tmp_path):
+    with pytest.raises(ValueError, match="requires vllm_mode='colocate'"):
+        DistillationConfig(
+            **_make_distillation_config_kwargs(tmp_path),
+            use_vllm=True,
+            vllm_mode="server",
+            vllm_weight_sync_mode="lora",
+        )
 
 
 def test_distillation_config_rejects_invalid_reverse_kl_top_1_mode(tmp_path):

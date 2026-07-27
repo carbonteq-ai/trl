@@ -137,6 +137,9 @@ class DistillationConfig(_BaseConfig):
             Regex pattern for vLLM structured outputs.
         vllm_sync_frequency (`int`, *optional*, defaults to `1`):
             Frequency (in training steps) to synchronize student model weights to the vLLM engine.
+        vllm_weight_sync_mode (`str`, *optional*, defaults to `"full"`):
+            Student weight synchronization strategy. `"full"` synchronizes the complete model; `"lora"` keeps the
+            colocated vLLM base model immutable and refreshes only the active PEFT adapter.
         vllm_enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Enable vLLM sleep mode to offload student weights during the optimizer step.
         vllm_speculative_config (`dict`, *optional*):
@@ -361,6 +364,10 @@ class DistillationConfig(_BaseConfig):
         default=1,
         metadata={"help": "Frequency (in training steps) to synchronize student weights to the vLLM engine."},
     )
+    vllm_weight_sync_mode: str = field(
+        default="full",
+        metadata={"help": 'Student weight synchronization strategy. Either "full" or "lora".'},
+    )
     vllm_enable_sleep_mode: bool = field(
         default=False,
         metadata={"help": "Enable vLLM sleep mode to offload student weights during the optimizer step."},
@@ -427,6 +434,11 @@ class DistillationConfig(_BaseConfig):
                 f"gradient_accumulation_steps. Got {self.generation_batch_size} * {self.num_generations} != "
                 f"{self.per_device_train_batch_size} * {self.gradient_accumulation_steps}."
             )
+
+        if self.vllm_weight_sync_mode not in {"full", "lora"}:
+            raise ValueError("vllm_weight_sync_mode must be either 'full' or 'lora'.")
+        if self.vllm_weight_sync_mode == "lora" and self.vllm_mode != "colocate":
+            raise ValueError("vllm_weight_sync_mode='lora' requires vllm_mode='colocate'.")
 
         if self.use_teacher_server and self.use_liger_kernel:
             raise ValueError(

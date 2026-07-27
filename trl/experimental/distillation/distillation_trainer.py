@@ -681,6 +681,7 @@ class DistillationTrainer(_BaseTrainer):
                 enable_sleep_mode=args.vllm_enable_sleep_mode,
                 speculative_config=args.vllm_speculative_config,
                 engine_kwargs=args.vllm_engine_kwargs,
+                weight_sync_mode=args.vllm_weight_sync_mode,
                 model_impl=args.vllm_model_impl,
                 trust_remote_code=args.trust_remote_code,
                 temperature=args.temperature,

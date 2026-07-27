@@ -32,6 +32,9 @@ The fork currently maintains:
   experimental on-policy distillation;
 - candidate support for native MTP and KV-cache dtypes in on-policy
   distillation, plus normalized per-generation speculative-decoding metrics;
+- an explicit on-policy-distillation weight synchronization mode, allowing a
+  colocated vLLM student to refresh only its active PEFT LoRA adapter instead
+  of merging and synchronizing the complete model;
 - a candidate vLLM 0.25.1 TurboQuant cache-marker compatibility guard which
   activates only when the installed build still reports no TurboQuant
   quantization mode;
@@ -65,6 +68,12 @@ The candidate MTP and TurboQuant additions apply to colocated vLLM engines.
 External server mode must receive equivalent options when the server process is
 launched. The shared vLLM constructor rejects engine kwargs which attempt to
 override TRL-owned model, lifecycle, synchronization, or sampling arguments.
+
+On-policy distillation accepts `vllm_weight_sync_mode="lora"` only in
+colocated mode. The shared `VLLMGeneration` boundary then validates that the
+student is a PEFT model, preserves the immutable base weights, and uses the
+level-1 sleep lifecycle already qualified by the generic LoRA synchronization
+implementation.
 
 The current consumer resolves Python 3.12, Torch 2.11, Transformers 5.14, and
 vLLM 0.25.1. On the local Ampere GPU, TurboQuant K8V4 requires an FP16 rollout
