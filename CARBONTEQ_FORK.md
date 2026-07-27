@@ -11,7 +11,7 @@ consuming post-training framework.
 - Upstream base: `95809b942eb5d11d0b06d749510d88be99230b73` (`Release: v1.8 (#6346)`)
 - CarbonTeq remote: `git@github.com:carbonteq-ai/trl.git`
 - Published implementation commit: `76dd120e88437cfa44c27fc5b17f4fed68ebfd91`
-- Current development branch: `codex/dapo-dynamic-sampling`
+- Current development branch: `codex/distillation-lora-sync`
 
 The post-training framework's executable pin is in
 `../rl/packages/train/pyproject.toml` and `../rl/uv.lock`. Do not describe a
