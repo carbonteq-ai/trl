@@ -408,7 +408,25 @@ class VLLMGeneration:
         self.max_num_seqs = max_num_seqs
         self.enable_sleep_mode = enable_sleep_mode
         self.speculative_config = speculative_config
-        self.engine_kwargs = engine_kwargs or {}
+        self.engine_kwargs = dict(engine_kwargs or {})
+        # The trainer derives a resident sequence count from its generation
+        # batch. Framework consumers may deliberately cap that count so a
+        # large logical batch is processed in bounded vLLM waves instead of
+        # overcommitting KV cache memory.
+        requested_max_num_seqs = self.engine_kwargs.pop("max_num_seqs", None)
+        if requested_max_num_seqs is not None:
+            if isinstance(requested_max_num_seqs, bool) or not isinstance(requested_max_num_seqs, int) or requested_max_num_seqs < 1:
+                raise ValueError("vLLM max_num_seqs must be a positive integer")
+            self.max_num_seqs = requested_max_num_seqs
+        requested_max_num_batched_tokens = self.engine_kwargs.pop("max_num_batched_tokens", None)
+        if requested_max_num_batched_tokens is not None:
+            if (
+                isinstance(requested_max_num_batched_tokens, bool)
+                or not isinstance(requested_max_num_batched_tokens, int)
+                or requested_max_num_batched_tokens < 1
+            ):
+                raise ValueError("vLLM max_num_batched_tokens must be a positive integer")
+        self._max_num_batched_tokens = requested_max_num_batched_tokens or 4096
         if weight_name_prefix is not None and (not weight_name_prefix or not weight_name_prefix.endswith(".")):
             raise ValueError("weight_name_prefix must be a non-empty module prefix ending with `.`")
         self.weight_name_prefix = weight_name_prefix
@@ -514,7 +532,7 @@ class VLLMGeneration:
                 # Feed identical seed for tp groups to ensure sampling results are the same across workers
                 "seed": accelerator.process_index // self.tensor_parallel_size,
                 # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
-                "max_num_batched_tokens": 4096,
+                "max_num_batched_tokens": self._max_num_batched_tokens,
                 # Important so temperature scaling/logit tweaking affects the TIS log probs
                 "logprobs_mode": "processed_logprobs",
                 "quantization": quantization,

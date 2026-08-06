@@ -190,6 +190,45 @@ def test_colocated_engine_receives_speculative_config(monkeypatch):
     assert captured["disable_log_stats"] is False
 
 
+def test_colocated_engine_allows_bounded_sequence_waves(monkeypatch):
+    captured = {}
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.llm_engine = SimpleNamespace(
+                vllm_config=SimpleNamespace(cache_config=SimpleNamespace(kv_cache_size_tokens=2048)),
+                logger_manager=SimpleNamespace(stat_loggers=[]),
+            )
+
+    class FakeModel:
+        name_or_path = "model"
+
+        def named_modules(self):
+            return []
+
+    accelerator = SimpleNamespace(
+        state=SimpleNamespace(deepspeed_plugin=None, fsdp_plugin=None),
+        num_processes=1,
+        process_index=0,
+        local_process_index=0,
+        wait_for_everyone=lambda: None,
+    )
+    monkeypatch.setattr(vllm_generation, "is_vllm_available", lambda: True)
+    monkeypatch.setattr(vllm_generation, "LLM", FakeLLM, raising=False)
+
+    VLLMGeneration(
+        model=FakeModel(),
+        accelerator=accelerator,
+        processing_class=object(),
+        max_num_seqs=256,
+        engine_kwargs={"max_num_seqs": 32, "max_num_batched_tokens": 32768},
+    )
+
+    assert captured["max_num_seqs"] == 32
+    assert captured["max_num_batched_tokens"] == 32768
+
+
 def test_explicit_runtime_stats_setting_is_accepted_for_speculative_metrics(monkeypatch):
     captured = {}
 
