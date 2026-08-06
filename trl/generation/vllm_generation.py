@@ -771,6 +771,32 @@ class VLLMGeneration:
         if self._kv_cache_peak_tracker is not None:
             self.last_generation_metrics[_KV_CACHE_PEAK_USAGE_METRIC] = self._kv_cache_peak_tracker.peak_usage_ratio
 
+    def _generate_colocated_waves(self, prompts: list[dict], sampling_params: Any) -> list:
+        """Generate a colocated batch in bounded request waves.
+
+        ``max_num_seqs`` limits the number of sequences vLLM schedules at once,
+        but passing a larger list to ``LLM.generate`` still queues every request
+        in one call.  Large online-RL updates can therefore build an unbounded
+        request queue, exhaust the runner's file descriptors, and leave stale
+        requests behind when a rollout fails.  Keep the call boundary bounded
+        as well as the engine capacity while preserving prompt order.
+        """
+        if not prompts:
+            return []
+
+        wave_size = self.max_num_seqs or len(prompts)
+        outputs = []
+        for start in range(0, len(prompts), wave_size):
+            outputs.extend(
+                self.llm.generate(
+                    prompts[start : start + wave_size],
+                    sampling_params=sampling_params,
+                    use_tqdm=False,
+                    lora_request=self._lora_request,
+                )
+            )
+        return outputs
+
     def generate(
         self,
         prompts: list[list[int]],
@@ -942,12 +968,7 @@ class VLLMGeneration:
             with profiler:
                 if self._kv_cache_peak_tracker is not None:
                     self._kv_cache_peak_tracker.reset()
-                all_outputs = self.llm.generate(
-                    vllm_prompts,
-                    sampling_params=sampling_params,
-                    use_tqdm=False,
-                    lora_request=self._lora_request,
-                )
+                all_outputs = self._generate_colocated_waves(vllm_prompts, sampling_params)
 
             all_prompt_ids = [output.prompt_token_ids for output in all_outputs]
             all_completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]

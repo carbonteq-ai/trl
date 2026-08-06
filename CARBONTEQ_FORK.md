@@ -25,7 +25,10 @@ The fork currently maintains:
 - vLLM 0.24 and 0.25 dependency compatibility;
 - `datasets 4.6` compatibility for Verifiers integration;
 - memory-efficient entropy metrics for non-contiguous slices;
-- colocated GRPO vLLM speculative configuration and guarded engine kwargs;
+- colocated GRPO vLLM speculative configuration and guarded engine kwargs,
+  including explicit `max_num_seqs` and `max_num_batched_tokens` caps plus
+  request-side waves so large logical batches can be processed without
+  unbounded vLLM queue growth;
 - model weight-name prefixes, native LoRA synchronization, and compatible
   sleep/wake behavior for quantized bases;
 - exact-token Verifiers rollout hooks and dataset identity for GRPO and
@@ -80,6 +83,13 @@ The candidate MTP and TurboQuant additions apply to colocated vLLM engines.
 External server mode must receive equivalent options when the server process is
 launched. The shared vLLM constructor rejects engine kwargs which attempt to
 override TRL-owned model, lifecycle, synchronization, or sampling arguments.
+The rollout-cap fields are the exception: they are validated positive integers
+and replace the trainer-derived resident sequence count and default 4,096
+batched-token cap. The colocated generation boundary also splits each logical
+batch into request waves no larger than `max_num_seqs`, preserving output order
+while avoiding a large queued burst. This is required when the framework's
+generation batch is 256/512 but the target GPU is qualified for 32 resident
+sequences.
 
 On-policy distillation accepts `vllm_weight_sync_mode="lora"` only in
 colocated mode. The shared `VLLMGeneration` boundary then validates that the

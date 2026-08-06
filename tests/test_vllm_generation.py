@@ -229,6 +229,28 @@ def test_colocated_engine_allows_bounded_sequence_waves(monkeypatch):
     assert captured["max_num_batched_tokens"] == 32768
 
 
+def test_colocated_generation_sends_bounded_request_waves_in_order():
+    generation = object.__new__(VLLMGeneration)
+    generation.max_num_seqs = 2
+    generation._lora_request = None
+    calls = []
+
+    class FakeLLM:
+        def generate(self, prompts, *, sampling_params, use_tqdm, lora_request):
+            calls.append((prompts, sampling_params, use_tqdm, lora_request))
+            return [SimpleNamespace(prompt_token_ids=prompt["prompt_token_ids"], outputs=[]) for prompt in prompts]
+
+    generation.llm = FakeLLM()
+    prompts = [{"prompt_token_ids": [index]} for index in range(5)]
+    sampling_params = object()
+
+    outputs = generation._generate_colocated_waves(prompts, sampling_params)
+
+    assert [[row["prompt_token_ids"] for row in call[0]] for call in calls] == [[[0], [1]], [[2], [3]], [[4]]]
+    assert [output.prompt_token_ids for output in outputs] == [[0], [1], [2], [3], [4]]
+    assert all(call[1:] == (sampling_params, False, None) for call in calls)
+
+
 def test_explicit_runtime_stats_setting_is_accepted_for_speculative_metrics(monkeypatch):
     captured = {}
 
