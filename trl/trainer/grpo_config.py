@@ -293,14 +293,22 @@ class GRPOConfig(_BaseConfig):
         dynamic_sampling (`bool`, *optional*, defaults to `False`):
             Whether to keep only prompt groups whose rewards have non-zero variance and draw replacement prompt groups
             until the generation batch is full. This is the dynamic sampling component of
-            [DAPO](https://huggingface.co/papers/2503.14476). Valid prompt groups are retained; only missing groups are
-            refilled.
+            [DAPO](https://huggingface.co/papers/2503.14476). Valid prompt groups are retained while bounded full-size
+            candidate batches are generated until the target is met.
         dynamic_sampling_max_batches (`int`, *optional*, defaults to `10`):
             Maximum number of candidate generation batches evaluated for one optimizer generation batch when dynamic
             sampling is enabled. Training raises an error instead of silently using a partial batch when this limit is
             exhausted.
         dynamic_sampling_reward_std_epsilon (`float`, *optional*, defaults to `0.0`):
             Minimum within-group reward standard deviation required to retain a prompt group during dynamic sampling.
+        active_sampling (`bool`, *optional*, defaults to `False`):
+            Filter prompt groups with zero reward spread and refill only the synchronized number of missing rows.
+            This preserves a full informative batch without regenerating an entire candidate batch on each refill,
+            following the active-sampling acceptance semantics published with OLMo 3.
+        active_sampling_max_batches (`int`, *optional*, defaults to `10`):
+            Maximum generation rounds used to fill one active-sampling training batch.
+        active_sampling_reward_std_epsilon (`float`, *optional*, defaults to `0.0`):
+            Minimum within-group reward standard deviation retained by active sampling.
         mask_truncated_completions (`bool`, *optional*, defaults to `False`):
             When enabled, truncated completions are excluded from the loss calculation, preventing them from being
             incorrectly penalized and introducing noise during training. According to the
@@ -888,8 +896,8 @@ class GRPOConfig(_BaseConfig):
     dynamic_sampling: bool = field(
         default=False,
         metadata={
-            "help": "Keep prompt groups with non-zero reward variance and refill only missing groups, as introduced "
-            "by DAPO."
+            "help": "Keep prompt groups with non-zero reward variance and generate bounded full-size candidate "
+            "batches until the target is met, as introduced by DAPO."
         },
     )
     dynamic_sampling_max_batches: int = field(
@@ -899,6 +907,21 @@ class GRPOConfig(_BaseConfig):
     dynamic_sampling_reward_std_epsilon: float = field(
         default=0.0,
         metadata={"help": "Minimum within-group reward standard deviation retained by dynamic sampling."},
+    )
+    active_sampling: bool = field(
+        default=False,
+        metadata={
+            "help": "Keep prompt groups with non-zero reward variance and refill only the synchronized number of "
+            "missing rows, following the active-sampling acceptance semantics published with OLMo 3."
+        },
+    )
+    active_sampling_max_batches: int = field(
+        default=10,
+        metadata={"help": "Maximum generation rounds used to fill one active-sampling training batch."},
+    )
+    active_sampling_reward_std_epsilon: float = field(
+        default=0.0,
+        metadata={"help": "Minimum within-group reward standard deviation retained by active sampling."},
     )
     use_precomputed_advantages: bool = field(
         default=False,
@@ -1238,6 +1261,33 @@ class GRPOConfig(_BaseConfig):
             if local_generation_batch_size % self.num_generations != 0:
                 raise ValueError(
                     "dynamic_sampling requires each process's generation batch to contain complete prompt groups; "
+                    f"generation_batch_size / world_size ({local_generation_batch_size}) must be divisible by "
+                    f"num_generations ({self.num_generations})"
+                )
+        if self.active_sampling:
+            if self.dynamic_sampling:
+                raise ValueError(
+                    "active_sampling and dynamic_sampling are separate refill strategies; enable only one"
+                )
+            if self.loss_type != "dapo" and not self.use_precomputed_advantages:
+                raise ValueError(
+                    "active_sampling requires loss_type='dapo' unless rollout_func supplies precomputed advantages"
+                )
+            if self.multi_objective_aggregation != "sum_then_normalize" or self.scale_rewards not in ["group", "none"]:
+                raise ValueError(
+                    "active_sampling requires sum_then_normalize aggregation and group-local reward statistics"
+                )
+            if self.active_sampling_max_batches < 1:
+                raise ValueError("active_sampling_max_batches must be a positive integer")
+            if (
+                not math.isfinite(self.active_sampling_reward_std_epsilon)
+                or self.active_sampling_reward_std_epsilon < 0
+            ):
+                raise ValueError("active_sampling_reward_std_epsilon must be a finite non-negative number")
+            local_generation_batch_size = self.generation_batch_size // num_processes
+            if local_generation_batch_size % self.num_generations != 0:
+                raise ValueError(
+                    "active_sampling requires each process's generation batch to contain complete prompt groups; "
                     f"generation_batch_size / world_size ({local_generation_batch_size}) must be divisible by "
                     f"num_generations ({self.num_generations})"
                 )

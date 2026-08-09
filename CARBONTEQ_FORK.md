@@ -35,6 +35,9 @@ The fork keeps the following behavior on top of upstream 1.9.2:
   globally token-weighted tolerance;
 - bounded DAPO dynamic sampling, configurable reward scaling, correct exclusion
   of truncated completions from group statistics, and advantage diagnostics;
+- bounded active sampling that requests only the synchronized number of missing
+  prompt groups, plus a first-class `Olmo3GRPOConfig` for the published
+  model-agnostic OlmoRL recipe with immutable objective-defining settings;
 - optional token-aligned precomputed advantages for agentic estimators without
   moving environment ownership into TRL;
 - exact-token external rollout hooks and source-row preservation for

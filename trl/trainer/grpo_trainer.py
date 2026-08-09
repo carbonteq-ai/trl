@@ -869,6 +869,9 @@ class GRPOTrainer(_BaseTrainer):
         self.dynamic_sampling = args.dynamic_sampling
         self.dynamic_sampling_max_batches = args.dynamic_sampling_max_batches
         self.dynamic_sampling_reward_std_epsilon = args.dynamic_sampling_reward_std_epsilon
+        self.active_sampling = args.active_sampling
+        self.active_sampling_max_batches = args.active_sampling_max_batches
+        self.active_sampling_reward_std_epsilon = args.active_sampling_reward_std_epsilon
 
         if train_dataset is None:
             # A dataset is optional when an environment owns the data and returns the prompt from `reset()`; then
@@ -1260,7 +1263,7 @@ class GRPOTrainer(_BaseTrainer):
                 batch_size=self.args.generation_batch_size // self.num_generations,
                 repeat_count=self.num_iterations * self.args.steps_per_generation,
             )
-        candidate_multiplier = self.dynamic_sampling_max_batches if self.dynamic_sampling else 1
+        candidate_multiplier = self._sampling_candidate_multiplier
         return self._get_dataloader(
             dataset=dataset,
             description="Training",
@@ -1298,7 +1301,7 @@ class GRPOTrainer(_BaseTrainer):
         #                                          ...
         if dataset is None:
             dataset = self.train_dataset
-        candidate_multiplier = self.dynamic_sampling_max_batches if self.dynamic_sampling else 1
+        candidate_multiplier = self._sampling_candidate_multiplier
         return RepeatSampler(
             data_source=dataset,
             mini_repeat_count=self.num_generations,
@@ -1637,7 +1640,9 @@ class GRPOTrainer(_BaseTrainer):
             generate_every = self.args.steps_per_generation * self.num_iterations
             if self._step % generate_every == 0 or self._buffered_inputs is None:
                 # self._buffered_inputs=None can occur when resuming from a checkpoint
-                if self.dynamic_sampling:
+                if self.active_sampling:
+                    generation_batch = self._prepare_active_sampling_inputs(generation_batch)
+                elif self.dynamic_sampling:
                     generation_batch = self._prepare_dynamic_sampling_inputs(generation_batch)
                 else:
                     generation_batch = self._generate_and_score_completions(generation_batch)
@@ -1703,6 +1708,76 @@ class GRPOTrainer(_BaseTrainer):
         batch["num_items_in_batch"] = self.accelerator.gather(local_tokens).sum()
         self._metrics["train"]["dynamic_sampling/candidate_batches"].append(candidate_batches_used)
         self._metrics["train"]["dynamic_sampling/retained_fraction"].append(retained_count / candidate_count)
+        return batch
+
+    @property
+    def _sampling_candidate_multiplier(self) -> int:
+        if self.active_sampling:
+            return self.active_sampling_max_batches
+        if self.dynamic_sampling:
+            return self.dynamic_sampling_max_batches
+        return 1
+
+    def _prepare_active_sampling_inputs(
+        self, candidate_inputs: list[dict[str, torch.Tensor | Any]]
+    ) -> dict[str, torch.Tensor | Any]:
+        """Retain informative groups and generate only the synchronized number of missing rows."""
+        if any("image" in row or "images" in row for row in candidate_inputs):
+            raise NotImplementedError("active sampling currently supports text-only GRPO datasets")
+
+        target_size = len(candidate_inputs) // self.active_sampling_max_batches
+        if target_size == 0 or len(candidate_inputs) % self.active_sampling_max_batches != 0:
+            raise RuntimeError("active sampling received an incomplete candidate generation batch")
+
+        retained_batches = []
+        retained_count = 0
+        candidate_count = 0
+        candidate_cursor = 0
+        generation_rounds = 0
+        for _ in range(self.active_sampling_max_batches):
+            local_missing = max(target_size - retained_count, 0)
+            missing_by_process = self.accelerator.gather(torch.tensor(local_missing, device=self.accelerator.device))
+            synchronized_missing = int(missing_by_process.max().item())
+            if synchronized_missing == 0:
+                break
+            if synchronized_missing % self.num_generations != 0:
+                raise RuntimeError("active sampling refill size must contain complete prompt groups")
+
+            candidate_batch = candidate_inputs[candidate_cursor : candidate_cursor + synchronized_missing]
+            if len(candidate_batch) != synchronized_missing:
+                raise RuntimeError("active sampling exhausted its bounded candidate pool")
+            candidate_cursor += synchronized_missing
+
+            scored_batch = self._generate_and_score_completions(candidate_batch)
+            group_reward_std = scored_batch.pop("group_reward_std")
+            keep = group_reward_std > self.active_sampling_reward_std_epsilon
+            generation_rounds += 1
+            candidate_count += len(keep)
+            if keep.any():
+                retained_batches.append(self._select_dynamic_sampling_rows(scored_batch, keep))
+                retained_count += int(keep.sum().item())
+
+        local_ready = torch.tensor(retained_count >= target_size, device=self.accelerator.device)
+        all_ready = self.accelerator.gather(local_ready)
+        if not all_ready.all():
+            retained_counts = self.accelerator.gather(
+                torch.tensor(retained_count, device=self.accelerator.device)
+            ).tolist()
+            raise RuntimeError(
+                "active sampling exhausted "
+                f"{self.active_sampling_max_batches} generation rounds before every process filled its generation "
+                f"batch; retained rows by process: {retained_counts}"
+            )
+
+        batch = self._concatenate_dynamic_sampling_batches(retained_batches)
+        batch = self._select_dynamic_sampling_rows(
+            batch, torch.arange(len(batch["completion_ids"]), device=self.accelerator.device) < target_size
+        )
+        local_tokens = batch["completion_mask"].sum()
+        batch["num_items_in_batch"] = self.accelerator.gather(local_tokens).sum()
+        self._metrics["train"]["active_sampling/generation_rounds"].append(generation_rounds)
+        self._metrics["train"]["active_sampling/retained_fraction"].append(retained_count / candidate_count)
+        self._metrics["train"]["active_sampling/generated_rows"].append(candidate_count)
         return batch
 
     @staticmethod
@@ -3122,7 +3197,7 @@ class GRPOTrainer(_BaseTrainer):
             "advantages": advantages,
             "num_items_in_batch": num_items_in_batch,
         }
-        if self.dynamic_sampling and mode == "train":
+        if (self.dynamic_sampling or self.active_sampling) and mode == "train":
             output["group_reward_std"] = local_group_reward_std
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps

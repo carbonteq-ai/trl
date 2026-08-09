@@ -136,14 +136,49 @@ To use this formulation, set `loss_type="dapo"` in [`GRPOConfig`].
 
 DAPO dynamic sampling removes prompt groups whose rewards are all equal because those groups have no relative learning
 signal. Enable it with `dynamic_sampling=True`. The trainer retains every informative group already generated and
-draws candidates only to fill the missing rows; it does not regenerate the whole batch when one group is uninformative.
+draws bounded, full-size candidate batches until it fills the target batch.
 `dynamic_sampling_max_batches` bounds the additional rollout work and raises an error if a complete training batch
 cannot be formed. `dynamic_sampling_reward_std_epsilon` can exclude groups whose reward variance is non-zero but too
 small to be useful.
 
+Use `active_sampling=True` to retain the same zero-gradient filtering while reducing each refill request to the
+synchronized number of missing rows. `active_sampling_max_batches` bounds its generation rounds. The OLMo 3 preset
+selects this more efficient strategy.
+
 Dynamic sampling currently supports text-only datasets and requires each process's generation batch to contain complete
 prompt groups. These constraints are validated before or at trainer startup instead of producing partial or
 cross-process groups.
+
+#### OLMo 3 OlmoRL recipe
+
+[`Olmo3GRPOConfig`] exposes the combined, model-agnostic OlmoRL recipe published with OLMo 3 as one selectable
+configuration. It uses the existing [`GRPOTrainer`] execution engine while fixing the coupled algorithm choices that
+define the recipe: zero-gradient filtering with active refill, global token-level normalization, no KL penalty,
+clip-lower `0.2`, clip-higher `0.272`, token-level TIS capped at `2.0`, and group-mean centering without standard
+deviation scaling.
+
+```python
+from trl import GRPOTrainer, Olmo3GRPOConfig
+
+training_args = Olmo3GRPOConfig(
+    output_dir="olmo3-grpo-output",
+    learning_rate=1e-6,
+    num_generations=8,
+    active_sampling_max_batches=10,
+)
+
+trainer = GRPOTrainer(
+    model=model,
+    reward_funcs=reward_funcs,
+    args=training_args,
+    train_dataset=train_dataset,
+)
+```
+
+The algorithm is named for the OLMo 3 pipeline but is not restricted to OLMo models. Workload and capacity settings
+remain configurable; the seven objective-defining choices are immutable in this configuration. Use [`GRPOConfig`]
+directly for ablations or modified recipes. This trainer implements bounded, synchronized active refill; it does not
+replicate OLMo 3's separate, fully asynchronous distributed actor/learner infrastructure.
 
 #### Precomputed token advantages
 
