@@ -1009,6 +1009,14 @@ class GRPOConfig(_BaseConfig):
             "IS ratios are computed and constrained."
         },
     )
+    vllm_policy_parity_max_mean_logp_delta: float | None = field(
+        default=0.05,
+        metadata={
+            "help": "Maximum allowed mean absolute per-token log-probability difference between the vLLM sampler "
+            "and the training actor on the first training rollout. The trainer fails before optimization when the "
+            "difference exceeds this value. Set to `None` only to opt out for deliberately off-policy research."
+        },
+    )
     vllm_importance_sampling_mode: str = field(
         default="sequence_mask",
         metadata={
@@ -1218,6 +1226,12 @@ class GRPOConfig(_BaseConfig):
 
         if self.logits_chunk_size is not None and self.logits_chunk_size < 1:
             raise ValueError("logits_chunk_size must be a positive integer when provided.")
+
+        if self.vllm_policy_parity_max_mean_logp_delta is not None and (
+            not math.isfinite(self.vllm_policy_parity_max_mean_logp_delta)
+            or self.vllm_policy_parity_max_mean_logp_delta <= 0
+        ):
+            raise ValueError("vllm_policy_parity_max_mean_logp_delta must be a finite positive number or None")
 
         if self.vllm_importance_sampling_cap is not None:
             warnings.warn(

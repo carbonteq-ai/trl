@@ -10,8 +10,10 @@ consuming post-training framework.
 - Upstream repository: `git@github.com:huggingface/trl.git`
 - Upstream base: `95809b942eb5d11d0b06d749510d88be99230b73` (`Release: v1.8 (#6346)`)
 - CarbonTeq remote: `git@github.com:carbonteq-ai/trl.git`
-- Published implementation commit: `ffb5e9ba74f166ddac05c1185f9d698e964c296b`
-- Current development branch: `codex/distillation-lora-sync`
+- Published implementation commit: `91b0ce707631d503fbed337b42444a9d3fac3acb`
+- Current development branch: `codex/bounded-vllm-waves`
+- Unpublished working-tree candidate: composite-model native-LoRA namespace
+  synchronization and a mandatory first-rollout actor/sampler parity gate
 
 The post-training framework's executable pin is in
 `../rl/packages/train/pyproject.toml` and `../rl/uv.lock`. Do not describe a
@@ -31,6 +33,13 @@ The fork currently maintains:
   unbounded vLLM queue growth;
 - model weight-name prefixes, native LoRA synchronization, and compatible
   sleep/wake behavior for quantized bases;
+- candidate native-LoRA prefix handling that atomically rewrites only the
+  disposable PEFT export used for vLLM synchronization, preserving the actor
+  checkpoint and safetensors metadata;
+- a candidate first-training-rollout parity gate that recomputes actor
+  log-probabilities on the selected completion tokens and fails before the
+  first optimizer update when their globally weighted mean absolute delta from
+  the sampler exceeds a finite configured limit;
 - exact-token Verifiers rollout hooks and dataset identity for GRPO and
   experimental on-policy distillation;
 - candidate support for native MTP and KV-cache dtypes in on-policy
@@ -96,6 +105,21 @@ colocated mode. The shared `VLLMGeneration` boundary then validates that the
 student is a PEFT model, preserves the immutable base weights, and uses the
 level-1 sleep lifecycle already qualified by the generic LoRA synchronization
 implementation.
+
+Composite model namespaces apply to native-LoRA synchronization as well as
+full-weight synchronization. When `weight_name_prefix` is selected, the
+candidate inserts it after PEFT's `base_model.model.` envelope in the
+disposable synchronized adapter. Keys already carrying the prefix remain
+unchanged, conflicting remaps fail, and the retained actor adapter is not
+rewritten. This is a generic synchronization rule; the consumer owns the
+model-family-specific prefix value.
+
+`vllm_policy_parity_max_mean_logp_delta` defaults to `0.05`. On the first
+training rollout, the trainer gathers the sum and token count across ranks so
+the comparison is weighted by selected tokens rather than by process. The
+check uses the same completion/tool mask as the policy loss and runs even when
+importance-sampling correction is disabled. `None` is an explicit opt-out for
+deliberately off-policy research; it is not the normal on-policy setting.
 
 The current consumer resolves Python 3.12, Torch 2.11, Transformers 5.14, and
 vLLM 0.25.1. On the local Ampere GPU, TurboQuant K8V4 requires an FP16 rollout
@@ -165,6 +189,13 @@ For the on-policy `num_items_in_batch` fix specifically, run:
 
     uv run pytest tests/experimental/test_distillation_trainer.py \
       -k num_items_in_batch
+
+For composite native-LoRA synchronization and the pre-update parity gate, run:
+
+    uv run pytest tests/test_vllm_generation.py \
+      -k 'lora or weight_name_prefix' -q
+    uv run pytest tests/test_grpo_trainer.py \
+      -k 'policy_parity or importance_sampling' -q
 
 Run Ruff and the repository's standard test suite before publishing. The
 developer environment does not include vLLM by default; validate the guarded

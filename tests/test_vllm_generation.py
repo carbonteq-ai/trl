@@ -1,7 +1,11 @@
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 from trl.generation import vllm_generation
 from trl.generation.vllm_generation import (
@@ -335,9 +339,9 @@ def test_colocated_lora_sync_exports_adapter_without_merging_base_weights(monkey
 
     class FakePeftModel:
         name_or_path = "model"
-        peft_config = {"default": SimpleNamespace(r=8)}
 
         def __init__(self):
+            self.peft_config = {"default": SimpleNamespace(r=8)}
             self.saved = []
 
         def named_modules(self):
@@ -385,6 +389,67 @@ def test_colocated_lora_sync_exports_adapter_without_merging_base_weights(monkey
     assert model.saved == [(generation._lora_directory.name, True)]
     assert generation._lora_request.lora_path == generation._lora_directory.name
     assert generation._lora_request.load_inplace is True
+
+
+def test_colocated_lora_sync_applies_composite_model_prefix_to_disposable_adapter(monkeypatch):
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakePeftModel:
+        name_or_path = "model"
+
+        def __init__(self):
+            self.peft_config = {"default": SimpleNamespace(r=8)}
+
+        def named_modules(self):
+            return []
+
+        def save_pretrained(self, path, safe_serialization):
+            assert safe_serialization is True
+            save_file(
+                {
+                    "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(1),
+                    "base_model.model.language_model.model.layers.0.self_attn.k_proj.lora_A.weight": torch.ones(1),
+                },
+                Path(path) / "adapter_model.safetensors",
+                metadata={"format": "pt", "source": "actor"},
+            )
+
+    model = FakePeftModel()
+    accelerator = SimpleNamespace(
+        state=SimpleNamespace(deepspeed_plugin=None, fsdp_plugin=None),
+        num_processes=1,
+        process_index=0,
+        local_process_index=0,
+        wait_for_everyone=lambda: None,
+    )
+    monkeypatch.setattr(vllm_generation, "is_vllm_available", lambda: True)
+    monkeypatch.setattr(vllm_generation, "is_peft_model", lambda value: value is model)
+    monkeypatch.setattr(vllm_generation, "LLM", FakeLLM, raising=False)
+    monkeypatch.setattr(
+        vllm_generation,
+        "LoRARequest",
+        lambda name, identifier, path, *, load_inplace: SimpleNamespace(lora_path=path),
+        raising=False,
+    )
+
+    generation = VLLMGeneration(
+        model=model,
+        accelerator=accelerator,
+        processing_class=object(),
+        weight_sync_mode="lora",
+        weight_name_prefix="language_model.",
+    )
+    generation.sync_weights()
+
+    exported = Path(generation._lora_request.lora_path) / "adapter_model.safetensors"
+    with safe_open(exported, framework="pt", device="cpu") as handle:
+        assert set(handle.keys()) == {
+            "base_model.model.language_model.model.layers.0.self_attn.k_proj.lora_A.weight",
+            "base_model.model.language_model.model.layers.0.self_attn.q_proj.lora_A.weight",
+        }
+        assert handle.metadata() == {"format": "pt", "source": "actor"}
 
 
 def test_colocated_lora_wake_does_not_reload_immutable_quantized_base(monkeypatch):

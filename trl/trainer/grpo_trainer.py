@@ -761,6 +761,8 @@ class GRPOTrainer(_BaseTrainer):
         self.vllm_importance_sampling_mode = args.vllm_importance_sampling_mode
         self.vllm_importance_sampling_clip_max = args.vllm_importance_sampling_clip_max
         self.vllm_importance_sampling_clip_min = args.vllm_importance_sampling_clip_min
+        self.vllm_policy_parity_max_mean_logp_delta = args.vllm_policy_parity_max_mean_logp_delta
+        self._vllm_policy_parity_checked = False
         self.logits_chunk_size = args.logits_chunk_size
         self.use_liger_kernel = args.use_liger_kernel
         self.loss_type = args.loss_type
@@ -2241,16 +2243,6 @@ class GRPOTrainer(_BaseTrainer):
         total_prompt_tokens = agg_prompt_lengths.sum()
         total_completion_tokens = agg_completion_lengths.sum()  # = num_items_in_batch, required for the DAPO loss
 
-        # Log the metrics
-        if mode == "train":
-            self.state.num_input_tokens_seen += (total_prompt_tokens + total_completion_tokens).item()
-        self._metrics[mode]["num_tokens"] = [self.state.num_input_tokens_seen]
-
-        # Log completion lengths, mean, min, max
-        self._metrics[mode]["completions/mean_length"].append(agg_completion_lengths.float().mean().item())
-        self._metrics[mode]["completions/min_length"].append(agg_completion_lengths.float().min().item())
-        self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
-
         # Identify sequences that terminated with EOS and log their lengths
         eos_and_pad = [self._tokenizer.eos_token_id, self._tokenizer.pad_token_id]
         rollout_is_truncated = extra_fields.get("is_truncated")
@@ -2268,6 +2260,22 @@ class GRPOTrainer(_BaseTrainer):
         self._metrics[mode]["completions/mean_terminated_length"].append(term_completion_lengths.float().mean().item())
         self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
         self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
+
+        # When truncated completions are masked, they contribute neither tokens nor loss. Keep them
+        # out of DAPO's active-token denominator as well; otherwise the surviving completions are
+        # silently down-weighted by masked tokens.
+        if self.mask_truncated_completions:
+            total_completion_tokens = agg_completion_lengths[~agg_is_truncated].sum().clamp(min=1)
+
+        # Log the metrics
+        if mode == "train":
+            self.state.num_input_tokens_seen += (total_prompt_tokens + total_completion_tokens).item()
+        self._metrics[mode]["num_tokens"] = [self.state.num_input_tokens_seen]
+
+        # Log completion lengths, mean, min, max
+        self._metrics[mode]["completions/mean_length"].append(agg_completion_lengths.float().mean().item())
+        self._metrics[mode]["completions/min_length"].append(agg_completion_lengths.float().min().item())
+        self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
 
         if self.tools:
             agg_tool_call_count = self.accelerator.gather(torch.tensor(tool_call_count, device=device)).sum()
@@ -2290,6 +2298,23 @@ class GRPOTrainer(_BaseTrainer):
             images,
             tool_images,
         )
+
+    def _enforce_vllm_policy_parity(self, mode: str, mean_delta: float, token_count: int) -> None:
+        """Fail the first training rollout when vLLM and the actor are not the same policy."""
+        limit = self.vllm_policy_parity_max_mean_logp_delta
+        if mode != "train" or limit is None or self._vllm_policy_parity_checked:
+            return
+        if token_count <= 0:
+            raise RuntimeError(
+                "vLLM policy parity could not be evaluated because the first training rollout has no selected tokens"
+            )
+        if not math.isfinite(mean_delta) or mean_delta > limit:
+            raise RuntimeError(
+                "vLLM policy parity check failed before the first optimizer update: "
+                f"mean absolute per-token log-probability delta {mean_delta:.6f} exceeds {limit:.6f} "
+                f"across {token_count} selected tokens"
+            )
+        self._vllm_policy_parity_checked = True
 
     def _generate_and_score_completions(
         self, inputs: list[dict[str, torch.Tensor | Any]]
@@ -2452,16 +2477,19 @@ class GRPOTrainer(_BaseTrainer):
         else:
             tool_mask = None
 
-        # If mask_truncated_completions is enabled, zero out truncated completions for attention and loss masking
+        # Derive the truncation mask for telemetry on every run. When masking is enabled,
+        # remove the field from reward inputs and zero the affected rows for attention/loss.
+        rollout_is_truncated = extra_fields.get("is_truncated")
+        if rollout_is_truncated is not None:
+            if len(rollout_is_truncated) != len(completion_ids_list):
+                raise ValueError("rollout_func is_truncated must align with completion_ids")
+            is_truncated = torch.tensor(rollout_is_truncated, dtype=torch.bool, device=device)
+        else:
+            eos_and_pad = [self._tokenizer.eos_token_id, self._tokenizer.pad_token_id]
+            is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device)
+        agg_is_truncated = self.accelerator.gather(is_truncated)
         if self.mask_truncated_completions:
-            rollout_is_truncated = extra_fields.pop("is_truncated", None)
-            if rollout_is_truncated is not None:
-                if len(rollout_is_truncated) != len(completion_ids_list):
-                    raise ValueError("rollout_func is_truncated must align with completion_ids")
-                is_truncated = torch.tensor(rollout_is_truncated, dtype=torch.bool, device=device)
-            else:
-                eos_and_pad = [self._tokenizer.eos_token_id, self._tokenizer.pad_token_id]
-                is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device)
+            extra_fields.pop("is_truncated", None)
             # Mask completion_mask for attention masking
             completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
             # Also mask tool_mask for consistency in multi-turn training
@@ -2601,8 +2629,12 @@ class GRPOTrainer(_BaseTrainer):
             # When using vLLM, we always compute old_per_token_logps for importance sampling, it was shown that the
             # distribution mismatch between vLLM and the training model can be large and harm the training.
             generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
+            needs_vllm_actor_logps = self.use_vllm and (
+                self.vllm_importance_sampling_correction
+                or self.vllm_policy_parity_max_mean_logp_delta is not None
+            )
             if self.args.gradient_accumulation_steps % generate_every != 0 or (
-                self.use_vllm and self.vllm_importance_sampling_correction
+                needs_vllm_actor_logps
             ):
                 old_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
                     self.model,
@@ -2629,13 +2661,28 @@ class GRPOTrainer(_BaseTrainer):
                 else:
                     logps_diff = per_token_logps_diff
 
-                vllm_importance_sampling_ratio = torch.exp(logps_diff)
+                raw_vllm_importance_sampling_ratio = torch.exp(logps_diff)
+                importance_sampling_clamp_mask = torch.zeros_like(raw_vllm_importance_sampling_ratio, dtype=torch.bool)
+                vllm_importance_sampling_ratio = raw_vllm_importance_sampling_ratio
 
                 # vllm_importance_sampling_ratio.shape:
                 #   token_* modes:     (B, T)  (per-token ratio)
                 #   sequence_* modes:  (B, 1)  (per-sequence ratio)
 
                 if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
+                    min_val = (
+                        self.vllm_importance_sampling_clip_min
+                        if self.vllm_importance_sampling_clip_min is not None
+                        else -math.inf
+                    )
+                    max_val = (
+                        self.vllm_importance_sampling_clip_max
+                        if self.vllm_importance_sampling_clip_max is not None
+                        else math.inf
+                    )
+                    importance_sampling_clamp_mask = (vllm_importance_sampling_ratio < min_val) | (
+                        vllm_importance_sampling_ratio > max_val
+                    )
                     vllm_importance_sampling_ratio = torch.clamp(
                         vllm_importance_sampling_ratio,
                         min=self.vllm_importance_sampling_clip_min,
@@ -2656,6 +2703,7 @@ class GRPOTrainer(_BaseTrainer):
                     invalid_mis_mask = (vllm_importance_sampling_ratio < min_val) | (
                         vllm_importance_sampling_ratio > max_val
                     )
+                    importance_sampling_clamp_mask = invalid_mis_mask
                     vllm_importance_sampling_ratio = vllm_importance_sampling_ratio.masked_fill(
                         invalid_mis_mask, value=0.0
                     )
@@ -2715,6 +2763,12 @@ class GRPOTrainer(_BaseTrainer):
         rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
         num_generations = self.num_generations if mode == "train" else self.num_generations_eval
 
+        # A masked truncated completion must not change the group mean or standard
+        # deviation. Otherwise its reward changes the learning signal of the other
+        # completions even though its own tokens are excluded from the loss.
+        if self.mask_truncated_completions and agg_is_truncated is not None:
+            rewards_per_func[agg_is_truncated] = torch.nan
+
         # A completion for which every reward function returned None is unscorable. nansum would collapse it to 0,
         # which both biases the per-group baseline and hands the completion a spurious advantage. Mark these rows NaN
         # so they're excluded from the (nan-aware) baseline below; their advantage is forced to 0 afterwards.
@@ -2771,6 +2825,46 @@ class GRPOTrainer(_BaseTrainer):
         # so zero their advantage to keep them from moving the policy.
         advantages = torch.nan_to_num(advantages, nan=0.0)
 
+        # Keep the learning signal auditable without persisting per-token tensors. These
+        # statistics are computed over rows that actually participate in the reward
+        # baseline; masked/unscorable completions are reported separately.
+        scorable_mask = ~unscorable_mask
+        scorable_advantages = advantages[scorable_mask]
+        if scorable_advantages.numel() > 0:
+            advantage_mean = scorable_advantages.mean()
+            advantage_std = (
+                scorable_advantages.std(unbiased=False)
+                if scorable_advantages.numel() > 1
+                else torch.zeros_like(advantage_mean)
+            )
+            advantage_abs_mean = scorable_advantages.abs().mean()
+            advantage_positive_fraction = (scorable_advantages > 0).float().mean()
+            advantage_negative_fraction = (scorable_advantages < 0).float().mean()
+            advantage_zero_fraction = (
+                torch.isclose(scorable_advantages, torch.zeros_like(scorable_advantages)).float().mean()
+            )
+            group_reward_std_mean = std_rewards[scorable_mask].mean()
+        else:
+            zero = torch.zeros((), device=device)
+            advantage_mean = zero
+            advantage_std = zero
+            advantage_abs_mean = zero
+            advantage_positive_fraction = zero
+            advantage_negative_fraction = zero
+            advantage_zero_fraction = zero
+            group_reward_std_mean = zero
+        self._metrics[mode]["advantages/mean"].append(advantage_mean.item())
+        self._metrics[mode]["advantages/std"].append(advantage_std.item())
+        self._metrics[mode]["advantages/abs_mean"].append(advantage_abs_mean.item())
+        self._metrics[mode]["advantages/positive_fraction"].append(advantage_positive_fraction.item())
+        self._metrics[mode]["advantages/negative_fraction"].append(advantage_negative_fraction.item())
+        self._metrics[mode]["advantages/zero_fraction"].append(advantage_zero_fraction.item())
+        self._metrics[mode]["advantages/scorable_fraction"].append(scorable_mask.float().mean().item())
+        self._metrics[mode]["advantages/truncated_fraction"].append(
+            agg_is_truncated.float().mean().item() if agg_is_truncated is not None else 0.0
+        )
+        self._metrics[mode]["group_reward_std/mean"].append(group_reward_std_mean.item())
+
         # Slice to keep only the local part of the data
         process_slice = slice(
             self.accelerator.process_index * len(prompts),
@@ -2824,18 +2918,28 @@ class GRPOTrainer(_BaseTrainer):
         if images is not None:
             self._logs["images"].extend(gather_object(images))
 
-        if self.use_vllm and self.vllm_importance_sampling_correction:
-            delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
+        if needs_vllm_actor_logps:
+            delta = torch.abs(old_per_token_logps - sampling_per_token_logps).float()
             mask = completion_mask.bool() if tool_mask is None else (completion_mask * tool_mask).bool()
             delta = delta[mask]
-            mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-            max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
-            self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
-                self.accelerator.gather(mean_delta).mean().item()
+            local_stats = torch.tensor(
+                [delta.sum().item(), delta.numel()],
+                dtype=torch.float64,
+                device=device,
             )
+            gathered_stats = self.accelerator.gather(local_stats).reshape(-1, 2)
+            global_token_count = int(gathered_stats[:, 1].sum().item())
+            global_delta_sum = gathered_stats[:, 0].sum().item()
+            global_mean_delta = global_delta_sum / global_token_count if global_token_count else 0.0
+            max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
+            self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(global_mean_delta)
             self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
                 self.accelerator.gather(max_delta).max().item()
             )
+            self._metrics[mode]["sampling/sampling_logp_difference/token_count"].append(global_token_count)
+            self._enforce_vllm_policy_parity(mode, global_mean_delta, global_token_count)
+
+        if self.use_vllm and self.vllm_importance_sampling_correction:
             if sequence_level_is:
                 flat_is_ratio = vllm_importance_sampling_ratio.flatten()
             else:
@@ -2859,6 +2963,17 @@ class GRPOTrainer(_BaseTrainer):
             self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
                 nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
             )
+            if importance_sampling_clamp_mask is not None:
+                if sequence_level_is:
+                    clamp_fraction = importance_sampling_clamp_mask.float().mean()
+                else:
+                    clamp_fraction = (
+                        (importance_sampling_clamp_mask & mask.bool()).float().sum()
+                        / mask.float().sum().clamp(min=1.0)
+                    )
+                self._metrics[mode]["sampling/importance_sampling_ratio/clamped_fraction"].append(
+                    self.accelerator.gather(clamp_fraction).mean().item()
+                )
 
         output = {
             "prompt_ids": prompt_ids,

@@ -88,6 +88,54 @@ async def async_multiply_tool(a: int, b: int) -> int:
     return a * b
 
 
+def _policy_parity_trainer(limit: float | None = 0.05) -> GRPOTrainer:
+    trainer = object.__new__(GRPOTrainer)
+    trainer.vllm_policy_parity_max_mean_logp_delta = limit
+    trainer._vllm_policy_parity_checked = False
+    return trainer
+
+
+def test_vllm_policy_parity_gate_accepts_first_training_rollout_once():
+    trainer = _policy_parity_trainer()
+
+    trainer._enforce_vllm_policy_parity("train", 0.014, 128)
+    trainer._enforce_vllm_policy_parity("train", 1.0, 128)
+
+    assert trainer._vllm_policy_parity_checked is True
+
+
+def test_vllm_policy_parity_gate_rejects_mismatched_first_training_rollout():
+    trainer = _policy_parity_trainer()
+
+    with pytest.raises(RuntimeError, match=r"0\.253000 exceeds 0\.050000.*128 selected tokens"):
+        trainer._enforce_vllm_policy_parity("train", 0.253, 128)
+
+    assert trainer._vllm_policy_parity_checked is False
+
+
+def test_vllm_policy_parity_gate_ignores_eval_and_allows_explicit_opt_out():
+    trainer = _policy_parity_trainer()
+    trainer._enforce_vllm_policy_parity("eval", 1.0, 128)
+    assert trainer._vllm_policy_parity_checked is False
+
+    disabled = _policy_parity_trainer(None)
+    disabled._enforce_vllm_policy_parity("train", 1.0, 0)
+    assert disabled._vllm_policy_parity_checked is False
+
+
+def test_vllm_policy_parity_gate_rejects_empty_evidence():
+    trainer = _policy_parity_trainer()
+
+    with pytest.raises(RuntimeError, match="no selected tokens"):
+        trainer._enforce_vllm_policy_parity("train", 0.0, 0)
+
+
+@pytest.mark.parametrize("value", [0.0, -0.1, float("inf"), float("nan")])
+def test_vllm_policy_parity_limit_requires_positive_finite_value(tmp_path, value):
+    with pytest.raises(ValueError, match="finite positive"):
+        GRPOConfig(output_dir=tmp_path, vllm_policy_parity_max_mean_logp_delta=value)
+
+
 class TestGetHighEntropyMask(TrlTestCase):
     def get_high_entropy_mask(self, entropies, mask, threshold):
         """Helper method to test the get_high_entropy_mask functionality."""
@@ -174,6 +222,7 @@ class TestGRPORolloutDispatch:
         trainer._last_loaded_step = 1
         trainer.use_vllm = False
         trainer.use_transformers_continuous_batching = False
+        trainer.mask_truncated_completions = False
         trainer.vllm_generation = SimpleNamespace(sync_weights=MagicMock())
         trainer.processing_class = SimpleNamespace(
             batch_decode=MagicMock(return_value=["decoded"]),

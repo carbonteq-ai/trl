@@ -20,6 +20,7 @@ import os
 import tempfile
 from collections.abc import MutableMapping
 from contextlib import nullcontext
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -137,6 +138,41 @@ def _accumulate_spec_decode_metrics(
     if _KV_CACHE_PEAK_USAGE_METRIC in metrics:
         prior_peak = buffer.get(_KV_CACHE_PEAK_USAGE_METRIC, [0.0])[-1]
         buffer[_KV_CACHE_PEAK_USAGE_METRIC] = [max(prior_peak, metrics[_KV_CACHE_PEAK_USAGE_METRIC])]
+
+
+def _prefix_lora_adapter_weights(directory: str | Path, prefix: str) -> None:
+    """Rewrite a disposable PEFT adapter for a composite vLLM model namespace."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    adapter_root = Path(directory)
+    weight_files = tuple(sorted(adapter_root.glob("adapter_model*.safetensors")))
+    if not weight_files:
+        raise FileNotFoundError(f"LoRA synchronization exported no safetensors weights under {adapter_root}")
+
+    peft_envelope = "base_model.model."
+    prefixed_envelope = f"{peft_envelope}{prefix}"
+    for weight_file in weight_files:
+        with safe_open(weight_file, framework="pt", device="cpu") as handle:
+            metadata = handle.metadata()
+            tensor_names = handle.keys()
+            tensors = {name: handle.get_tensor(name) for name in tensor_names}
+
+        remapped = {}
+        for name, tensor in tensors.items():
+            if name.startswith((prefixed_envelope, prefix)):
+                remapped_name = name
+            elif name.startswith(peft_envelope):
+                remapped_name = f"{peft_envelope}{prefix}{name.removeprefix(peft_envelope)}"
+            else:
+                remapped_name = f"{prefix}{name}"
+            if remapped_name in remapped:
+                raise ValueError(f"LoRA weight prefix creates duplicate tensor name {remapped_name!r}")
+            remapped[remapped_name] = tensor
+
+        temporary = weight_file.with_name(f".{weight_file.name}.tmp")
+        save_file(remapped, temporary, metadata=metadata)
+        temporary.replace(weight_file)
 
 
 def _apply_turboquant_compatibility_patch() -> tuple[str, ...]:
@@ -437,8 +473,6 @@ class VLLMGeneration:
                 raise ValueError("LoRA weight synchronization is supported only in colocated vLLM mode")
             if not is_peft_model(model):
                 raise ValueError("LoRA weight synchronization requires a PEFT model")
-            if weight_name_prefix is not None:
-                raise ValueError("weight_name_prefix does not apply to LoRA weight synchronization")
         self.weight_sync_mode = weight_sync_mode
         self._lora_directory = None
         self._lora_request = None
@@ -664,6 +698,8 @@ class VLLMGeneration:
             # The base weights are immutable in this mode. Persist only the active adapter in PEFT's native format;
             # LoRARequest(load_inplace=True) reloads the same adapter ID on the next generation call.
             self.model.save_pretrained(self._lora_directory.name, safe_serialization=True)
+            if self.weight_name_prefix is not None:
+                _prefix_lora_adapter_weights(self._lora_directory.name, self.weight_name_prefix)
             return
 
         # Wake up vLLM weights before loading to ensure device memory is mapped. Without this, load_weights() writes to
