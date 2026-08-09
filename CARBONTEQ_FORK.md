@@ -12,7 +12,7 @@ Posttrain framework.
 - CarbonTeq repository: `https://github.com/carbonteq-ai/trl`
 - Development branch: `codex/trl-1.9-carbonteq`
 - Intended package release: `trl==1.9.2.post1`
-- Published implementation commit: pending release qualification
+- Published implementation commit: `8680936a3d3e6f5e7c1f5389434b3e45ee68d98b`
 
 The Posttrain dependency declaration and lockfile are the executable consumer
 authority. Do not update them or describe a candidate capability as published
