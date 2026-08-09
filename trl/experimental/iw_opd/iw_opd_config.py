@@ -144,8 +144,15 @@ class IWOPDConfig(_BaseConfig):
             Regex pattern for vLLM structured outputs.
         vllm_sync_frequency (`int`, *optional*, defaults to `1`):
             Frequency (in training steps) to synchronize student model weights to the vLLM engine.
+        vllm_weight_sync_mode (`str`, *optional*, defaults to `"full"`):
+            Student weight synchronization strategy. `"full"` synchronizes the complete model; `"lora"` keeps the
+            colocated vLLM base model immutable and refreshes only the active PEFT adapter.
         vllm_enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Enable vLLM sleep mode to offload student weights during the optimizer step.
+        vllm_speculative_config (`dict`, *optional*):
+            vLLM speculative decoding configuration passed to the colocated generation engine.
+        vllm_engine_kwargs (`dict`, *optional*):
+            Additional keyword arguments passed to the colocated vLLM engine.
 
         > Parameters that control logging
 
@@ -159,7 +166,12 @@ class IWOPDConfig(_BaseConfig):
             Number of completions to print. If `None`, all completions are logged.
     """
 
-    _VALID_DICT_FIELDS = _BaseConfig._VALID_DICT_FIELDS + ["model_init_kwargs", "teacher_model_init_kwargs"]
+    _VALID_DICT_FIELDS = _BaseConfig._VALID_DICT_FIELDS + [
+        "model_init_kwargs",
+        "teacher_model_init_kwargs",
+        "vllm_speculative_config",
+        "vllm_engine_kwargs",
+    ]
 
     # Model
     model_init_kwargs: dict[str, Any] | str | None = field(
@@ -373,9 +385,21 @@ class IWOPDConfig(_BaseConfig):
         default=1,
         metadata={"help": "Frequency (in training steps) to synchronize student weights to the vLLM engine."},
     )
+    vllm_weight_sync_mode: str = field(
+        default="full",
+        metadata={"help": 'Student weight synchronization strategy. Either "full" or "lora".'},
+    )
     vllm_enable_sleep_mode: bool = field(
         default=False,
         metadata={"help": "Enable vLLM sleep mode to offload student weights during the optimizer step."},
+    )
+    vllm_speculative_config: dict | None = field(
+        default=None,
+        metadata={"help": "vLLM speculative decoding configuration for the colocated generation engine."},
+    )
+    vllm_engine_kwargs: dict | None = field(
+        default=None,
+        metadata={"help": "Additional keyword arguments for the colocated vLLM generation engine."},
     )
 
     # W&B
@@ -462,6 +486,10 @@ class IWOPDConfig(_BaseConfig):
                 "distillation_objective='iw_opd' with use_vllm=True requires vllm_sync_frequency=1 so generated "
                 "rollouts match the training policy as closely as possible."
             )
+        if self.vllm_weight_sync_mode not in {"full", "lora"}:
+            raise ValueError("vllm_weight_sync_mode must be either 'full' or 'lora'.")
+        if self.vllm_weight_sync_mode == "lora" and self.vllm_mode != "colocate":
+            raise ValueError("vllm_weight_sync_mode='lora' requires vllm_mode='colocate'.")
         if self.use_teacher_server and (
             self.teacher_model_server_url is None or not self.teacher_model_server_url.strip()
         ):

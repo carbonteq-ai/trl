@@ -17,8 +17,11 @@
 import logging
 import math
 import os
+import tempfile
+from collections.abc import MutableMapping
 from contextlib import nullcontext
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import torch
 from accelerate.utils import broadcast_object_list, gather_object, is_peft_model
@@ -41,10 +44,155 @@ from .vllm_client import VLLMClient
 
 if is_vllm_available():
     from vllm import LLM, RequestOutput, SamplingParams
+    from vllm.lora.request import LoRARequest
     from vllm.sampling_params import StructuredOutputsParams
 
 
 logger = logging.getLogger(__name__)
+
+_SPEC_DECODE_COUNTERS = {
+    "vllm:spec_decode_num_drafts": "drafts",
+    "vllm:spec_decode_num_draft_tokens": "draft_tokens",
+    "vllm:spec_decode_num_accepted_tokens": "accepted_tokens",
+}
+
+_KV_CACHE_CAPACITY_METRIC = "rollout/kv_cache_capacity_tokens"
+_KV_CACHE_PEAK_USAGE_METRIC = "rollout/kv_cache_peak_usage_ratio"
+
+
+class _KvCachePeakTracker:
+    """Retain the exact peak scheduler-reported KV-cache usage for one generation call."""
+
+    def __init__(self) -> None:
+        self.peak_usage_ratio = 0.0
+
+    def record(self, scheduler_stats, iteration_stats, mm_cache_stats=None, engine_idx=0) -> None:
+        del iteration_stats, mm_cache_stats, engine_idx
+        if scheduler_stats is not None:
+            self.peak_usage_ratio = max(self.peak_usage_ratio, float(scheduler_stats.kv_cache_usage))
+
+    def reset(self) -> None:
+        self.peak_usage_ratio = 0.0
+
+    def log(self) -> None:
+        pass
+
+    def log_engine_initialized(self) -> None:
+        pass
+
+    def record_sleep_state(self, sleep=0, level=0) -> None:
+        del sleep, level
+
+
+def _compute_spec_decode_counter_delta(
+    current: dict[str, float], previous: dict[str, float]
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Convert vLLM process-lifetime counters into metrics for one generation call."""
+    if not current:
+        return {}, previous
+    delta = {
+        name: value - previous.get(name, 0.0) if value >= previous.get(name, 0.0) else value
+        for name, value in current.items()
+    }
+    drafts = delta.get("drafts", 0.0)
+    draft_tokens = delta.get("draft_tokens", 0.0)
+    accepted_tokens = delta.get("accepted_tokens", 0.0)
+    return (
+        {
+            "rollout/spec_num_drafts": drafts,
+            "rollout/spec_num_draft_tokens": draft_tokens,
+            "rollout/spec_num_accepted_tokens": accepted_tokens,
+            "rollout/spec_accept_rate": accepted_tokens / draft_tokens if draft_tokens > 0 else 0.0,
+            "rollout/spec_accept_length": 1.0 + accepted_tokens / drafts if drafts > 0 else 0.0,
+        },
+        current,
+    )
+
+
+def _accumulate_spec_decode_metrics(buffer: MutableMapping[str, list[float]], metrics: dict[str, float]) -> None:
+    """Accumulate turn-local counters into one step total with weighted rates."""
+    if not metrics:
+        return
+    counter_names = (
+        "rollout/spec_num_drafts",
+        "rollout/spec_num_draft_tokens",
+        "rollout/spec_num_accepted_tokens",
+    )
+    if any(name in metrics for name in counter_names):
+        totals = {
+            name: (buffer.get(name, [0.0])[-1] if buffer.get(name) else 0.0) + metrics.get(name, 0.0)
+            for name in counter_names
+        }
+        for name, value in totals.items():
+            buffer[name] = [value]
+        drafts = totals["rollout/spec_num_drafts"]
+        draft_tokens = totals["rollout/spec_num_draft_tokens"]
+        accepted_tokens = totals["rollout/spec_num_accepted_tokens"]
+        buffer["rollout/spec_accept_rate"] = [accepted_tokens / draft_tokens if draft_tokens > 0 else 0.0]
+        buffer["rollout/spec_accept_length"] = [1.0 + accepted_tokens / drafts if drafts > 0 else 0.0]
+
+    if _KV_CACHE_CAPACITY_METRIC in metrics:
+        buffer[_KV_CACHE_CAPACITY_METRIC] = [metrics[_KV_CACHE_CAPACITY_METRIC]]
+    if _KV_CACHE_PEAK_USAGE_METRIC in metrics:
+        prior_peak = buffer.get(_KV_CACHE_PEAK_USAGE_METRIC, [0.0])[-1]
+        buffer[_KV_CACHE_PEAK_USAGE_METRIC] = [max(prior_peak, metrics[_KV_CACHE_PEAK_USAGE_METRIC])]
+
+
+def _prefix_lora_adapter_weights(directory: str | Path, prefix: str) -> None:
+    """Rewrite a disposable PEFT adapter for a composite vLLM model namespace."""
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    adapter_root = Path(directory)
+    weight_files = tuple(sorted(adapter_root.glob("adapter_model*.safetensors")))
+    if not weight_files:
+        raise FileNotFoundError(f"LoRA synchronization exported no safetensors weights under {adapter_root}")
+
+    peft_envelope = "base_model.model."
+    prefixed_envelope = f"{peft_envelope}{prefix}"
+    for weight_file in weight_files:
+        with safe_open(weight_file, framework="pt", device="cpu") as handle:
+            metadata = handle.metadata()
+            tensor_names = handle.keys()
+            tensors = {name: handle.get_tensor(name) for name in tensor_names}
+
+        remapped = {}
+        for name, tensor in tensors.items():
+            if name.startswith((prefixed_envelope, prefix)):
+                remapped_name = name
+            elif name.startswith(peft_envelope):
+                remapped_name = f"{peft_envelope}{prefix}{name.removeprefix(peft_envelope)}"
+            else:
+                remapped_name = f"{prefix}{name}"
+            if remapped_name in remapped:
+                raise ValueError(f"LoRA weight prefix creates duplicate tensor name {remapped_name!r}")
+            remapped[remapped_name] = tensor
+
+        temporary = weight_file.with_name(f".{weight_file.name}.tmp")
+        save_file(remapped, temporary, metadata=metadata)
+        temporary.replace(weight_file)
+
+
+def _apply_turboquant_compatibility_patch() -> tuple[str, ...]:
+    """Preserve TurboQuant's quantized cache marker in affected vLLM builds."""
+    from vllm.v1.kv_cache_interface import KVQuantMode, TQFullAttentionSpec, get_kv_quant_mode
+
+    if get_kv_quant_mode("turboquant_k8v4") != KVQuantMode.NONE:
+        return ()
+    if getattr(TQFullAttentionSpec, "_trl_quant_marker_patch", False):
+        return ("turboquant-quant-marker",)
+
+    inherited_post_init: Any = TQFullAttentionSpec.__post_init__
+
+    def tq_post_init(self: Any) -> None:
+        inherited_post_init(self)
+        if self.kv_quant_mode == KVQuantMode.NONE:
+            object.__setattr__(self, "kv_quant_mode", KVQuantMode.FP8_PER_TENSOR)
+
+    spec_class: Any = TQFullAttentionSpec
+    spec_class.__post_init__ = tq_post_init
+    spec_class._trl_quant_marker_patch = True
+    return ("turboquant-quant-marker",)
 
 
 def empty_cache() -> None:
@@ -171,6 +319,20 @@ class VLLMGeneration:
         enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Whether to enable sleep mode for the engine to offload weights/cache during the optimizer step. Keeps GPU
             memory usage low, but waking the engine adds host–device transfer latency.
+        speculative_config (`dict`, *optional*):
+            Engine-level speculative decoding configuration for colocated vLLM. This value is forwarded to `LLM` and
+            is ignored in server mode, whose engine must be configured when the server is launched.
+        engine_kwargs (`dict`, *optional*):
+            Additional non-conflicting `LLM` engine arguments for colocated mode. Arguments controlled directly by
+            this adapter cannot be overridden. This value is ignored in server mode.
+        weight_name_prefix (`str`, *optional*):
+            Prefix added to parameter names before weight synchronization. Use this when the vLLM model keeps a
+            composite-model namespace around the text model while the training model exposes the text model directly.
+        weight_sync_mode (`str`, *optional*, defaults to `"full"`):
+            How colocated vLLM receives current policy weights. `"full"` merges PEFT adapters and synchronizes model
+            parameters. `"lora"` keeps vLLM's base weights unchanged and reloads the active PEFT LoRA adapter through
+            vLLM's native dynamic-LoRA path. The latter avoids copying packed 4-bit parameter storage into vLLM and
+            is supported only for PEFT LoRA models in colocated mode.
         model_impl (`str`, *optional*, defaults to `"auto"`):
             Model implementation to use for vLLM.
             - "auto" will try to use the vLLM implementation, if it exists, and fall back to the Transformers
@@ -241,6 +403,10 @@ class VLLMGeneration:
         max_model_length: int | None = None,
         max_num_seqs: int | None = None,
         enable_sleep_mode: bool = False,
+        speculative_config: dict | None = None,
+        engine_kwargs: dict | None = None,
+        weight_name_prefix: str | None = None,
+        weight_sync_mode: str = "full",
         model_impl: str = "auto",
         trust_remote_code: bool = False,
         # Generation configuration
@@ -275,6 +441,43 @@ class VLLMGeneration:
         self.max_model_length = max_model_length
         self.max_num_seqs = max_num_seqs
         self.enable_sleep_mode = enable_sleep_mode
+        self.speculative_config = speculative_config
+        self.engine_kwargs = dict(engine_kwargs or {})
+        # The trainer derives a resident sequence count from its generation
+        # batch. Framework consumers may deliberately cap that count so a
+        # large logical batch is processed in bounded vLLM waves instead of
+        # overcommitting KV cache memory.
+        requested_max_num_seqs = self.engine_kwargs.pop("max_num_seqs", None)
+        if requested_max_num_seqs is not None:
+            if (
+                isinstance(requested_max_num_seqs, bool)
+                or not isinstance(requested_max_num_seqs, int)
+                or requested_max_num_seqs < 1
+            ):
+                raise ValueError("vLLM max_num_seqs must be a positive integer")
+            self.max_num_seqs = requested_max_num_seqs
+        requested_max_num_batched_tokens = self.engine_kwargs.pop("max_num_batched_tokens", None)
+        if requested_max_num_batched_tokens is not None:
+            if (
+                isinstance(requested_max_num_batched_tokens, bool)
+                or not isinstance(requested_max_num_batched_tokens, int)
+                or requested_max_num_batched_tokens < 1
+            ):
+                raise ValueError("vLLM max_num_batched_tokens must be a positive integer")
+        self._max_num_batched_tokens = requested_max_num_batched_tokens or 4096
+        if weight_name_prefix is not None and (not weight_name_prefix or not weight_name_prefix.endswith(".")):
+            raise ValueError("weight_name_prefix must be a non-empty module prefix ending with `.`")
+        self.weight_name_prefix = weight_name_prefix
+        if weight_sync_mode not in {"full", "lora"}:
+            raise ValueError("weight_sync_mode must be either `full` or `lora`")
+        if weight_sync_mode == "lora":
+            if mode != "colocate":
+                raise ValueError("LoRA weight synchronization is supported only in colocated vLLM mode")
+            if not is_peft_model(model):
+                raise ValueError("LoRA weight synchronization requires a PEFT model")
+        self.weight_sync_mode = weight_sync_mode
+        self._lora_directory = None
+        self._lora_request = None
         self.model_impl = model_impl
         self.trust_remote_code = trust_remote_code
 
@@ -287,6 +490,10 @@ class VLLMGeneration:
         self.max_completion_length = max_completion_length
         self.logprobs = logprobs
         self.generation_kwargs = generation_kwargs or {}
+        self.last_generation_metrics: dict[str, float] = {}
+        self._spec_decode_counter_snapshot: dict[str, float] = {}
+        self._kv_cache_capacity_tokens: float | None = None
+        self._kv_cache_peak_tracker: _KvCachePeakTracker | None = None
 
         self._init_vllm()
 
@@ -348,26 +555,69 @@ class VLLMGeneration:
                         raise ValueError("vLLM does not support in-flight 8-bit quantization.")
 
             # Build LLM initialization kwargs
-            self.llm = LLM(
-                model=model.name_or_path,
-                tensor_parallel_size=self.tensor_parallel_size,
-                gpu_memory_utilization=self.gpu_memory_utilization,
-                max_model_len=self.max_model_length,
-                max_num_seqs=self.max_num_seqs,
-                enable_sleep_mode=self.enable_sleep_mode,
-                model_impl=self.model_impl,
-                distributed_executor_backend="external_launcher",
+            llm_kwargs = {
+                "model": model.name_or_path,
+                "tensor_parallel_size": self.tensor_parallel_size,
+                "gpu_memory_utilization": self.gpu_memory_utilization,
+                "max_model_len": self.max_model_length,
+                "max_num_seqs": self.max_num_seqs,
+                "enable_sleep_mode": self.enable_sleep_mode,
+                "speculative_config": self.speculative_config,
+                "model_impl": self.model_impl,
+                "distributed_executor_backend": "external_launcher",
                 # Feed identical seed for tp groups to ensure sampling results are the same across workers
-                seed=accelerator.process_index // self.tensor_parallel_size,
+                "seed": accelerator.process_index // self.tensor_parallel_size,
                 # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
-                max_num_batched_tokens=4096,
+                "max_num_batched_tokens": self._max_num_batched_tokens,
                 # Important so temperature scaling/logit tweaking affects the TIS log probs
-                logprobs_mode="processed_logprobs",
-                quantization=quantization,
-                trust_remote_code=self.trust_remote_code,
-            )
-            if self.enable_sleep_mode:
-                self.llm.sleep(level=2)
+                "logprobs_mode": "processed_logprobs",
+                "quantization": quantization,
+                "trust_remote_code": self.trust_remote_code,
+            }
+            observe_runtime_metrics = self.speculative_config is not None or str(
+                self.engine_kwargs.get("kv_cache_dtype", "")
+            ).startswith("turboquant_")
+            if observe_runtime_metrics:
+                requested_log_stats = self.engine_kwargs.get("disable_log_stats")
+                if requested_log_stats is True:
+                    raise ValueError("runtime metric collection requires vLLM disable_log_stats=False")
+                if requested_log_stats is None:
+                    llm_kwargs["disable_log_stats"] = False
+            if self.weight_sync_mode == "lora":
+                max_rank = max(config.r for config in model.peft_config.values())
+                supported_ranks = (1, 8, 16, 32, 64, 128, 256, 320, 512)
+                try:
+                    max_lora_rank = next(rank for rank in supported_ranks if rank >= max_rank)
+                except StopIteration as error:
+                    raise ValueError(f"vLLM does not support LoRA rank {max_rank}") from error
+                llm_kwargs.update({"enable_lora": True, "max_lora_rank": max_lora_rank})
+            conflicts = sorted(set(llm_kwargs).intersection(self.engine_kwargs))
+            if conflicts:
+                raise ValueError(
+                    f"vLLM engine kwargs cannot override TRL-controlled arguments: {', '.join(conflicts)}"
+                )
+            if str(self.engine_kwargs.get("kv_cache_dtype", "")).startswith("turboquant_"):
+                _apply_turboquant_compatibility_patch()
+            llm_kwargs.update(self.engine_kwargs)
+            self.llm = LLM(**llm_kwargs)
+            if observe_runtime_metrics:
+                cache_config = self.llm.llm_engine.vllm_config.cache_config
+                capacity = getattr(cache_config, "kv_cache_size_tokens", None)
+                if isinstance(capacity, int) and capacity > 0:
+                    self._kv_cache_capacity_tokens = float(capacity)
+                logger_manager = self.llm.llm_engine.logger_manager
+                if logger_manager is not None:
+                    self._kv_cache_peak_tracker = _KvCachePeakTracker()
+                    logger_manager.stat_loggers.append(self._kv_cache_peak_tracker)
+            if self.weight_sync_mode == "lora":
+                self._lora_directory = tempfile.TemporaryDirectory(prefix="trl-vllm-lora-")
+                self._lora_request = LoRARequest(
+                    "trl-training-policy",
+                    1,
+                    self._lora_directory.name,
+                    load_inplace=True,
+                )
+            self._sleep_colocated_engine()
         else:
             raise ValueError(f"vllm_mode must be either 'server' or 'colocate', got '{self.mode}'.")
 
@@ -386,6 +636,8 @@ class VLLMGeneration:
 
     def _push_param_to_vllm(self, name: str, param) -> None:
         """Push a single parameter tensor to the vLLM engine (server or colocate mode)."""
+        if self.weight_name_prefix is not None and not name.startswith(self.weight_name_prefix):
+            name = f"{self.weight_name_prefix}{name}"
         if self.mode == "server" and self.accelerator.is_main_process:
             self.vllm_client.update_named_param(name, param)
         elif self.mode == "colocate":
@@ -446,6 +698,14 @@ class VLLMGeneration:
 
         Handles FSDP, DeepSpeed, PEFT weight synchronization.
         """
+        if self.weight_sync_mode == "lora":
+            # The base weights are immutable in this mode. Persist only the active adapter in PEFT's native format;
+            # LoRARequest(load_inplace=True) reloads the same adapter ID on the next generation call.
+            self.model.save_pretrained(self._lora_directory.name, safe_serialization=True)
+            if self.weight_name_prefix is not None:
+                _prefix_lora_adapter_weights(self._lora_directory.name, self.weight_name_prefix)
+            return
+
         # Wake up vLLM weights before loading to ensure device memory is mapped. Without this, load_weights() writes to
         # freed/unmapped memory when sleep mode is active, which crashes on backends with strict physical memory
         # management (e.g., Ascend NPU). See https://github.com/huggingface/trl/issues/5142
@@ -500,6 +760,83 @@ class VLLMGeneration:
         elif self.mode == "colocate":
             self.llm.reset_prefix_cache()
 
+    def _wake_weights_for_generation(self) -> None:
+        """Restore colocated weights without reloading an immutable LoRA base model."""
+        if self.mode != "colocate" or not self.enable_sleep_mode:
+            return
+
+        empty_cache()  # required to avoid OOM in some cases
+        self.llm.wake_up(tags=["weights"])
+        if self.weight_sync_mode == "lora":
+            # Native LoRA synchronization never mutates the vLLM base model. Level-1 sleep restores its CPU-backed
+            # allocations on wake, and the adapter is refreshed separately by LoRARequest(load_inplace=True). Calling
+            # reload_weights here is both unnecessary and unsupported by vLLM's bitsandbytes loader.
+            return
+
+        # Work around https://github.com/vllm-project/vllm/issues/29341 for full-parameter synchronization.
+        try:
+            self.llm.collective_rpc("reload_weights")
+        except NotImplementedError:
+            # Non-CUDA vLLM backends (e.g., vllm-ascend's NPUWorkerV1), don't implement reload_weights.
+            pass
+
+    def _sleep_colocated_engine(self) -> None:
+        """Release colocated memory using the level compatible with the synchronization strategy."""
+        if self.mode != "colocate" or not self.enable_sleep_mode:
+            return
+        # Full synchronization can reconstruct discarded weights from the trainer, so it retains vLLM's level-2
+        # behavior. Native LoRA synchronization keeps the quantized base immutable; level 1 preserves a CPU backup
+        # because vLLM cannot reload a bitsandbytes checkpoint after level 2 discards those allocations.
+        level = 1 if self.weight_sync_mode == "lora" else 2
+        self.llm.sleep(level=level)
+
+    def _collect_generation_metrics(self) -> None:
+        """Snapshot optional MTP and KV-cache runtime metrics before the engine sleeps."""
+        self.last_generation_metrics = {}
+        if self.mode != "colocate":
+            return
+        if self.speculative_config is not None and hasattr(self.llm, "get_metrics"):
+            current: dict[str, float] = {}
+            for metric in self.llm.get_metrics():
+                normalized_name = _SPEC_DECODE_COUNTERS.get(getattr(metric, "name", ""))
+                value = getattr(metric, "value", None)
+                if normalized_name is not None and isinstance(value, (int, float)):
+                    current[normalized_name] = current.get(normalized_name, 0.0) + float(value)
+            spec_metrics, self._spec_decode_counter_snapshot = _compute_spec_decode_counter_delta(
+                current, self._spec_decode_counter_snapshot
+            )
+            self.last_generation_metrics.update(spec_metrics)
+        if self._kv_cache_capacity_tokens is not None:
+            self.last_generation_metrics[_KV_CACHE_CAPACITY_METRIC] = self._kv_cache_capacity_tokens
+        if self._kv_cache_peak_tracker is not None:
+            self.last_generation_metrics[_KV_CACHE_PEAK_USAGE_METRIC] = self._kv_cache_peak_tracker.peak_usage_ratio
+
+    def _generate_colocated_waves(self, prompts: list[dict], sampling_params: Any) -> list:
+        """Generate a colocated batch in bounded request waves.
+
+        ``max_num_seqs`` limits the number of sequences vLLM schedules at once,
+        but passing a larger list to ``LLM.generate`` still queues every request
+        in one call.  Large online-RL updates can therefore build an unbounded
+        request queue, exhaust the runner's file descriptors, and leave stale
+        requests behind when a rollout fails.  Keep the call boundary bounded
+        as well as the engine capacity while preserving prompt order.
+        """
+        if not prompts:
+            return []
+
+        wave_size = self.max_num_seqs or len(prompts)
+        outputs = []
+        for start in range(0, len(prompts), wave_size):
+            outputs.extend(
+                self.llm.generate(
+                    prompts[start : start + wave_size],
+                    sampling_params=sampling_params,
+                    use_tqdm=False,
+                    lora_request=self._lora_request,
+                )
+            )
+        return outputs
+
     def generate(
         self,
         prompts: list[list[int]],
@@ -536,16 +873,8 @@ class VLLMGeneration:
         repetition_penalty = self.repetition_penalty
         max_completion_length = self.max_completion_length
 
-        # Wake up colocated vLLM weights if needed (idempotent if already awake from sync_weights)
-        if self.mode == "colocate" and self.enable_sleep_mode:
-            empty_cache()  # required to avoid OOM in some cases
-            self.llm.wake_up(tags=["weights"])
-            # Work around for https://github.com/vllm-project/vllm/issues/29341
-            try:
-                self.llm.collective_rpc("reload_weights")
-            except NotImplementedError:
-                # Non-CUDA vLLM backends (e.g., vllm-ascend's NPUWorkerV1), don't implement reload_weights
-                pass
+        # Wake up colocated vLLM weights if needed (idempotent if already awake from sync_weights).
+        self._wake_weights_for_generation()
 
         # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
         if self.mode == "server":
@@ -677,7 +1006,9 @@ class VLLMGeneration:
                 torch.distributed.barrier(device_ids=[accelerator.local_process_index])
 
             with profiler:
-                all_outputs = self.llm.generate(vllm_prompts, sampling_params=sampling_params, use_tqdm=False)
+                if self._kv_cache_peak_tracker is not None:
+                    self._kv_cache_peak_tracker.reset()
+                all_outputs = self._generate_colocated_waves(vllm_prompts, sampling_params)
 
             all_prompt_ids = [output.prompt_token_ids for output in all_outputs]
             all_completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
@@ -698,7 +1029,7 @@ class VLLMGeneration:
                 logprobs = all_logprobs
                 logprob_token_ids = all_logprob_token_ids
 
-            if self.enable_sleep_mode:
-                self.llm.sleep(level=2)
+            self._collect_generation_metrics()
+            self._sleep_colocated_engine()
 
         return prompt_ids, completion_ids, logprobs, logprob_token_ids

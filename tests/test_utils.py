@@ -627,6 +627,16 @@ class TestEntropyFromLogits(TrlTestCase):
         predicted_entropy = entropy_from_logits(logits, chunk_size=chunk_size)
         torch.testing.assert_close(predicted_entropy, entropy, rtol=1e-5, atol=1e-5)
 
+    def test_entropy_from_noncontiguous_sequence_slice(self):
+        logits = torch.randn(2, 17, 768)[:, :-1, :]
+        assert not logits.is_contiguous()
+        logps = logits.log_softmax(dim=-1)
+        expected = -(torch.exp(logps) * logps).sum(-1)
+
+        predicted = entropy_from_logits(logits, chunk_size=4)
+
+        torch.testing.assert_close(predicted, expected)
+
 
 @require_rich
 class TestPrintPromptCompletionsSample(TrlTestCase):
