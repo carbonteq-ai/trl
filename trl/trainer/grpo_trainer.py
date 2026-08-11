@@ -797,6 +797,7 @@ class GRPOTrainer(_BaseTrainer):
         self.vllm_importance_sampling_clip_max = args.vllm_importance_sampling_clip_max
         self.vllm_importance_sampling_clip_min = args.vllm_importance_sampling_clip_min
         self.vllm_policy_parity_max_mean_logp_delta = args.vllm_policy_parity_max_mean_logp_delta
+        self.vllm_policy_parity_max_tokens = args.vllm_policy_parity_max_tokens
         self._vllm_policy_parity_checked = False
         self.logits_chunk_size = args.logits_chunk_size
         self.use_liger_kernel = args.use_liger_kernel
@@ -1492,9 +1493,11 @@ class GRPOTrainer(_BaseTrainer):
         token_type_ids=None,
         mm_token_type_ids=None,
         image_position_ids=None,
+        temperature=None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Compute log-probs, (optionally) entropies, and (optionally) the MoE load-balancing aux loss."""
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
+        temperature = self.temperature if temperature is None else temperature
         all_logps = []
         all_entropies = []
         all_aux_losses = []
@@ -1566,7 +1569,7 @@ class GRPOTrainer(_BaseTrainer):
                 for chunk_start in range(0, logits_to_keep, self.logits_chunk_size):
                     chunk_end = min(chunk_start + self.logits_chunk_size, logits_to_keep)
                     logits = lm_head(last_hidden_state[:, chunk_start:chunk_end, :])
-                    logits.div_(self.temperature)
+                    logits.div_(temperature)
                     chunk_ids = completion_ids[:, chunk_start:chunk_end]
                     chunk_logps.append(selective_log_softmax(logits, chunk_ids))
                     if compute_entropy:
@@ -1587,7 +1590,7 @@ class GRPOTrainer(_BaseTrainer):
                 logits = logits[:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
                 # Divide logits by sampling temperature.
                 # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-                logits.div_(self.temperature)
+                logits.div_(temperature)
                 all_logps.append(selective_log_softmax(logits, completion_ids))
 
                 if compute_entropy:
@@ -1778,6 +1781,16 @@ class GRPOTrainer(_BaseTrainer):
         self._metrics["train"]["active_sampling/generation_rounds"].append(generation_rounds)
         self._metrics["train"]["active_sampling/retained_fraction"].append(retained_count / candidate_count)
         self._metrics["train"]["active_sampling/generated_rows"].append(candidate_count)
+        # Candidate rows are reserved by the dataloader before their reward
+        # variance is known.  Recording the complete accounting makes the
+        # active-sampling data cost visible without conflating it with the
+        # rollout population (each row still expands to ``num_generations``).
+        self._metrics["train"]["active_sampling/candidate_groups_reserved"].append(len(candidate_inputs))
+        self._metrics["train"]["active_sampling/candidate_groups_generated"].append(candidate_count)
+        self._metrics["train"]["active_sampling/candidate_groups_retained"].append(retained_count)
+        self._metrics["train"]["active_sampling/candidate_groups_unused"].append(
+            len(candidate_inputs) - candidate_cursor
+        )
         return batch
 
     @staticmethod
@@ -2522,6 +2535,36 @@ class GRPOTrainer(_BaseTrainer):
             )
         self._vllm_policy_parity_checked = True
 
+    @staticmethod
+    def _build_vllm_policy_parity_probe(
+        prompt_ids: list[list[int]],
+        completion_ids: list[list[int]],
+        loss_mask: torch.Tensor,
+        max_tokens: int,
+    ) -> tuple[list[list[int]], list[list[int]], list[torch.Tensor], list[int]]:
+        """Select a deterministic, token-bounded prefix of locally trainable completions."""
+        probe_prompts: list[list[int]] = []
+        probe_completions: list[list[int]] = []
+        probe_masks: list[torch.Tensor] = []
+        source_rows: list[int] = []
+        remaining = max_tokens
+        for row_index, (prompt, completion) in enumerate(zip(prompt_ids, completion_ids, strict=True)):
+            row_mask = loss_mask[row_index, : len(completion)].bool()
+            selected_positions = torch.nonzero(row_mask, as_tuple=False).flatten()
+            if selected_positions.numel() == 0:
+                continue
+            selected_count = min(int(selected_positions.numel()), remaining)
+            last_position = int(selected_positions[selected_count - 1].item())
+            prefix_length = last_position + 1
+            probe_prompts.append(prompt)
+            probe_completions.append(completion[:prefix_length])
+            probe_masks.append(row_mask[:prefix_length])
+            source_rows.append(row_index)
+            remaining -= selected_count
+            if remaining == 0:
+                break
+        return probe_prompts, probe_completions, probe_masks, source_rows
+
     def _generate_and_score_completions(
         self, inputs: list[dict[str, torch.Tensor | Any]]
     ) -> dict[str, torch.Tensor | Any]:
@@ -2713,6 +2756,29 @@ class GRPOTrainer(_BaseTrainer):
 
         loss_mask = completion_mask if tool_mask is None else completion_mask * tool_mask
         num_items_in_batch = self.accelerator.gather(loss_mask.sum()).sum()
+
+        parity_probe = None
+        parity_pending = (
+            self.use_vllm
+            and mode == "train"
+            and self.vllm_policy_parity_max_mean_logp_delta is not None
+            and not self._vllm_policy_parity_checked
+        )
+        if parity_pending:
+            if images is not None:
+                raise RuntimeError("the teacher-forced vLLM policy parity probe currently supports text-only rollouts")
+            probe_prompts, probe_completions, probe_masks, source_rows = self._build_vllm_policy_parity_probe(
+                prompt_ids_list,
+                completion_ids_list,
+                loss_mask.bool(),
+                self.vllm_policy_parity_max_tokens,
+            )
+            with profiling_context(self, "vllm_policy_parity"):
+                vllm_raw_logps = self.vllm_generation.score_completion_logprobs(
+                    probe_prompts,
+                    probe_completions,
+                )
+            parity_probe = (vllm_raw_logps, probe_masks, source_rows)
 
         # Concatenate prompt_mask with completion_mask for logit computation
         prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # (B, P+C)
@@ -3152,7 +3218,62 @@ class GRPOTrainer(_BaseTrainer):
                 self.accelerator.gather(max_delta).max().item()
             )
             self._metrics[mode]["sampling/sampling_logp_difference/token_count"].append(global_token_count)
-            self._enforce_vllm_policy_parity(mode, global_mean_delta, global_token_count)
+
+            if parity_pending:
+                if parity_probe is None:
+                    raise RuntimeError("vLLM policy parity probe evidence is missing")
+                vllm_raw_logps, probe_masks, source_rows = parity_probe
+                if self.temperature == 1.0:
+                    actor_raw_logps = old_per_token_logps
+                else:
+                    actor_raw_logps, _, _ = self._get_per_token_logps_and_entropies(
+                        self.model,
+                        prompt_completion_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size,
+                        num_images=num_images,
+                        num_tiles=num_tiles,
+                        temperature=1.0,
+                        **forward_kwargs,
+                    )
+
+                parity_deltas = []
+                for row_index, vllm_row, probe_mask in zip(
+                    source_rows, vllm_raw_logps, probe_masks, strict=True
+                ):
+                    if len(vllm_row) != len(probe_mask):
+                        raise RuntimeError("vLLM parity log-probabilities do not align with the probe completion")
+                    row_actor_logps = actor_raw_logps[row_index, : len(vllm_row)]
+                    row_vllm_logps = torch.tensor(vllm_row, device=device, dtype=row_actor_logps.dtype)
+                    parity_deltas.append(torch.abs(row_actor_logps - row_vllm_logps).float()[probe_mask])
+                local_parity_delta = (
+                    torch.cat(parity_deltas)
+                    if parity_deltas
+                    else torch.empty(0, device=device, dtype=torch.float32)
+                )
+                local_parity_stats = torch.tensor(
+                    [local_parity_delta.sum().item(), local_parity_delta.numel()],
+                    dtype=torch.float64,
+                    device=device,
+                )
+                gathered_parity_stats = self.accelerator.gather(local_parity_stats).reshape(-1, 2)
+                parity_token_count = int(gathered_parity_stats[:, 1].sum().item())
+                parity_delta_sum = gathered_parity_stats[:, 0].sum().item()
+                parity_mean_delta = parity_delta_sum / parity_token_count if parity_token_count else 0.0
+                parity_max_delta = (
+                    torch.max(local_parity_delta)
+                    if local_parity_delta.numel() > 0
+                    else torch.tensor(0.0, device=device)
+                )
+                self._metrics[mode]["sampling/policy_parity_logp_difference/mean"].append(parity_mean_delta)
+                self._metrics[mode]["sampling/policy_parity_logp_difference/max"].append(
+                    self.accelerator.gather(parity_max_delta).max().item()
+                )
+                self._metrics[mode]["sampling/policy_parity_logp_difference/token_count"].append(
+                    parity_token_count
+                )
+                self._enforce_vllm_policy_parity(mode, parity_mean_delta, parity_token_count)
 
         if self.use_vllm and self.vllm_importance_sampling_correction:
             if sequence_level_is:

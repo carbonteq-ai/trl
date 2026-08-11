@@ -1038,9 +1038,18 @@ class GRPOConfig(_BaseConfig):
     vllm_policy_parity_max_mean_logp_delta: float | None = field(
         default=0.05,
         metadata={
-            "help": "Maximum allowed mean absolute per-token log-probability difference between the vLLM sampler "
-            "and the training actor on the first training rollout. The trainer fails before optimization when the "
-            "difference exceeds this value. Set to `None` only to opt out for deliberately off-policy research."
+            "help": "Maximum allowed mean absolute per-token raw log-probability difference between a teacher-forced "
+            "vLLM parity probe and the training actor on the first training rollout. The trainer fails before "
+            "optimization when the difference exceeds this value. Behavior-policy log-probabilities after sampling "
+            "processors remain separate and are used for importance sampling. Set to `None` only to opt out for "
+            "deliberately off-policy research."
+        },
+    )
+    vllm_policy_parity_max_tokens: int = field(
+        default=16384,
+        metadata={
+            "help": "Maximum selected completion tokens per process in the first-rollout vLLM weight-parity probe. "
+            "This bounds the one-time teacher-forced prefill without weakening the configured delta threshold."
         },
     )
     vllm_importance_sampling_mode: str = field(
@@ -1302,6 +1311,12 @@ class GRPOConfig(_BaseConfig):
             or self.vllm_policy_parity_max_mean_logp_delta <= 0
         ):
             raise ValueError("vllm_policy_parity_max_mean_logp_delta must be a finite positive number or None")
+        if (
+            isinstance(self.vllm_policy_parity_max_tokens, bool)
+            or not isinstance(self.vllm_policy_parity_max_tokens, int)
+            or self.vllm_policy_parity_max_tokens < 1
+        ):
+            raise ValueError("vllm_policy_parity_max_tokens must be a positive integer")
 
         if self.vllm_importance_sampling_cap is not None:
             warnings.warn(

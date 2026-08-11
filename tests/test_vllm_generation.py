@@ -504,6 +504,53 @@ def test_colocated_sleep_level_preserves_native_lora_base(sync_mode, expected_le
     assert calls == [expected_level]
 
 
+def test_colocated_policy_parity_probe_teacher_forces_observed_tokens(monkeypatch):
+    calls = []
+    captured = {}
+    generation = object.__new__(VLLMGeneration)
+    generation.mode = "colocate"
+    generation.tensor_parallel_size = 1
+    generation.enable_sleep_mode = False
+    generation.accelerator = SimpleNamespace()
+    generation._lora_request = None
+    generation._wake_weights_for_generation = lambda: calls.append("wake")
+    generation._sleep_colocated_engine = lambda: calls.append("sleep")
+
+    def fake_sampling_params(**kwargs):
+        captured["sampling"] = kwargs
+        return kwargs
+
+    def fake_generate(prompts, sampling_params):
+        captured["prompts"] = prompts
+        assert sampling_params == captured["sampling"]
+        return [
+            SimpleNamespace(
+                prompt_token_ids=[1, 2, 10, 11],
+                prompt_logprobs=[
+                    None,
+                    {2: SimpleNamespace(logprob=-0.1)},
+                    {10: SimpleNamespace(logprob=-0.2)},
+                    {11: SimpleNamespace(logprob=-0.3)},
+                ],
+            )
+        ]
+
+    monkeypatch.setattr(vllm_generation, "SamplingParams", fake_sampling_params, raising=False)
+    generation._generate_colocated_waves = fake_generate
+
+    result = generation.score_completion_logprobs([[1, 2]], [[10, 11]])
+
+    assert result == [[-0.2, -0.3]]
+    assert captured["prompts"] == [{"prompt_token_ids": [1, 2, 10, 11]}]
+    assert captured["sampling"] == {
+        "max_tokens": 1,
+        "temperature": 1.0,
+        "prompt_logprobs": 1,
+        "detokenize": False,
+    }
+    assert calls == ["wake", "sleep"]
+
+
 def test_lora_sync_rejects_unsupported_execution_shapes(monkeypatch):
     class FakeModel:
         name_or_path = "model"

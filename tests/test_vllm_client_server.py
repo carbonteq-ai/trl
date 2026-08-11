@@ -22,7 +22,7 @@ from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 from transformers.testing_utils import torch_device
 
 from trl.generation.vllm_client import VLLMClient
-from trl.generation.vllm_generation import extract_logprobs
+from trl.generation.vllm_generation import extract_actual_prompt_logprobs, extract_logprobs
 from trl.import_utils import is_vllm_available
 from trl.scripts.vllm_serve import chunk_list
 
@@ -122,6 +122,32 @@ class TestExtractLogprobs(TrlTestCase):
 
         assert all_logprobs is None
         assert all_token_ids is None
+
+    def test_extract_actual_prompt_logprobs_selects_observed_completion_tokens(self):
+        all_outputs = [
+            SimpleNamespace(
+                prompt_token_ids=[10, 11, 20, 21],
+                prompt_logprobs=[
+                    None,
+                    {11: SimpleNamespace(logprob=-0.1)},
+                    {20: SimpleNamespace(logprob=-0.2), 99: SimpleNamespace(logprob=-0.3)},
+                    {21: SimpleNamespace(logprob=-0.4)},
+                ],
+            )
+        ]
+
+        assert extract_actual_prompt_logprobs(all_outputs, [2]) == [[-0.2, -0.4]]
+
+    def test_extract_actual_prompt_logprobs_rejects_missing_observed_token(self):
+        all_outputs = [
+            SimpleNamespace(
+                prompt_token_ids=[10, 20],
+                prompt_logprobs=[None, {99: SimpleNamespace(logprob=-0.3)}],
+            )
+        ]
+
+        with pytest.raises(RuntimeError, match="observed completion token"):
+            extract_actual_prompt_logprobs(all_outputs, [1])
 
 
 @pytest.mark.slow

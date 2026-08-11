@@ -5,6 +5,10 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
+Fork status: `candidate`. The published `trl==1.9.2.post1` bytes remain at
+commit `a82ecebc0fa081efd58302a34a553445fc73271d`; the raw policy-parity repair
+described below is local qualification input and is not published yet.
+
 ## Upstream base
 
 - Upstream repository: `https://github.com/huggingface/trl`
@@ -12,7 +16,7 @@ Posttrain framework.
 - CarbonTeq repository: `https://github.com/carbonteq-ai/trl`
 - Development branch: `codex/trl-1.9-carbonteq`
 - Intended package release: `trl==1.9.2.post1`
-- Release implementation commit: `6efe0b7921cc796cc6a71ee992ec699cc65cdffb`
+- Published release commit: `a82ecebc0fa081efd58302a34a553445fc73271d`
 
 The Posttrain dependency declaration and lockfile are the executable consumer
 authority. Do not update them or describe a candidate capability as published
@@ -33,6 +37,10 @@ The fork keeps the following behavior on top of upstream 1.9.2:
   including compatible sleep/wake behavior for colocated vLLM;
 - a mandatory first-rollout actor/sampler log-probability parity gate, with a
   globally token-weighted tolerance;
+- separate raw actor/sampler parity and processed behavior-policy evidence:
+  vLLM teacher-forces a bounded prompt/completion probe for the synchronization
+  gate, while sampled post-processor log probabilities remain available to
+  token-level TIS;
 - bounded DAPO dynamic sampling, configurable reward scaling, correct exclusion
   of truncated completions from group statistics, and advantage diagnostics;
 - bounded active sampling that requests only the synchronized number of missing
@@ -77,6 +85,15 @@ and standard deviation when configured. Scalar verifier components remain a
 single reward before DAPO normalization; component metrics are diagnostic, not
 independent objectives.
 
+The actor/sampler gate compares like with like. Sampling temperature, top-p,
+top-k, repetition, and presence processors intentionally alter behavior-policy
+log probabilities, so those values are not compared directly with raw actor
+logits. `VLLMGeneration.score_completion_logprobs` teacher-forces a
+deterministic, token-bounded probe through vLLM prompt-logprob collection;
+`GRPOTrainer` recomputes the same raw actor values at temperature 1. The
+existing processed delta remains the TIS input and diagnostic. Truncated or
+masked rows are excluded from the parity probe.
+
 ## Compatibility constraints
 
 - Package baseline: Python 3.10+, Transformers as declared by upstream 1.9.2,
@@ -106,6 +123,23 @@ advantages, and projection:
 
     uv run pytest -q tests/test_grpo_trainer.py \
       -k 'policy_parity or importance_sampling or truncated or advantage or logits_chunking'
+
+The raw-parity candidate specifically changes
+`trl/generation/vllm_generation.py`, `trl/trainer/grpo_config.py`, and
+`trl/trainer/grpo_trainer.py`; its regression coverage is in
+`tests/test_vllm_generation.py`, `tests/test_vllm_client_server.py`, and
+`tests/test_grpo_trainer.py`. Run:
+
+    uv run pytest -q \
+      tests/test_grpo_trainer.py \
+      tests/test_vllm_generation.py \
+      tests/test_vllm_client_server.py \
+      -k 'policy_parity or extract_actual_prompt_logprobs or score_completion_logprobs'
+
+Before publication, the exact candidate wheel must also pass a real colocated
+LoRA canary that records finite raw parity below the configured tolerance,
+independent processed TIS evidence, one optimizer update, and adapter-only
+artifacts.
 
 Then run Ruff, the complete TRL test suite, and the Posttrain adapter contract
 tests. A package release additionally requires a clean install from the exact

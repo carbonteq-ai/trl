@@ -84,6 +84,10 @@ def test_active_sampling_refills_only_missing_rows():
     assert batch["completion_ids"].shape == (4, 2)
     assert trainer._metrics["train"]["active_sampling/generation_rounds"] == [2]
     assert trainer._metrics["train"]["active_sampling/generated_rows"] == [6]
+    assert trainer._metrics["train"]["active_sampling/candidate_groups_reserved"] == [8]
+    assert trainer._metrics["train"]["active_sampling/candidate_groups_generated"] == [6]
+    assert trainer._metrics["train"]["active_sampling/candidate_groups_retained"] == [4]
+    assert trainer._metrics["train"]["active_sampling/candidate_groups_unused"] == [2]
 
 
 def test_dynamic_sampling_retains_valid_groups_and_refills_only_missing_rows():

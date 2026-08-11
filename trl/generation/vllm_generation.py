@@ -247,6 +247,39 @@ def extract_logprobs(all_outputs: list["RequestOutput"]):
     return all_logprobs, all_token_ids
 
 
+def extract_actual_prompt_logprobs(all_outputs: list["RequestOutput"], prompt_lengths: list[int]) -> list[list[float]]:
+    """Extract raw log-probabilities for the observed completion tokens in teacher-forced requests.
+
+    vLLM does not apply sampling processors to ``prompt_logprobs``. This makes a full
+    prompt+completion request suitable for comparing model weights even when generation used
+    temperature, top-k/top-p, or repetition/presence penalties.
+    """
+    if len(all_outputs) != len(prompt_lengths):
+        raise ValueError("vLLM prompt-logprob outputs must align with prompt lengths")
+
+    rows: list[list[float]] = []
+    for output, prompt_length in zip(all_outputs, prompt_lengths, strict=True):
+        prompt_logprobs = output.prompt_logprobs
+        prompt_token_ids = output.prompt_token_ids
+        if prompt_logprobs is None:
+            raise RuntimeError("vLLM did not return prompt log-probabilities for the parity probe")
+        if len(prompt_logprobs) != len(prompt_token_ids):
+            raise RuntimeError("vLLM prompt tokens and prompt log-probabilities are misaligned")
+
+        row: list[float] = []
+        for position in range(prompt_length, len(prompt_token_ids)):
+            token_logprobs = prompt_logprobs[position]
+            token_id = prompt_token_ids[position]
+            if token_logprobs is None or token_id not in token_logprobs:
+                raise RuntimeError("vLLM prompt log-probabilities did not include the observed completion token")
+            value = float(token_logprobs[token_id].logprob)
+            if not math.isfinite(value):
+                raise RuntimeError("vLLM returned a non-finite prompt log-probability")
+            row.append(value)
+        rows.append(row)
+    return rows
+
+
 if TYPE_CHECKING:
     from accelerate import Accelerator
     from peft import PeftModel
@@ -1033,3 +1066,84 @@ class VLLMGeneration:
             self._sleep_colocated_engine()
 
         return prompt_ids, completion_ids, logprobs, logprob_token_ids
+
+    def score_completion_logprobs(
+        self,
+        prompt_ids: list[list[int]],
+        completion_ids: list[list[int]],
+        profiler: ProfilingContext | None = None,
+    ) -> list[list[float]]:
+        """Teacher-force completions through vLLM and return raw observed-token log-probabilities.
+
+        Generation log-probabilities intentionally reflect the behavior policy after sampling
+        processors and remain the authority for importance sampling. This separate, bounded probe
+        is for actor/sampler *weight parity* only.
+        """
+        if len(prompt_ids) != len(completion_ids):
+            raise ValueError("parity prompt and completion batches must have the same length")
+
+        profiler = profiler or nullcontext()
+        accelerator = self.accelerator
+        local_sequences = [prompt + completion for prompt, completion in zip(prompt_ids, completion_ids, strict=True)]
+        local_prompt_lengths = [len(prompt) for prompt in prompt_ids]
+
+        self._wake_weights_for_generation()
+        if self.mode == "server":
+            all_sequences = gather_object(local_sequences)
+            all_prompt_lengths = gather_object(local_prompt_lengths)
+            process_counts = gather_object([len(local_sequences)])
+            if accelerator.is_main_process:
+                with profiler:
+                    response = self.vllm_client.get_sequence_logprobs(
+                        all_sequences,
+                        all_prompt_lengths,
+                        top_logprobs=1,
+                        temperature=1.0,
+                        use_binary=True,
+                    )
+                payload = [[token[0] for token in row] for row in response["actual_logprobs"]]
+            else:
+                payload = None
+            obj_list = [payload]
+            broadcast_object_list(obj_list, from_process=0)
+            all_logprobs = obj_list[0]
+            process_start = sum(process_counts[: accelerator.process_index])
+            process_slice = slice(process_start, process_start + len(local_sequences))
+            return all_logprobs[process_slice]
+
+        if self.mode != "colocate":
+            raise ValueError(f"vllm_mode must be either 'server' or 'colocate', got {self.mode!r}")
+
+        if self.tensor_parallel_size > 1:
+            local_size = len(local_sequences)
+            gathered_sequences: list[list[list[int]]] = [[] for _ in range(self.tensor_parallel_size)]
+            gathered_prompt_lengths: list[list[int]] = [[] for _ in range(self.tensor_parallel_size)]
+            gathered_counts: list[int] = [0 for _ in range(self.tensor_parallel_size)]
+            torch.distributed.all_gather_object(gathered_sequences, local_sequences, group=self.tp_group)
+            torch.distributed.all_gather_object(gathered_prompt_lengths, local_prompt_lengths, group=self.tp_group)
+            torch.distributed.all_gather_object(gathered_counts, local_size, group=self.tp_group)
+            all_sequences = [row for batch in gathered_sequences for row in batch]
+            all_prompt_lengths = [length for batch in gathered_prompt_lengths for length in batch]
+        else:
+            all_sequences = local_sequences
+            all_prompt_lengths = local_prompt_lengths
+
+        sampling_params = SamplingParams(
+            max_tokens=1,
+            temperature=1.0,
+            prompt_logprobs=1,
+            detokenize=False,
+        )
+        if self.enable_sleep_mode:
+            self.llm.wake_up(tags=["kv_cache"])
+        prompts = [{"prompt_token_ids": sequence} for sequence in all_sequences]
+        with profiler:
+            all_outputs = self._generate_colocated_waves(prompts, sampling_params)
+        all_logprobs = extract_actual_prompt_logprobs(all_outputs, all_prompt_lengths)
+        self._sleep_colocated_engine()
+
+        if self.tensor_parallel_size > 1:
+            local_rank = torch.distributed.get_rank(group=self.tp_group)
+            local_start = sum(gathered_counts[:local_rank])
+            return all_logprobs[local_start : local_start + local_size]
+        return all_logprobs

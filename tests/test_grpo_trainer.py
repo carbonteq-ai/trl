@@ -130,6 +130,33 @@ def test_vllm_policy_parity_gate_rejects_empty_evidence():
         trainer._enforce_vllm_policy_parity("train", 0.0, 0)
 
 
+def test_vllm_policy_parity_probe_is_token_bounded_and_skips_masked_rows():
+    prompts, completions, masks, rows = GRPOTrainer._build_vllm_policy_parity_probe(
+        prompt_ids=[[1], [2], [3]],
+        completion_ids=[[10, 11, 12], [20, 21], [30, 31, 32]],
+        loss_mask=torch.tensor(
+            [
+                [0, 0, 0],
+                [1, 0, 0],
+                [1, 0, 1],
+            ],
+            dtype=torch.bool,
+        ),
+        max_tokens=2,
+    )
+
+    assert prompts == [[2], [3]]
+    assert completions == [[20], [30]]
+    assert [mask.tolist() for mask in masks] == [[True], [True]]
+    assert rows == [1, 2]
+
+
+@pytest.mark.parametrize("value", [0, -1, True])
+def test_vllm_policy_parity_token_budget_requires_positive_value(tmp_path, value):
+    with pytest.raises(ValueError, match="max_tokens must be a positive integer"):
+        GRPOConfig(output_dir=tmp_path, vllm_policy_parity_max_tokens=value)
+
+
 @pytest.mark.parametrize("value", [0.0, -0.1, float("inf"), float("nan")])
 def test_vllm_policy_parity_limit_requires_positive_finite_value(tmp_path, value):
     with pytest.raises(ValueError, match="finite positive"):
