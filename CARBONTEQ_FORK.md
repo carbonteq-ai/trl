@@ -5,24 +5,25 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
-Fork status: `candidate`. The published `trl==1.9.2.post2` bytes are tagged at
-commit `216023d99324fae89dd58629130ba3bb043582ed`. The complete IW-OPD sampling
-contract repair is carried by this candidate branch and will be released only
-as the distinct internal build `trl==1.9.2.post4`.
+Fork status: `published`. `trl==1.9.2.post4` is the current published CarbonTeq
+build, tagged at commit `61064605db84f84898692c2b3eefe1eb2b90a952` as
+`carbonteq-v1.9.2.post4`. Its exact wheel SHA-256 is
+`fe604767723e1494d32f85dc2858f900d9d7c98d4fc0663658af5fd03e0d3fa3` and its
+source-distribution SHA-256 is
+`f4a35830b5271800915a158e1e963c8c536e84f140222b0999561e10083db579`.
 
 ## Upstream base
 
 - Upstream repository: `https://github.com/huggingface/trl`
 - Upstream base: `33f9e462728b98f7f91d38b99328e81adde2faa0` (`v1.9.2`)
 - CarbonTeq repository: `https://github.com/carbonteq-ai/trl`
-- Development branch: `codex/trl-1.9-carbonteq`
-- Intended package release: `trl==1.9.2.post4`
-- Published release commit: `216023d99324fae89dd58629130ba3bb043582ed`
+- Release branch: `v1.9.2.post4-release`
+- Published package release: `trl==1.9.2.post4`
+- Published release commit: `61064605db84f84898692c2b3eefe1eb2b90a952`
 
 The Posttrain dependency declaration and lockfile are the executable consumer
-authority. Do not update them or describe a candidate capability as published
-until the fork commit, immutable release tag, package hash, and clean-install
-verification exist.
+authority. A candidate capability is not published until its fork commit,
+immutable release tag, package hashes, and clean-install verification exist.
 
 ## Maintained delta
 
@@ -151,8 +152,11 @@ independent processed TIS evidence, one optimizer update, and adapter-only
 artifacts.
 
 Then run Ruff, the complete TRL test suite, and the Posttrain adapter contract
-tests. A package release additionally requires a clean install from the exact
-built artifact and GPU canaries for the selected DAPO and IW-OPD profiles.
+tests. Publication is manual from Posttrain's repository-scoped retained-asset
+workflow: it downloads the immutable GitHub Release assets, verifies their
+supplied SHA-256 values, uploads the exact bytes to the internal stable index,
+and retains a clean-install receipt. Forks do not receive release runners or
+execute fork-controlled publication workflows.
 
 ## Rebase procedure
 
@@ -176,7 +180,8 @@ Before updating Posttrain:
 2. build `trl==1.9.2.post4` from the immutable release commit;
 3. record wheel and source hashes;
 4. create and verify the immutable CarbonTeq tag and release;
-5. upload the exact artifacts to the internal stable index;
+5. use Posttrain's manual retained-asset workflow to upload the exact artifacts
+   to the internal stable index;
 6. verify a clean install imports the expected version and IW-OPD API;
 7. update the Posttrain dependency, lockfile, fork consumer page, and release
    receipt;
