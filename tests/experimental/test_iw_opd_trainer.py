@@ -162,6 +162,36 @@ def test_external_rollout_preserves_sparse_multiturn_tokens_and_iw_opd_logprobs(
     assert completion_lengths == [3]
 
 
+def test_external_rollout_preserves_constrained_grammar_prefix_metadata():
+    constrained = {
+        "teacher_prompt_ids": [[101, 102, 105, 4368, 107]],
+        "teacher_completion_ids": [[20, 21]],
+        "teacher_completion_offsets": [0],
+        "structured_output_schemas": [{"type": "object"}],
+        "schema_digests": ["schema-1"],
+        "constrained_request_ids": ["selected-1"],
+        "allowed_set_digests": [["allowed-0", "allowed-1"]],
+        "grammar_prefix_ids": [[105, 4368, 107]],
+    }
+
+    def rollout_func(*args, **kwargs):
+        del args, kwargs
+        return {
+            "prompt_ids": [[10, 11]],
+            "prompt_lengths": [2],
+            "completion_ids": [[20, 21]],
+            "completion_loss_mask": [[True, True]],
+            "logprobs": [[-0.1, -0.2]],
+            **constrained,
+        }
+
+    trainer = _external_rollout_trainer(rollout_func)
+    IWOPDTrainer._generate_with_rollout_func(trainer, [_external_rollout_slice()], [0])
+
+    for key, value in constrained.items():
+        assert trainer._buffered_inputs[0][key] == value
+
+
 @pytest.mark.parametrize(
     ("update", "message"),
     [

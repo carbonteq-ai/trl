@@ -992,6 +992,7 @@ class IWOPDTrainer(_BaseTrainer):
             "schema_digests",
             "constrained_request_ids",
             "allowed_set_digests",
+            "grammar_prefix_ids",
         )
         present_constrained_fields = [key for key in constrained_fields if output.get(key) is not None]
         if present_constrained_fields and len(present_constrained_fields) != len(constrained_fields):
