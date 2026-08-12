@@ -8,7 +8,7 @@ Posttrain framework.
 Fork status: `candidate`. The published `trl==1.9.2.post2` bytes are tagged at
 commit `216023d99324fae89dd58629130ba3bb043582ed`. The complete IW-OPD sampling
 contract repair is carried by this candidate branch and will be released only
-as the distinct internal build `trl==1.9.2.post3`.
+as the distinct internal build `trl==1.9.2.post4`.
 
 ## Upstream base
 
@@ -16,7 +16,7 @@ as the distinct internal build `trl==1.9.2.post3`.
 - Upstream base: `33f9e462728b98f7f91d38b99328e81adde2faa0` (`v1.9.2`)
 - CarbonTeq repository: `https://github.com/carbonteq-ai/trl`
 - Development branch: `codex/trl-1.9-carbonteq`
-- Intended package release: `trl==1.9.2.post3`
+- Intended package release: `trl==1.9.2.post4`
 - Published release commit: `216023d99324fae89dd58629130ba3bb043582ed`
 
 The Posttrain dependency declaration and lockfile are the executable consumer
@@ -173,7 +173,7 @@ built artifact and GPU canaries for the selected DAPO and IW-OPD profiles.
 Before updating Posttrain:
 
 1. finish the clean fork commit and push it;
-2. build `trl==1.9.2.post3` from the immutable release commit;
+2. build `trl==1.9.2.post4` from the immutable release commit;
 3. record wheel and source hashes;
 4. create and verify the immutable CarbonTeq tag and release;
 5. upload the exact artifacts to the internal stable index;
