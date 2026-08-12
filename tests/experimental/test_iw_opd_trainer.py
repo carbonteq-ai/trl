@@ -1028,6 +1028,29 @@ class TestIWOPDTrainer(TrlTestCase):
                 rollout_logprobs=torch.tensor([[float("-inf"), -0.3]]),
             )
 
+    def test_iw_opd_rejects_loss_overflow_with_input_ranges(self):
+        trainer = IWOPDTrainer.__new__(IWOPDTrainer)
+        trainer.temperature = 1.0
+        trainer.iw_opd_gamma = 0.0
+        trainer.iw_opd_epsilon = 1e-8
+        trainer._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        trainer.model = SimpleNamespace(training=True)
+
+        # The gathered student logprob is finite, but multiplying it by a
+        # finite advantage overflows float32. This must be diagnosed at the
+        # token-loss boundary instead of surfacing as an aggregate trainer log.
+        student_logits = torch.tensor([[[0.0, -3e38]]])
+        completion_tokens = torch.tensor([[1]])
+        labels = torch.tensor([[1]])
+        with pytest.raises(FloatingPointError, match="token loss is non-finite.*student_logprobs=.*advantages="):
+            trainer._compute_iw_opd_loss(
+                student_logits=student_logits,
+                completion_tokens=completion_tokens,
+                labels=labels,
+                teacher_actual_logprobs=torch.tensor([[1.0]]),
+                rollout_logprobs=torch.tensor([[-1.0]]),
+            )
+
         # Buffer layout: with mixed prompt lengths, prompt_length (shortest real prompt) is smaller than the
         # padded prompt width, so rollout logprobs must be stored at full sequence width to survive the
         # labels-style slice in compute_loss.

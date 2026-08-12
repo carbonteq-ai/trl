@@ -1521,6 +1521,22 @@ class IWOPDTrainer(_BaseTrainer):
 
         loss = -student_actual_logprobs * advantages
         loss = torch.where(valid_mask, loss, torch.zeros_like(loss))
+        nonfinite_loss = valid_mask & ~torch.isfinite(loss)
+        if nonfinite_loss.any():
+            def _range(values: torch.Tensor) -> str:
+                required = values[valid_mask]
+                return f"[{required.min().item():.6g}, {required.max().item():.6g}]"
+
+            nonfinite_count = int(nonfinite_loss.sum().item())
+            total_required = int(valid_mask.sum().item())
+            raise FloatingPointError(
+                "IW-OPD token loss is non-finite after finite inputs: "
+                f"{nonfinite_count}/{total_required}; "
+                f"student_logprobs={_range(student_actual_logprobs)}, "
+                f"teacher_logprobs={_range(safe_teacher_logprobs)}, "
+                f"rollout_logprobs={_range(safe_rollout_logprobs)}, "
+                f"advantages={_range(advantages)}, weights={_range(weights)}."
+            )
 
         with torch.no_grad():
             mode = "train" if self.model.training else "eval"

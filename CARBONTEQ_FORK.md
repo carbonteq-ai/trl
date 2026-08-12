@@ -5,23 +5,23 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
-Fork status: `candidate`. `trl==1.9.2.post4` is the current published CarbonTeq
-build, tagged at commit `61064605db84f84898692c2b3eefe1eb2b90a952` as
-`carbonteq-v1.9.2.post4`. Its exact wheel SHA-256 is
-`fe604767723e1494d32f85dc2858f900d9d7c98d4fc0663658af5fd03e0d3fa3` and its
+Fork status: `candidate`. `trl==1.9.2.post8` is the current published CarbonTeq
+build, tagged at commit `9a219ce5a593d85fe6058025de211ce42267e6b6` as
+`carbonteq-v1.9.2.post8`. Its exact wheel SHA-256 is
+`9933755547f3d09e5abef195607e5d8b682d277a4fc1febce6bd2cd053140ca5` and its
 source-distribution SHA-256 is
-`f4a35830b5271800915a158e1e963c8c536e84f140222b0999561e10083db579`.
+`c6e167ffafae776e5c9514e9a8777058c0c05835afe568caf4e063df962bb06c`.
 
 ## Upstream base
 
 - Upstream repository: `https://github.com/huggingface/trl`
 - Upstream base: `33f9e462728b98f7f91d38b99328e81adde2faa0` (`v1.9.2`)
 - CarbonTeq repository: `https://github.com/carbonteq-ai/trl`
-- Release branch: `v1.9.2.post5-release` (publishing `1.9.2.post8`; the
+- Release branch: `v1.9.2.post5-release` (publishing `1.9.2.post9`; the
   already-reserved `carbonteq-v1.9.2.post5` through `post7` tags name
   unrelated commits)
-- Published package release: `trl==1.9.2.post4`
-- Published release commit: `61064605db84f84898692c2b3eefe1eb2b90a952`
+- Published package release: `trl==1.9.2.post8`
+- Published release commit: `9a219ce5a593d85fe6058025de211ce42267e6b6`
 
 The Posttrain dependency declaration and lockfile are the executable consumer
 authority. A candidate capability is not published until its fork commit,
@@ -65,6 +65,9 @@ The fork keeps the following behavior on top of upstream 1.9.2:
   so an invalid rollout or actor state fails at the owning numerical boundary
   with the affected-token count rather than surfacing later as an opaque
   aggregate non-finite loss;
+- IW-OPD validates the token loss after combining those finite inputs and
+  reports the student, teacher, behavior-policy, advantage, and weight ranges
+  when float32 reduction overflows;
 - memory-bounded log-probability projection for GRPO policy/reference scoring;
 - compatibility with the Posttrain runtime's `datasets>=4.6.1,<4.7` constraint.
 
