@@ -10,9 +10,9 @@ Posttrain framework.
 - Upstream repository: `https://github.com/huggingface/trl`
 - Upstream base: `33f9e462728b98f7f91d38b99328e81adde2faa0` (`v1.9.2`)
 - CarbonTeq repository: `https://github.com/carbonteq-ai/trl`
-- Development branch: `codex/trl-1.9-carbonteq`
-- Intended package release: `trl==1.9.2.post1`
-- Release implementation commit: `6efe0b7921cc796cc6a71ee992ec699cc65cdffb`
+- Development branch: `feat/iwopd-native-template-constrained-logprobs`
+- Intended package release: `trl==1.9.2.post2`
+- Release implementation commit: `2371bca979a0d067c88c7a46ad76449ea458fc00`
 
 The Posttrain dependency declaration and lockfile are the executable consumer
 authority. Do not update them or describe a candidate capability as published
@@ -42,6 +42,9 @@ The fork keeps the following behavior on top of upstream 1.9.2:
   moving environment ownership into TRL;
 - exact-token external rollout hooks and source-row preservation for
   `IWOPDTrainer`;
+- model-native teacher prompt rendering with exact student completion replay,
+  plus XGrammar-constrained student, teacher, and current-policy token
+  probabilities with per-position alignment evidence;
 - IW-OPD support for sparse environment masks, cached rollout log-probabilities,
   LoRA-only vLLM synchronization, speculative configuration, and engine kwargs;
 - memory-bounded log-probability projection for GRPO policy/reference scoring;
@@ -96,6 +99,7 @@ independent objectives.
 Run the focused maintained-delta suite from this repository:
 
     uv run pytest -q \
+      tests/test_constrained_replay.py \
       tests/test_vllm_generation.py \
       tests/test_dapo_dynamic_sampling.py \
       tests/test_sampo_precomputed_advantages.py \
@@ -130,7 +134,7 @@ built artifact and GPU canaries for the selected DAPO and IW-OPD profiles.
 Before updating Posttrain:
 
 1. finish the clean fork commit and push it;
-2. build `trl==1.9.2.post1` from the immutable release commit;
+2. build `trl==1.9.2.post2` from the immutable release commit;
 3. record wheel and source hashes;
 4. create and verify the immutable CarbonTeq tag and release;
 5. upload the exact artifacts to the internal stable index;
