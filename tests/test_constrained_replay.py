@@ -5,12 +5,23 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm import SamplingParams
-from vllm.v1.sample.logits_processor import AdapterLogitsProcessor
+from vllm.v1.sample.logits_processor import (
+    AdapterLogitsProcessor,
+    _load_logitsprocs_by_fqcns,
+)
 
 from trl.generation.constrained_replay import (
     ConstrainedReplayLogitsProcessor,
     collect_constrained_replay_results,
 )
+
+
+def test_constrained_replay_processor_uses_vllm_fqcn_contract():
+    loaded = _load_logitsprocs_by_fqcns(
+        ["trl.generation.constrained_replay:ConstrainedReplayLogitsProcessor"]
+    )
+
+    assert loaded == [ConstrainedReplayLogitsProcessor]
 
 
 class _Matcher:

@@ -366,7 +366,7 @@ def llm_worker(
         # Important so temperature scaling/logit tweaking affects the TIS log probs
         logprobs_mode="processed_logprobs",
         speculative_config=json.loads(script_args.speculative_config) if script_args.speculative_config else None,
-        logits_processors=["trl.generation.constrained_replay.ConstrainedReplayLogitsProcessor"],
+        logits_processors=["trl.generation.constrained_replay:ConstrainedReplayLogitsProcessor"],
     )
 
     # Send ready signal to parent process
