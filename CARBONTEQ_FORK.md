@@ -17,7 +17,7 @@ source-distribution SHA-256 is
 - Upstream repository: `https://github.com/huggingface/trl`
 - Upstream base: `33f9e462728b98f7f91d38b99328e81adde2faa0` (`v1.9.2`)
 - CarbonTeq repository: `https://github.com/carbonteq-ai/trl`
-- Release branch: `v1.9.2.post5-release` (publishing `1.9.2.post9`; the
+- Release branch: `v1.9.2.post5-release` (publishing `1.9.2.post10`; the
   already-reserved `carbonteq-v1.9.2.post5` through `post7` tags name
   unrelated commits)
 - Published package release: `trl==1.9.2.post8`
@@ -163,10 +163,13 @@ artifacts.
 
 Then run Ruff, the complete TRL test suite, and the Posttrain adapter contract
 tests. Publication is manual from Posttrain's repository-scoped retained-asset
-workflow: it downloads the immutable GitHub Release assets, verifies their
-supplied SHA-256 values, uploads the exact bytes to the internal stable index,
-and retains a clean-install receipt. Forks do not receive release runners or
-execute fork-controlled publication workflows.
+candidate workflow: it downloads the immutable GitHub Release assets, verifies
+their supplied SHA-256 values, uploads the exact bytes only to
+`carbonteq/dev`, proves development-channel readback, and retains a clean
+install receipt. After Posttrain candidate qualification, its separate
+repository-owned promotion workflow re-verifies those same bytes and transfers
+them server-side to `carbonteq/stable`. Forks do not receive release runners
+or execute fork-controlled publication workflows.
 
 ## Rebase procedure
 
@@ -190,10 +193,13 @@ Before updating Posttrain:
 2. build the candidate TRL version from the immutable release commit;
 3. record wheel and source hashes;
 4. create and verify the immutable CarbonTeq tag and release;
-5. use Posttrain's manual retained-asset workflow to upload the exact artifacts
-   to the internal stable index;
-6. verify a clean install imports the expected version and IW-OPD API;
-7. update the Posttrain dependency, lockfile, fork consumer page, and release
-   receipt;
-8. run Posttrain CPU contracts and the selected GPU canaries before promoting a
-   Posttrain release.
+5. use Posttrain's manual retained-asset candidate workflow to upload the
+   exact artifacts only to `carbonteq/dev` and prove their readback;
+6. verify a clean development-index install imports the expected version and
+   IW-OPD API;
+7. materialize the Posttrain candidate lock and run its CPU contracts and
+   selected GPU canaries;
+8. use Posttrain's separate promotion workflow to move the unchanged,
+   hash-verified artifacts to `carbonteq/stable`;
+9. update the Posttrain stable dependency, lockfile, fork consumer page, and
+   release receipt.
