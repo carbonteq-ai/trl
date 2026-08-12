@@ -21,6 +21,17 @@ _RESULTS: dict[str, _ReplayState] = {}
 _RESULTS_LOCK = Lock()
 
 
+def _decode_allowed_tokens(bitmask: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    """Return a CPU boolean vector for bool or XGrammar compressed masks."""
+    row = bitmask[0].cpu()
+    if row.dtype == torch.bool:
+        return row[:vocab_size].clone()
+    bit_weights = 1 << torch.arange(32, dtype=torch.int64)
+    return (
+        (row.to(torch.int64).unsqueeze(1) & bit_weights.unsqueeze(0)) != 0
+    ).reshape(-1)[:vocab_size]
+
+
 def _position_digest(schema_digest: str, completion_ids: list[int], position: int) -> str:
     payload = {
         "completion_prefix": completion_ids[:position],
@@ -36,12 +47,12 @@ class _ReplayState:
     request_id: str
     completion_ids: list[int]
     schema_digest: str
-    matcher: Any
-    bitmask: torch.Tensor
+    allowed_token_ids: list[torch.Tensor | None]
+    allowed_bitmasks: list[torch.Tensor | None]
+    precomputed_allowed_counts: list[int]
     logprobs: list[torch.Tensor] = field(default_factory=list)
     allowed_counts: list[torch.Tensor] = field(default_factory=list)
     allowed_set_digests: list[str] = field(default_factory=list)
-    accepted: int = 0
 
 
 class ConstrainedReplayLogitsProcessor(AdapterLogitsProcessor):
@@ -93,8 +104,39 @@ class ConstrainedReplayLogitsProcessor(AdapterLogitsProcessor):
             raise ValueError("constrained replay schema digest mismatch")
         context = self._compiler.compile_json_schema(schema_text, any_whitespace=False)
         matcher = self._xgr.GrammarMatcher(context)
-        bitmask = self._xgr.allocate_token_bitmask(1, self._vocab_size).to(self._device)
-        state = _ReplayState(request_id, completion_ids, observed_digest, matcher, bitmask)
+        bitmask = self._xgr.allocate_token_bitmask(1, self._vocab_size)
+        allowed_token_ids: list[torch.Tensor | None] = []
+        allowed_bitmasks: list[torch.Tensor | None] = []
+        allowed_counts: list[int] = []
+        # Walk the known completion once on CPU. Doing grammar state transitions
+        # inside vLLM's per-request GPU callback serializes Python/XGrammar work
+        # across the resident wave and makes long exact-token replay unusably slow.
+        for position, selected in enumerate(completion_ids):
+            bitmask.fill_(0)
+            matcher.fill_next_token_bitmask(bitmask, 0)
+            allowed = _decode_allowed_tokens(bitmask, self._vocab_size)
+            if not bool(allowed[selected]):
+                raise ValueError(f"selected token {selected} is disallowed at position {position}")
+            count = int(allowed.sum().item())
+            allowed_counts.append(count)
+            if count <= 1024:
+                allowed_token_ids.append(
+                    torch.nonzero(allowed, as_tuple=False).flatten().to(self._device)
+                )
+                allowed_bitmasks.append(None)
+            else:
+                allowed_token_ids.append(None)
+                allowed_bitmasks.append(bitmask.clone().to(self._device))
+            if not matcher.accept_token(selected):
+                raise ValueError(f"selected token {selected} was rejected at position {position}")
+        state = _ReplayState(
+            request_id,
+            completion_ids,
+            observed_digest,
+            allowed_token_ids,
+            allowed_bitmasks,
+            allowed_counts,
+        )
         with _RESULTS_LOCK:
             if request_id in _RESULTS:
                 raise ValueError(f"duplicate constrained replay request id: {request_id}")
@@ -104,24 +146,28 @@ class ConstrainedReplayLogitsProcessor(AdapterLogitsProcessor):
             position = len(output_ids)
             if position >= len(completion_ids):
                 raise ValueError(f"constrained replay exceeded completion for {request_id}")
-            while state.accepted < position:
-                token_id = int(output_ids[state.accepted])
-                expected = completion_ids[state.accepted]
-                if token_id != expected or not matcher.accept_token(token_id):
-                    raise ValueError(
-                        f"constrained replay prefix diverged at {state.accepted}: {token_id} != {expected}"
-                    )
-                state.accepted += 1
-            state.bitmask.fill_(0)
-            matcher.fill_next_token_bitmask(state.bitmask, 0)
-            constrained = logits.float().clone()
-            self._xgr.apply_token_bitmask_inplace(constrained.unsqueeze(0), state.bitmask)
+            if position and int(output_ids[-1]) != completion_ids[position - 1]:
+                raise ValueError(
+                    f"constrained replay prefix diverged at {position - 1}: "
+                    f"{output_ids[-1]} != {completion_ids[position - 1]}"
+                )
             selected = completion_ids[position]
-            selected_logit = constrained[selected]
-            if not torch.isfinite(selected_logit):
-                raise ValueError(f"selected token {selected} is disallowed at position {position}")
-            state.logprobs.append(selected_logit - torch.logsumexp(constrained, dim=-1))
-            state.allowed_counts.append(torch.isfinite(constrained).sum())
+            float_logits = logits.float()
+            allowed_ids = state.allowed_token_ids[position]
+            if allowed_ids is not None:
+                denominator = torch.logsumexp(float_logits.index_select(0, allowed_ids), dim=-1)
+            else:
+                constrained = float_logits.clone()
+                bitmask_at_position = state.allowed_bitmasks[position]
+                assert bitmask_at_position is not None
+                self._xgr.apply_token_bitmask_inplace(
+                    constrained.unsqueeze(0), bitmask_at_position
+                )
+                denominator = torch.logsumexp(constrained, dim=-1)
+            state.logprobs.append(float_logits[selected] - denominator)
+            state.allowed_counts.append(
+                torch.tensor(state.precomputed_allowed_counts[position], device=self._device)
+            )
             state.allowed_set_digests.append(_position_digest(state.schema_digest, completion_ids, position))
             logits.fill_(float("-inf"))
             logits[selected] = 0

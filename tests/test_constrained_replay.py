@@ -12,6 +12,7 @@ from vllm.v1.sample.logits_processor import (
 
 from trl.generation.constrained_replay import (
     ConstrainedReplayLogitsProcessor,
+    _decode_allowed_tokens,
     collect_constrained_replay_results,
 )
 
@@ -25,10 +26,13 @@ def test_constrained_replay_processor_uses_vllm_fqcn_contract():
 
 
 class _Matcher:
+    fill_calls = 0
+
     def __init__(self, _context):
         self.position = 0
 
     def fill_next_token_bitmask(self, bitmask, row):
+        type(self).fill_calls += 1
         bitmask[row].fill_(False)
         allowed = ([1, 2], [3])[self.position]
         bitmask[row, allowed] = True
@@ -62,6 +66,7 @@ class _Compiler:
 
 
 def test_exact_completion_is_scored_before_forcing_and_evidence_is_collected():
+    _Matcher.fill_calls = 0
     processor = ConstrainedReplayLogitsProcessor.__new__(ConstrainedReplayLogitsProcessor)
     AdapterLogitsProcessor.__init__(processor, SimpleNamespace(), torch.device("cpu"), False)
     processor._compiler = _Compiler()
@@ -82,11 +87,14 @@ def test_exact_completion_is_scored_before_forcing_and_evidence_is_collected():
     )
     replay = processor.new_req_logits_processor(params)
     assert replay is not None
+    assert _Matcher.fill_calls == 2
 
     first_logits = torch.tensor([0.0, 1.0, 2.0, 4.0])
     replay([], first_logits)
     assert first_logits.tolist() == [float("-inf"), float("-inf"), 0.0, float("-inf")]
     replay([2], torch.tensor([3.0, 2.0, 1.0, 0.0]))
+    # Grammar traversal is precomputed once; the vLLM GPU callback only scores.
+    assert _Matcher.fill_calls == 2
 
     result = collect_constrained_replay_results(["row-1"])[0]
     assert result["completion_ids"] == [2, 3]
@@ -116,3 +124,12 @@ def test_constrained_replay_rejects_schema_digest_mismatch():
 
     with pytest.raises(ValueError, match="schema digest mismatch"):
         processor.new_req_logits_processor(params)
+
+
+def test_xgrammar_compressed_bitmask_decodes_without_sign_extension():
+    # Bits 0, 31, 32 and 63 exercise both compressed words and signed int32.
+    mask = torch.tensor([[-(2**31) + 1, -(2**31) + 1]], dtype=torch.int32)
+
+    allowed = _decode_allowed_tokens(mask, 64)
+
+    assert torch.nonzero(allowed, as_tuple=False).flatten().tolist() == [0, 31, 32, 63]
