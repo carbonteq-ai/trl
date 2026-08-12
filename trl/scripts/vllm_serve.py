@@ -47,6 +47,12 @@ class WeightSyncWorkerExtension:
     communicator = None  # Communicator for weight updates
     client_rank = None  # Source rank for broadcasting updated weights
 
+    def collect_constrained_replay_results(self, request_ids: list[str]):
+        """Return exact-token constrained scoring evidence from this worker."""
+        from trl.generation.constrained_replay import collect_constrained_replay_results
+
+        return collect_constrained_replay_results(request_ids)
+
     def init_communicator(self, host: str, port: int, world_size: int, client_device_uuid: str) -> None:
         """
         Initializes the weight update communicator using a stateless process group.
@@ -360,6 +366,7 @@ def llm_worker(
         # Important so temperature scaling/logit tweaking affects the TIS log probs
         logprobs_mode="processed_logprobs",
         speculative_config=json.loads(script_args.speculative_config) if script_args.speculative_config else None,
+        logits_processors=["trl.generation.constrained_replay.ConstrainedReplayLogitsProcessor"],
     )
 
     # Send ready signal to parent process
@@ -374,7 +381,22 @@ def llm_worker(
             break
 
         # Handle commands
-        if command["type"] in ["call", "fire_and_forget"]:
+        if command["type"] == "constrained_replay":
+            prompts = command["prompts"]
+            sampling_params = command["sampling_params"]
+            request_ids = command["request_ids"]
+            outputs = llm.generate(prompts=prompts, sampling_params=sampling_params, use_tqdm=False)
+            generated = [list(output.outputs[0].token_ids) for output in outputs]
+            if generated != command["completion_ids"]:
+                raise ValueError("constrained replay generated tokens differ from the requested completion")
+            worker_results = llm.collective_rpc(
+                method="collect_constrained_replay_results",
+                args=(request_ids,),
+            )
+            if len(worker_results) != 1:
+                raise ValueError("constrained replay currently requires tensor_parallel_size=1")
+            connection.send(worker_results[0])
+        elif command["type"] in ["call", "fire_and_forget"]:
             method_name = command["method"]
             args, kwargs = command.get("args", ()), command.get("kwargs", {})
             method = getattr(llm, method_name)
@@ -676,6 +698,88 @@ def main(script_args: ScriptArguments):
         actual_token_ids_b64: str | None = None
         shape: list[int] | None = None  # [batch_size, max_completion_len, top_logprobs]
         completion_lengths: list[int] | None = None  # actual completion length per sample
+
+    class ConstrainedSequenceLogprobsRequest(BaseModel):
+        prompt_ids: list[list[int]]
+        completion_ids: list[list[int]]
+        json_schemas: list[dict]
+        schema_digests: list[str]
+        request_ids: list[str]
+        temperature: float = 1.0
+
+    class ConstrainedSequenceLogprobsResponse(BaseModel):
+        results: list[dict]
+
+    @app.post("/get_constrained_sequence_logprobs/", response_model=ConstrainedSequenceLogprobsResponse)
+    async def get_constrained_sequence_logprobs(request: ConstrainedSequenceLogprobsRequest):
+        """Score exact completion IDs under the teacher's XGrammar-constrained distribution."""
+        count = len(request.prompt_ids)
+        if request.temperature <= 0:
+            raise ValueError("temperature must be positive")
+        if script_args.tensor_parallel_size != 1:
+            raise ValueError("constrained sequence scoring currently requires tensor_parallel_size=1")
+        if not all(
+            len(values) == count
+            for values in (
+                request.completion_ids,
+                request.json_schemas,
+                request.schema_digests,
+                request.request_ids,
+            )
+        ):
+            raise ValueError("all constrained replay request fields must have the same batch length")
+        if len(set(request.request_ids)) != count:
+            raise ValueError("constrained replay request_ids must be unique")
+        if any(not ids for ids in request.completion_ids):
+            raise ValueError("constrained replay completions must be non-empty")
+
+        prompts = [{"prompt_token_ids": ids} for ids in request.prompt_ids]
+        params = [
+            SamplingParams(
+                max_tokens=len(completion_ids),
+                min_tokens=len(completion_ids),
+                temperature=request.temperature,
+                ignore_eos=True,
+                detokenize=False,
+                extra_args={
+                    "constrained_replay": {
+                        "request_id": request_id,
+                        "completion_ids": completion_ids,
+                        "json_schema": schema,
+                        "schema_digest": schema_digest,
+                    }
+                },
+            )
+            for request_id, completion_ids, schema, schema_digest in zip(
+                request.request_ids,
+                request.completion_ids,
+                request.json_schemas,
+                request.schema_digests,
+                strict=True,
+            )
+        ]
+        # The OPD teacher is TP1. Split rows across data-parallel workers while
+        # preserving request order.
+        index_chunks = chunk_list(list(range(count)), script_args.data_parallel_size)
+        for connection, indices in zip(connections, index_chunks, strict=True):
+            if not indices:
+                connection.send({"type": "call", "method": "sleep", "args": (1,)})
+                continue
+            connection.send(
+                {
+                    "type": "constrained_replay",
+                    "prompts": [prompts[index] for index in indices],
+                    "sampling_params": [params[index] for index in indices],
+                    "request_ids": [request.request_ids[index] for index in indices],
+                    "completion_ids": [request.completion_ids[index] for index in indices],
+                }
+            )
+        chunk_results = [connection.recv() for connection in connections]
+        results = list(
+            chain.from_iterable(result for result, indices in zip(chunk_results, index_chunks, strict=True) if indices)
+        )
+        by_id = {result["request_id"]: result for result in results}
+        return {"results": [by_id[request_id] for request_id in request.request_ids]}
 
     def _run_prompt_logprobs(prompts, sampling_params):
         """Send prompts to DP workers and collect outputs."""

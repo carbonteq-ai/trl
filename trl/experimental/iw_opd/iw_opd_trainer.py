@@ -984,6 +984,22 @@ class IWOPDTrainer(_BaseTrainer):
             if len(set(rollout_ids)) != len(rollout_ids):
                 raise ValueError("rollout_func rollout_ids must be unique.")
 
+        constrained_fields = (
+            "teacher_prompt_ids",
+            "teacher_completion_ids",
+            "teacher_completion_offsets",
+            "structured_output_schemas",
+            "schema_digests",
+            "constrained_request_ids",
+            "allowed_set_digests",
+        )
+        present_constrained_fields = [key for key in constrained_fields if output.get(key) is not None]
+        if present_constrained_fields and len(present_constrained_fields) != len(constrained_fields):
+            raise ValueError("rollout_func constrained scoring fields must be supplied together.")
+        for key in present_constrained_fields:
+            if len(output[key]) != expected:
+                raise ValueError(f"rollout_func field {key!r} must contain {expected} items, got {len(output[key])}.")
+
         normalized: list[dict[str, Any]] = []
         for idx in range(expected):
             prompt_ids = list(output["prompt_ids"][idx])
@@ -1005,14 +1021,15 @@ class IWOPDTrainer(_BaseTrainer):
                 raise ValueError("rollout_func logprobs must align with completion_ids.")
             if not any(completion_loss_mask):
                 raise ValueError("rollout_func completion_loss_mask must select at least one token.")
-            normalized.append(
-                {
-                    "prompt_ids": prompt_ids,
-                    "completion_ids": completion_ids,
-                    "completion_loss_mask": completion_loss_mask,
-                    "logprobs": logprobs,
-                }
-            )
+            item = {
+                "prompt_ids": prompt_ids,
+                "completion_ids": completion_ids,
+                "completion_loss_mask": completion_loss_mask,
+                "logprobs": logprobs,
+            }
+            for key in present_constrained_fields:
+                item[key] = output[key][idx]
+            normalized.append(item)
 
         device = self.accelerator.device
         pad_id = pad_token_id if pad_token_id is not None else 0
@@ -1071,6 +1088,8 @@ class IWOPDTrainer(_BaseTrainer):
             )
             if rollout_ids is not None:
                 updated["rollout_ids"] = [rollout_ids[index] for index in owned_indices]
+            for key in present_constrained_fields:
+                updated[key] = [item[key] for item in items]
             self._buffered_inputs[slice_idx] = updated
             self._buffered_text_logs[slice_idx] = (prompt_texts, completion_texts)
 
@@ -1632,6 +1651,74 @@ class IWOPDTrainer(_BaseTrainer):
             prompt_attention_mask=inputs.get("prompt_attention_mask"),
             labels=inputs.get("labels"),
         )
+
+        teacher_prompt_ids = inputs.get("teacher_prompt_ids")
+        if teacher_prompt_ids is not None:
+            required = {
+                "structured_output_schemas": inputs.get("structured_output_schemas"),
+                "schema_digests": inputs.get("schema_digests"),
+                "constrained_request_ids": inputs.get("constrained_request_ids"),
+            }
+            if any(value is None for value in required.values()):
+                raise ValueError("constrained teacher scoring metadata is incomplete")
+            completion_ids = inputs.get("teacher_completion_ids")
+            completion_offsets = inputs.get("teacher_completion_offsets")
+            if completion_ids is None or completion_offsets is None:
+                raise ValueError("constrained teacher completion alignment is missing")
+            constrained = self.teacher_client.get_constrained_sequence_logprobs(
+                prompt_ids=teacher_prompt_ids,
+                completion_ids=completion_ids,
+                json_schemas=required["structured_output_schemas"],
+                schema_digests=required["schema_digests"],
+                request_ids=required["constrained_request_ids"],
+                temperature=self.temperature,
+            )["results"]
+            if [row["request_id"] for row in constrained] != required["constrained_request_ids"]:
+                raise ValueError("constrained teacher results are not aligned with request IDs")
+            expected_digests = inputs.get("allowed_set_digests")
+            for row, expected_ids, expected_allowed_digests in zip(
+                constrained, completion_ids, expected_digests, strict=True
+            ):
+                if row["completion_ids"] != expected_ids:
+                    raise ValueError("teacher constrained replay changed completion token IDs")
+                if row["allowed_set_digests"] != expected_allowed_digests:
+                    raise ValueError("teacher and student allowed-token sets are not aligned")
+
+            max_completion_length = max(
+                (
+                    len(sequence) - prompt_length
+                    for sequence, prompt_length in zip(sequences, prompt_lengths, strict=True)
+                ),
+                default=0,
+            )
+            actual = torch.full(
+                (batch_size, max_completion_length),
+                float("-inf"),
+                dtype=torch.float32,
+                device=input_ids.device,
+            )
+            token_ids = torch.zeros(
+                (batch_size, max_completion_length, 1),
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+            for index, (row, offset) in enumerate(zip(constrained, completion_offsets, strict=True)):
+                length = len(row["logprobs"])
+                if not isinstance(offset, int) or offset < 0 or offset + length > max_completion_length:
+                    raise ValueError("constrained teacher completion offset is invalid")
+                actual[index, offset : offset + length] = torch.tensor(
+                    row["logprobs"], dtype=torch.float32, device=input_ids.device
+                )
+                token_ids[index, offset : offset + length, 0] = torch.tensor(
+                    row["completion_ids"], dtype=torch.long, device=input_ids.device
+                )
+            return {
+                "actual_logprobs": actual,
+                "topk_logprobs": actual.unsqueeze(-1),
+                "topk_token_ids": token_ids,
+                "allowed_counts": [row["allowed_counts"] for row in constrained],
+                "allowed_set_digests": [row["allowed_set_digests"] for row in constrained],
+            }
 
         # The pure forward server path can use the requested teacher top-k support.
         # When beta > 0, config validation restricts the server-backed path to top-1.

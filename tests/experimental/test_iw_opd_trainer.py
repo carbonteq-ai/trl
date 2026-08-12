@@ -444,6 +444,45 @@ def test_build_teacher_request_inputs(
 
 
 class TestGetTeacherTokenLogprobsFromServer(TrlTestCase):
+    def test_constrained_teacher_uses_native_prefix_exact_completion_and_alignment_evidence(self):
+        mock_self = MagicMock()
+        mock_self.teacher_client.get_constrained_sequence_logprobs = MagicMock(
+            return_value={
+                "results": [
+                    {
+                        "request_id": "selected-1",
+                        "completion_ids": [20, 21],
+                        "logprobs": [-0.2, -0.3],
+                        "allowed_counts": [7, 3],
+                        "allowed_set_digests": ["allowed-0", "allowed-1"],
+                    }
+                ]
+            }
+        )
+        mock_self.temperature = 1.0
+        inputs = {
+            "input_ids": torch.tensor([[10, 11, 20, 21]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1]]),
+            "prompt_attention_mask": torch.tensor([[1, 1]]),
+            "prompt_length": 2,
+            "labels": torch.tensor([[-100, -100, 20, 21]]),
+            "teacher_prompt_ids": [[101, 102, 103]],
+            "teacher_completion_ids": [[20, 21]],
+            "teacher_completion_offsets": [0],
+            "structured_output_schemas": [{"type": "array"}],
+            "schema_digests": ["schema-1"],
+            "constrained_request_ids": ["selected-1"],
+            "allowed_set_digests": [["allowed-0", "allowed-1"]],
+        }
+
+        out = IWOPDTrainer._get_teacher_token_logprobs_from_server(mock_self, inputs, aligned_prompt_length=2)
+
+        torch.testing.assert_close(out["actual_logprobs"], torch.tensor([[-0.2, -0.3]]))
+        call = mock_self.teacher_client.get_constrained_sequence_logprobs.call_args.kwargs
+        assert call["prompt_ids"] == [[101, 102, 103]]
+        assert call["completion_ids"] == [[20, 21]]
+        assert call["json_schemas"] == [{"type": "array"}]
+
     def test_explicit_prompt_boundary_keeps_sparse_multiturn_positions_aligned(self):
         mock_self = MagicMock()
         mock_self.teacher_client.get_sequence_logprobs = MagicMock(

@@ -644,6 +644,34 @@ class VLLMClient:
                     "logprob_token_ids": json_response["logprob_token_ids"],
                 }
 
+    def get_constrained_sequence_logprobs(
+        self,
+        prompt_ids: list[list[int]],
+        completion_ids: list[list[int]],
+        json_schemas: list[dict],
+        schema_digests: list[str],
+        request_ids: list[str],
+        temperature: float = 1.0,
+    ) -> dict[str, list]:
+        """Score exact completion IDs under an identical XGrammar constraint."""
+        response = self.session.post(
+            f"{self.base_url}/get_constrained_sequence_logprobs/",
+            json={
+                "prompt_ids": prompt_ids,
+                "completion_ids": completion_ids,
+                "json_schemas": json_schemas,
+                "schema_digests": schema_digests,
+                "request_ids": request_ids,
+                "temperature": temperature,
+            },
+        )
+        if response.status_code != 200:
+            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+        results = response.json().get("results")
+        if not isinstance(results, list):
+            raise ValueError("constrained sequence response is missing results")
+        return {"results": results}
+
     @staticmethod
     def _decode_binary_logprobs(response: dict) -> dict[str, list]:
         """Decode base64-encoded numpy arrays back to nested lists.
