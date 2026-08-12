@@ -5,7 +5,7 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
-Fork status: `published`. `trl==1.9.2.post4` is the current published CarbonTeq
+Fork status: `candidate`. `trl==1.9.2.post4` is the current published CarbonTeq
 build, tagged at commit `61064605db84f84898692c2b3eefe1eb2b90a952` as
 `carbonteq-v1.9.2.post4`. Its exact wheel SHA-256 is
 `fe604767723e1494d32f85dc2858f900d9d7c98d4fc0663658af5fd03e0d3fa3` and its
@@ -17,7 +17,7 @@ source-distribution SHA-256 is
 - Upstream repository: `https://github.com/huggingface/trl`
 - Upstream base: `33f9e462728b98f7f91d38b99328e81adde2faa0` (`v1.9.2`)
 - CarbonTeq repository: `https://github.com/carbonteq-ai/trl`
-- Release branch: `v1.9.2.post4-release`
+- Release branch: `v1.9.2.post5-release`
 - Published package release: `trl==1.9.2.post4`
 - Published release commit: `61064605db84f84898692c2b3eefe1eb2b90a952`
 
@@ -58,6 +58,11 @@ The fork keeps the following behavior on top of upstream 1.9.2:
   repetition penalty, and additional transformers/vLLM generation arguments
   such as presence penalty are represented by `IWOPDConfig`, retained by
   `IWOPDTrainer`, and forwarded to both generation engines;
+- IW-OPD validates required student, teacher, and externally supplied
+  behavior-policy log probabilities before constructing an importance weight,
+  so an invalid rollout or actor state fails at the owning numerical boundary
+  with the affected-token count rather than surfacing later as an opaque
+  aggregate non-finite loss;
 - memory-bounded log-probability projection for GRPO policy/reference scoring;
 - compatibility with the Posttrain runtime's `datasets>=4.6.1,<4.7` constraint.
 
@@ -177,7 +182,7 @@ execute fork-controlled publication workflows.
 Before updating Posttrain:
 
 1. finish the clean fork commit and push it;
-2. build `trl==1.9.2.post4` from the immutable release commit;
+2. build the candidate TRL version from the immutable release commit;
 3. record wheel and source hashes;
 4. create and verify the immutable CarbonTeq tag and release;
 5. use Posttrain's manual retained-asset workflow to upload the exact artifacts

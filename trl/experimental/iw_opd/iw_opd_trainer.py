@@ -1481,6 +1481,14 @@ class IWOPDTrainer(_BaseTrainer):
         student_actual_logprobs = student_log_probs.gather(dim=-1, index=completion_tokens.unsqueeze(-1)).squeeze(-1)
 
         valid_mask = labels != -100
+        nonfinite_student = valid_mask & ~torch.isfinite(student_actual_logprobs)
+        if nonfinite_student.any():
+            nonfinite_count = int(nonfinite_student.sum().item())
+            total_required = int(valid_mask.sum().item())
+            raise FloatingPointError(
+                "Student logprobs are non-finite for required IW-OPD positions: "
+                f"{nonfinite_count}/{total_required}."
+            )
         missing_teacher = valid_mask & ~torch.isfinite(teacher_actual_logprobs)
         if missing_teacher.any():
             missing_count = int(missing_teacher.sum().item())
@@ -1492,6 +1500,15 @@ class IWOPDTrainer(_BaseTrainer):
         safe_teacher_logprobs = torch.where(valid_mask, teacher_actual_logprobs, 0.0)
         if rollout_logprobs is None:
             rollout_logprobs = student_actual_logprobs
+        else:
+            nonfinite_rollout = valid_mask & ~torch.isfinite(rollout_logprobs)
+            if nonfinite_rollout.any():
+                nonfinite_count = int(nonfinite_rollout.sum().item())
+                total_required = int(valid_mask.sum().item())
+                raise ValueError(
+                    "Rollout logprobs are non-finite for required IW-OPD positions: "
+                    f"{nonfinite_count}/{total_required}."
+                )
         safe_rollout_logprobs = torch.where(valid_mask, rollout_logprobs, 0.0)
         a_opd = (safe_teacher_logprobs - safe_rollout_logprobs).detach()
         a_opd = torch.where(valid_mask, a_opd, torch.zeros_like(a_opd))

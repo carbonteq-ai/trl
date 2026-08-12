@@ -996,6 +996,38 @@ class TestIWOPDTrainer(TrlTestCase):
         expected = -current_student_logprob * expected_advantage_sum / 2
         torch.testing.assert_close(loss, expected)
 
+    def test_iw_opd_rejects_nonfinite_required_logprobs(self):
+        trainer = IWOPDTrainer.__new__(IWOPDTrainer)
+        trainer.temperature = 1.0
+        trainer.iw_opd_gamma = 0.0
+        trainer.iw_opd_epsilon = 1e-8
+        trainer._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        trainer.model = SimpleNamespace(training=True)
+
+        completion_tokens = torch.tensor([[0, 1]])
+        labels = torch.tensor([[0, 1]])
+        teacher_actual_logprobs = torch.tensor([[-0.2, -0.1]])
+        finite_logits = torch.zeros(1, 2, 4)
+
+        invalid_student_logits = finite_logits.clone()
+        invalid_student_logits[0, 0] = float("-inf")
+        with pytest.raises(FloatingPointError, match="Student logprobs.*1/2"):
+            trainer._compute_iw_opd_loss(
+                student_logits=invalid_student_logits,
+                completion_tokens=completion_tokens,
+                labels=labels,
+                teacher_actual_logprobs=teacher_actual_logprobs,
+            )
+
+        with pytest.raises(ValueError, match="Rollout logprobs.*1/2"):
+            trainer._compute_iw_opd_loss(
+                student_logits=finite_logits,
+                completion_tokens=completion_tokens,
+                labels=labels,
+                teacher_actual_logprobs=teacher_actual_logprobs,
+                rollout_logprobs=torch.tensor([[float("-inf"), -0.3]]),
+            )
+
         # Buffer layout: with mixed prompt lengths, prompt_length (shortest real prompt) is smaller than the
         # padded prompt width, so rollout logprobs must be stored at full sequence width to survive the
         # labels-style slice in compute_loss.
