@@ -25,6 +25,7 @@ from datasets import Dataset, DatasetDict, IterableDatasetDict, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from trl.experimental.iw_opd import IWOPDConfig, IWOPDTrainer
+from trl.experimental.iw_opd import iw_opd_trainer as iw_opd_trainer_module
 from trl.experimental.iw_opd.iw_opd_trainer import (
     _add_tail_bucket,
     _jsd_divergence,
@@ -267,6 +268,96 @@ def test_distillation_config_accepts_colocated_vllm_engine_options(tmp_path):
     assert config.vllm_speculative_config == speculative
     assert config.vllm_engine_kwargs == {"kv_cache_dtype": "turboquant_k8v4"}
     assert config.vllm_weight_sync_mode == "lora"
+
+
+def test_distillation_config_accepts_generic_sampling_controls(tmp_path):
+    config = IWOPDConfig(
+        **_make_distillation_config_kwargs(tmp_path),
+        min_p=0.01,
+        repetition_penalty=1.1,
+        generation_kwargs={"presence_penalty": 1.5},
+    )
+
+    assert config.min_p == 0.01
+    assert config.repetition_penalty == 1.1
+    assert config.generation_kwargs == {"presence_penalty": 1.5}
+
+
+def test_iw_opd_trainer_forwards_complete_sampling_controls(monkeypatch, tmp_path):
+    captured = {}
+
+    class DummyModel:
+        def __init__(self):
+            config = SimpleNamespace(_name_or_path="student", vocab_size=17)
+            config.get_text_config = lambda: config
+            self.config = config
+            self.generation_config = SimpleNamespace(eos_token_id=2)
+
+    class DummyProcessingClass:
+        pad_token_id = 0
+        pad_token = "<pad>"
+
+    def fake_base_init(
+        self,
+        model,
+        args=None,
+        data_collator=None,
+        train_dataset=None,
+        eval_dataset=None,
+        processing_class=None,
+        compute_metrics=None,
+        callbacks=None,
+        optimizers=None,
+        preprocess_logits_for_metrics=None,
+    ):
+        del (
+            data_collator,
+            train_dataset,
+            eval_dataset,
+            compute_metrics,
+            callbacks,
+            optimizers,
+            preprocess_logits_for_metrics,
+        )
+        self.model = model
+        self.args = args
+        self.processing_class = processing_class
+        self.accelerator = SimpleNamespace(device=torch.device("cpu"), num_processes=1)
+        self.is_deepspeed_enabled = False
+
+    class CapturingVLLMGeneration:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(iw_opd_trainer_module._BaseTrainer, "__init__", fake_base_init)
+    monkeypatch.setattr(iw_opd_trainer_module, "is_vllm_available", lambda: True)
+    monkeypatch.setattr(iw_opd_trainer_module, "VLLMGeneration", CapturingVLLMGeneration)
+
+    config = IWOPDConfig(
+        **_make_distillation_config_kwargs(tmp_path),
+        use_vllm=True,
+        disable_dropout=False,
+        min_p=0.01,
+        repetition_penalty=1.1,
+        generation_kwargs={"presence_penalty": 1.5},
+    )
+    trainer = IWOPDTrainer(
+        model=DummyModel(),
+        teacher_model=None,
+        args=config,
+        data_collator=object(),
+        processing_class=DummyProcessingClass(),
+    )
+
+    assert trainer.top_k == 0
+    assert trainer.min_p == 0.01
+    assert trainer.repetition_penalty == 1.1
+    assert trainer.generation_config.min_p == 0.01
+    assert trainer.generation_config.repetition_penalty == 1.1
+    assert trainer.generation_config.presence_penalty == 1.5
+    assert captured["min_p"] == 0.01
+    assert captured["repetition_penalty"] == 1.1
+    assert captured["generation_kwargs"] == {"presence_penalty": 1.5}
 
 
 @pytest.mark.parametrize("value", ["adapter", "", "FULL"])

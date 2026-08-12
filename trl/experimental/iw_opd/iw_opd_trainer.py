@@ -619,6 +619,9 @@ class IWOPDTrainer(_BaseTrainer):
         self.iw_opd_epsilon = args.iw_opd_epsilon
         self.temperature = args.temperature
         self.top_p = args.top_p
+        self.top_k = args.top_k
+        self.min_p = args.min_p
+        self.repetition_penalty = args.repetition_penalty
         self.num_generations = args.num_generations
         self.reverse_kl_top_1_mode = args.reverse_kl_top_1_mode
         self.loss_top_k = args.loss_top_k
@@ -644,8 +647,12 @@ class IWOPDTrainer(_BaseTrainer):
             "top_p": args.top_p,
             "do_sample": True,
             "top_k": args.top_k,
+            "min_p": args.min_p,
+            "repetition_penalty": args.repetition_penalty,
             "pad_token_id": self.processing_class.pad_token_id,
         }
+        if args.generation_kwargs is not None:
+            generation_kwargs.update(args.generation_kwargs)
         self.generation_config = GenerationConfig(**generation_kwargs)
         self.generation_kwargs = generation_kwargs
         if (
@@ -698,8 +705,11 @@ class IWOPDTrainer(_BaseTrainer):
                 temperature=args.temperature,
                 top_p=args.top_p,
                 top_k=args.top_k,
+                min_p=args.min_p,
+                repetition_penalty=args.repetition_penalty,
                 max_completion_length=args.max_completion_length,
                 logprobs=0 if args.distillation_objective == "iw_opd" or rollout_func is not None else None,
+                generation_kwargs=args.generation_kwargs,
             )
             self.vllm_sync_frequency = args.vllm_sync_frequency
             self._last_vllm_sync_step = -1

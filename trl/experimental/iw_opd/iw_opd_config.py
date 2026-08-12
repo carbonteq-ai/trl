@@ -115,6 +115,14 @@ class IWOPDConfig(_BaseConfig):
             Top-p (nucleus) sampling parameter for on-policy generation.
         top_k (`int`, *optional*, defaults to `0`):
             Top-k sampling parameter for on-policy generation. `0` disables top-k filtering.
+        min_p (`float`, *optional*):
+            Minimum token probability relative to the most likely token. `None` disables min-p filtering.
+        generation_kwargs (`dict[str, Any]`, *optional*):
+            Additional keyword arguments passed to `GenerationConfig` for local generation or `SamplingParams` for
+            vLLM generation. Values for generation controls such as `min_p` and `top_p` override this config's
+            corresponding fields.
+        repetition_penalty (`float`, *optional*, defaults to `1.0`):
+            Penalty applied to tokens already present in the prompt or generated completion.
 
         > Parameters that control vLLM for student generation
 
@@ -169,6 +177,7 @@ class IWOPDConfig(_BaseConfig):
     _VALID_DICT_FIELDS = _BaseConfig._VALID_DICT_FIELDS + [
         "model_init_kwargs",
         "teacher_model_init_kwargs",
+        "generation_kwargs",
         "vllm_speculative_config",
         "vllm_engine_kwargs",
     ]
@@ -330,6 +339,24 @@ class IWOPDConfig(_BaseConfig):
     top_k: int = field(
         default=0,
         metadata={"help": "Top-k sampling parameter for on-policy generation. 0 disables top-k filtering."},
+    )
+    min_p: float | None = field(
+        default=None,
+        metadata={
+            "help": "Minimum token probability relative to the most likely token. Typical values are in the "
+            "0.01-0.2 range."
+        },
+    )
+    generation_kwargs: dict[str, Any] | None = field(
+        default=None,
+        metadata={
+            "help": "Additional keyword arguments passed to GenerationConfig or vLLM SamplingParams. Values "
+            "that conflict with generation controls such as min_p or top_p override those controls."
+        },
+    )
+    repetition_penalty: float = field(
+        default=1.0,
+        metadata={"help": "Penalty applied to tokens already present in the prompt or generated completion."},
     )
 
     # vLLM for student generation

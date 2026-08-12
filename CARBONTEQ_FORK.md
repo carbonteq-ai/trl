@@ -5,10 +5,10 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
-Fork status: `candidate`. The published `trl==1.9.2.post1` bytes remain at
-commit `a82ecebc0fa081efd58302a34a553445fc73271d`. The raw-policy-parity repair
-is carried by candidate commit `e4fbd0a0e826fdcd85dacd080f26792164c67350` and
-will be released only as the distinct internal build `trl==1.9.2.post2`.
+Fork status: `candidate`. The published `trl==1.9.2.post2` bytes are tagged at
+commit `216023d99324fae89dd58629130ba3bb043582ed`. The complete IW-OPD sampling
+contract repair is carried by this candidate branch and will be released only
+as the distinct internal build `trl==1.9.2.post3`.
 
 ## Upstream base
 
@@ -16,8 +16,8 @@ will be released only as the distinct internal build `trl==1.9.2.post2`.
 - Upstream base: `33f9e462728b98f7f91d38b99328e81adde2faa0` (`v1.9.2`)
 - CarbonTeq repository: `https://github.com/carbonteq-ai/trl`
 - Development branch: `codex/trl-1.9-carbonteq`
-- Intended package release: `trl==1.9.2.post2`
-- Published release commit: `a82ecebc0fa081efd58302a34a553445fc73271d`
+- Intended package release: `trl==1.9.2.post3`
+- Published release commit: `216023d99324fae89dd58629130ba3bb043582ed`
 
 The Posttrain dependency declaration and lockfile are the executable consumer
 authority. Do not update them or describe a candidate capability as published
@@ -53,6 +53,10 @@ The fork keeps the following behavior on top of upstream 1.9.2:
   `IWOPDTrainer`;
 - IW-OPD support for sparse environment masks, cached rollout log-probabilities,
   LoRA-only vLLM synchronization, speculative configuration, and engine kwargs;
+- complete behavior-policy sampling for IW-OPD: top-p, top-k, min-p,
+  repetition penalty, and additional transformers/vLLM generation arguments
+  such as presence penalty are represented by `IWOPDConfig`, retained by
+  `IWOPDTrainer`, and forwarded to both generation engines;
 - memory-bounded log-probability projection for GRPO policy/reference scoring;
 - compatibility with the Posttrain runtime's `datasets>=4.6.1,<4.7` constraint.
 
@@ -106,6 +110,10 @@ masked rows are excluded from the parity probe.
 - `vllm_weight_sync_mode="lora"` is colocated-only.
 - `distillation_objective="iw_opd"` is fully on-policy and requires fresh
   rollout log-probabilities aligned to the exact sampled tokens.
+- `IWOPDConfig.generation_kwargs` may override its declared generation controls
+  on both local transformers and vLLM paths. A consumer that selects a control
+  must use a compatible engine; unsupported engine parameters fail at the
+  engine boundary rather than being silently discarded.
 - TurboQuant and MTP are configured and qualified independently before their
   combination is promoted.
 
@@ -165,7 +173,7 @@ built artifact and GPU canaries for the selected DAPO and IW-OPD profiles.
 Before updating Posttrain:
 
 1. finish the clean fork commit and push it;
-2. build `trl==1.9.2.post2` from the immutable release commit;
+2. build `trl==1.9.2.post3` from the immutable release commit;
 3. record wheel and source hashes;
 4. create and verify the immutable CarbonTeq tag and release;
 5. upload the exact artifacts to the internal stable index;
