@@ -859,6 +859,48 @@ class TestIWOPDTrainer(TrlTestCase):
         # Doubling the global count exactly halves the loss (sum / num_items is linear in 1/num_items).
         torch.testing.assert_close(loss_double, loss_mean / 2, rtol=1e-4, atol=1e-6)
 
+    def test_on_policy_rollout_stamps_post_generation_num_items_in_batch(self):
+        dataset = Dataset.from_list([{"messages": [{"role": "user", "content": "Hello"}]}] * 4)
+
+        def rollout_func(prompts, trainer, *, inputs):
+            del trainer, prompts
+            prompt_ids = [row["prompt_ids"] for row in inputs]
+            completion_ids = [[7, 8, 9] for _ in inputs]
+            return {
+                "prompt_ids": prompt_ids,
+                "prompt_lengths": [len(prompt) for prompt in prompt_ids],
+                "completion_ids": completion_ids,
+                "completion_loss_mask": [[True, True, True] for _ in inputs],
+                "logprobs": [[0.0, 0.0, 0.0] for _ in inputs],
+                "rollout_ids": [f"trace-{index}" for index in range(len(inputs))],
+            }
+
+        trainer = IWOPDTrainer(
+            model=self.model_id,
+            teacher_model=self.model_id,
+            args=self._make_args(lmbda=1.0, distillation_objective="iw_opd"),
+            train_dataset=dataset,
+            processing_class=self.tokenizer,
+            rollout_func=rollout_func,
+        )
+
+        recorded = {}
+        original_compute_loss = trainer.compute_loss
+
+        def spy_compute_loss(model, inputs, return_outputs=False, num_items_in_batch=None):
+            recorded["stamped"] = inputs.get("num_items_in_batch")
+            recorded["trainer_level"] = num_items_in_batch
+            return original_compute_loss(
+                model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
+            )
+
+        trainer.compute_loss = spy_compute_loss
+        train_result = trainer.train()
+
+        assert int(recorded["trainer_level"]) == 0
+        assert int(recorded["stamped"]) == 6
+        assert math.isfinite(train_result.metrics["train_loss"])
+
     @require_liger_kernel
     @require_torch_accelerator
     def test_distillation_trainer_with_liger(self):

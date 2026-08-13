@@ -894,6 +894,24 @@ class IWOPDTrainer(_BaseTrainer):
             self._textual_logs["prompt"].extend(gather_object(on_policy_prompts))
             self._textual_logs["completion"].extend(gather_object(on_policy_completions))
 
+        # The Trainer-level count comes from the raw dataloader batch, before on-policy generation has produced any
+        # completion labels. A fully on-policy window therefore arrives with `num_items_in_batch == 0`, even though
+        # the buffered slices above now contain valid completion tokens. Recompute the global count from those
+        # post-generation labels and carry it with each slice, matching the GRPO and DistillationTrainer paths.
+        local_valid_tokens = sum(
+            int((buffered["labels"] != -100).sum())
+            for buffered in self._buffered_inputs
+            if buffered is not None and buffered.get("labels") is not None
+        )
+        num_items_in_batch = (
+            self.accelerator.gather(torch.tensor(local_valid_tokens, device=self.accelerator.device))
+            .sum()
+            .clamp_min(1)
+        )
+        for buffered in self._buffered_inputs:
+            if buffered is not None:
+                buffered["num_items_in_batch"] = num_items_in_batch
+
     @profiling_decorator
     def _generate_student_completions(self, slices: list[dict[str, torch.Tensor | Any]], on_policy_indices: list[int]):
         """Generate completions from the student model for on-policy training."""
@@ -1486,8 +1504,7 @@ class IWOPDTrainer(_BaseTrainer):
             nonfinite_count = int(nonfinite_student.sum().item())
             total_required = int(valid_mask.sum().item())
             raise FloatingPointError(
-                "Student logprobs are non-finite for required IW-OPD positions: "
-                f"{nonfinite_count}/{total_required}."
+                f"Student logprobs are non-finite for required IW-OPD positions: {nonfinite_count}/{total_required}."
             )
         missing_teacher = valid_mask & ~torch.isfinite(teacher_actual_logprobs)
         if missing_teacher.any():
@@ -1523,6 +1540,7 @@ class IWOPDTrainer(_BaseTrainer):
         loss = torch.where(valid_mask, loss, torch.zeros_like(loss))
         nonfinite_loss = valid_mask & ~torch.isfinite(loss)
         if nonfinite_loss.any():
+
             def _range(values: torch.Tensor) -> str:
                 required = values[valid_mask]
                 return f"[{required.min().item():.6g}, {required.max().item():.6g}]"
@@ -1853,6 +1871,9 @@ class IWOPDTrainer(_BaseTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         self._raise_if_local_teacher_tokenizer_mismatch()
+        # Prefer the post-generation count stamped by `_fill_buffer`: the Trainer-level value was counted before
+        # on-policy generation populated completion labels and can therefore be zero for a non-empty batch.
+        num_items_in_batch = inputs.get("num_items_in_batch", num_items_in_batch)
 
         if self.use_liger_loss:
             loss = self._compute_liger_loss(model, inputs, num_items_in_batch=num_items_in_batch)

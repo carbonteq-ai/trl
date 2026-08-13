@@ -68,6 +68,10 @@ The fork keeps the following behavior on top of upstream 1.9.2:
 - IW-OPD validates the token loss after combining those finite inputs and
   reports the student, teacher, behavior-policy, advantage, and weight ranges
   when float32 reduction overflows;
+- IW-OPD recomputes `num_items_in_batch` from buffered completion labels after
+  on-policy generation. The base Trainer count observes the prompt-only raw
+  batch and is zero for a fully on-policy window; carrying the post-generation
+  count prevents a finite token-loss sum from being divided by zero;
 - memory-bounded log-probability projection for GRPO policy/reference scoring;
 - compatibility with the Posttrain runtime's `datasets>=4.6.1,<4.7` constraint.
 
