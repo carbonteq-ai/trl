@@ -17,7 +17,7 @@ source-distribution SHA-256 is
 - Upstream repository: `https://github.com/huggingface/trl`
 - Upstream base: `33f9e462728b98f7f91d38b99328e81adde2faa0` (`v1.9.2`)
 - CarbonTeq repository: `https://github.com/carbonteq-ai/trl`
-- Release branch: `v1.9.2.post5-release` (publishing `1.9.2.post10`; the
+- Release branch: `v1.9.2.post5-release` (publishing `1.9.2.post11`; the
   already-reserved `carbonteq-v1.9.2.post5` through `post7` tags name
   unrelated commits)
 - Published package release: `trl==1.9.2.post8`
