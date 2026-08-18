@@ -11,8 +11,8 @@ Posttrain framework.
 - Upstream base: `33f9e462728b98f7f91d38b99328e81adde2faa0` (`v1.9.2`)
 - CarbonTeq repository: `https://github.com/carbonteq-ai/trl`
 - Development branch: `feat/iwopd-native-template-constrained-logprobs`
-- Intended package release: `trl==1.9.2.post7`
-- Release implementation commit: `2423739025c559705105e11050874f5f7d7a25b9`
+- Intended package release: `trl==1.9.2.post8`
+- Release implementation commit: `5c95ef32444bd71c8408d4f94cf19f6bb5b25278`
 
 The Posttrain dependency declaration and lockfile are the executable consumer
 authority. Do not update them or describe a candidate capability as published
@@ -52,6 +52,8 @@ The fork keeps the following behavior on top of upstream 1.9.2:
 - IW-OPD support for sparse environment masks, cached rollout log-probabilities,
   LoRA-only vLLM synchronization, speculative configuration, and engine kwargs;
 - memory-bounded log-probability projection for GRPO policy/reference scoring;
+- checkpoint-safe repeated generation batches, so gradient-accumulated IW-OPD and distillation resumes skip repeated
+  batches rather than exhausting the underlying logical-batch loader;
 - compatibility with the Posttrain runtime's `datasets>=4.6.1,<4.7` constraint.
 
 Upstream 1.9.2 already contains the corrected DAPO loss normalizer,
@@ -138,7 +140,7 @@ built artifact and GPU canaries for the selected DAPO and IW-OPD profiles.
 Before updating Posttrain:
 
 1. finish the clean fork commit and push it;
-2. build `trl==1.9.2.post7` from the immutable release commit;
+2. build `trl==1.9.2.post8` from the immutable release commit;
 3. record wheel and source hashes;
 4. create and verify the immutable CarbonTeq tag and release;
 5. upload the exact artifacts to the internal stable index;
