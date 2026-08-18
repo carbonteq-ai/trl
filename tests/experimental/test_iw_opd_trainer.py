@@ -21,7 +21,9 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import torch.nn.functional as F
+from accelerate import skip_first_batches
 from datasets import Dataset, DatasetDict, IterableDatasetDict, load_dataset
+from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from trl.experimental.iw_opd import IWOPDConfig, IWOPDTrainer
@@ -1133,3 +1135,15 @@ def test_repeat_batch_dataloader_delegates_set_epoch_via_getattr():
     wrapper.set_epoch(7)
 
     assert dataloader.epoch == 7
+
+
+def test_repeat_batch_dataloader_resumes_from_repeated_batch_offset():
+    dataloader = DataLoader(list(range(384)), batch_size=12, shuffle=False)
+    wrapper = _RepeatBatchDataLoader(dataloader, repeat_count=12)
+
+    remaining = list(skip_first_batches(wrapper, 28 * 12))
+
+    assert len(remaining) == 4 * 12
+    assert remaining[0].tolist() == list(range(336, 348))
+    assert all(batch.tolist() == remaining[0].tolist() for batch in remaining[:12])
+    assert remaining[-1].tolist() == list(range(372, 384))

@@ -291,7 +291,8 @@ class _RepeatBatchDataLoader:
 
     ``RepeatSampler`` with ``repeat_count > 1`` causes the DataLoader to re-collate (re-tokenize) the same examples on
     every repeat, which is wasteful. This wrapper instead keeps ``repeat_count=1`` in the sampler and repeats the
-    already-collated tensor dict, avoiding redundant tokenization.
+    already-collated tensor dict, avoiding redundant tokenization. Its batch sampler describes the same repeated
+    sequence so Accelerate can skip the correct number of batches when resuming from a checkpoint.
     """
 
     def __init__(self, dataloader, repeat_count: int):
@@ -306,12 +307,32 @@ class _RepeatBatchDataLoader:
     def __len__(self):
         return len(self.dataloader) * self.repeat_count
 
+    @property
+    def batch_sampler(self):
+        return _RepeatBatchSampler(self.dataloader.batch_sampler, self.repeat_count)
+
     def set_epoch(self, epoch: int):
         if hasattr(self.dataloader, "set_epoch"):
             self.dataloader.set_epoch(epoch)
 
     def __getattr__(self, attr):
         return getattr(self.dataloader, attr)
+
+
+class _RepeatBatchSampler:
+    """Describes the repeated batch sequence to dataloader reconstruction utilities."""
+
+    def __init__(self, batch_sampler, repeat_count: int):
+        self.batch_sampler = batch_sampler
+        self.repeat_count = repeat_count
+
+    def __iter__(self):
+        for batch in self.batch_sampler:
+            for _ in range(self.repeat_count):
+                yield batch
+
+    def __len__(self):
+        return len(self.batch_sampler) * self.repeat_count
 
 
 class DistillationTrainer(_BaseTrainer):
