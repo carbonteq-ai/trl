@@ -12,7 +12,8 @@ Wheel SHA-256: `8b19cd7fad5a28cf9ced4a7fac93bfaaedaac154faf019a3d3dd6abeaaa45c26
 Source SHA-256: `0f6407d8280d59b433ef28ed5d007ddde95bb064cd28f12661fa8e59ef2e67c9`.
 GitHub asset digests match both build-once artifacts. Installed post2 wheel
 passes CUDA native IW-OPD train/resume/export at accumulation 1 and 2.
-Development publication: Posttrain run `34007394648` (verify its conclusion).
+Development publication: Posttrain run `34007394648` succeeded, including
+clean installation and retained-byte readback. Stable promotion remains open.
 Sixty-six IW-OPD tests passed before expanding the skip matrix; the expanded
 map/streaming x accumulation 1/2/3 x generations 1/2 matrix passes all 12 cases.
 
