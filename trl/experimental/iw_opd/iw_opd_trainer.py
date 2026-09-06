@@ -46,7 +46,14 @@ from ...import_utils import is_vllm_available
 from ...models import prepare_deepspeed
 from ...models.utils import _ForwardRedirection, unwrap_model_for_generation
 from ...trainer.base_trainer import _BaseTrainer
-from ...trainer.utils import RepeatSampler, create_model_from_path, disable_dropout_in_model, pad, split_tensor_dict
+from ...trainer.utils import (
+    RepeatSampler,
+    create_model_from_path,
+    disable_dropout_in_model,
+    pad,
+    repeat_iterable_dataset,
+    split_tensor_dict,
+)
 from .iw_opd_config import IWOPDConfig
 
 
@@ -336,34 +343,6 @@ class _DistillationCollator:
             batch["messages"] = all_messages
             batch["rollout_inputs"] = all_rollout_inputs
         return batch
-
-
-class _RepeatBatchDataLoader:
-    """Repeats each collated batch ``repeat_count`` times without re-collation.
-
-    ``RepeatSampler`` with ``repeat_count > 1`` causes the DataLoader to re-collate (re-tokenize) the same examples on
-    every repeat, which is wasteful. This wrapper instead keeps ``repeat_count=1`` in the sampler and repeats the
-    already-collated tensor dict, avoiding redundant tokenization.
-    """
-
-    def __init__(self, dataloader, repeat_count: int):
-        self.dataloader = dataloader
-        self.repeat_count = repeat_count
-
-    def __iter__(self):
-        for batch in self.dataloader:
-            for _ in range(self.repeat_count):
-                yield batch
-
-    def __len__(self):
-        return len(self.dataloader) * self.repeat_count
-
-    def set_epoch(self, epoch: int):
-        if hasattr(self.dataloader, "set_epoch"):
-            self.dataloader.set_epoch(epoch)
-
-    def __getattr__(self, attr):
-        return getattr(self.dataloader, attr)
 
 
 class IWOPDTrainer(_BaseTrainer):
@@ -795,7 +774,7 @@ class IWOPDTrainer(_BaseTrainer):
             data_source=dataset,
             mini_repeat_count=self.num_generations,
             batch_size=self.args.generation_batch_size * self.accelerator.num_processes,
-            repeat_count=1,
+            repeat_count=self.args.gradient_accumulation_steps,
             shuffle=True,
             seed=self.args.seed,
         )
@@ -813,6 +792,17 @@ class IWOPDTrainer(_BaseTrainer):
 
         train_dataset = self.train_dataset
         data_collator = self.data_collator
+
+        if isinstance(train_dataset, torch.utils.data.IterableDataset):
+            # Keep repetition inside the dataset/sampler, as in DistillationTrainer.
+            # Wrapping an already prepared loader hides DataLoaderShard from
+            # Accelerate's checkpoint skip path, losing device placement and repeats.
+            train_dataset = repeat_iterable_dataset(
+                train_dataset,
+                mini_repeat_count=self.num_generations,
+                batch_size=self.args.generation_batch_size * self.accelerator.num_processes,
+                repeat_count=self.args.gradient_accumulation_steps,
+            )
 
         dataloader_params = {
             "batch_size": self._train_batch_size * self.args.gradient_accumulation_steps,
@@ -833,8 +823,7 @@ class IWOPDTrainer(_BaseTrainer):
             if self.args.dataloader_num_workers > 0:
                 dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
 
-        base_dataloader = self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
-        return _RepeatBatchDataLoader(base_dataloader, repeat_count=self.args.gradient_accumulation_steps)
+        return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
 
     # ──────────────────────────────────────────────────────────────────────
     #  Buffering: on/off-policy mixing across gradient accumulation steps

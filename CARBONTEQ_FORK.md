@@ -5,7 +5,10 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
-Fork status: `candidate`, version `1.12.0.post1`, retained GitHub prerelease.
+Fork status: `candidate`, version `1.12.0.post2`, checkpoint-recovery correction.
+Publication identity for post2 is pending build-once/readback below.
+
+Previous development candidate (not promoted): `1.12.0.post1`.
 Release commit: `6a5532e2f51e4e1cdc8a891582514a50f68a775a`.
 Tag: `carbonteq-v1.12.0.post1`.
 Wheel SHA-256: `cf242fafdfe476b7b8a250b300d6cbd52f502410a4053f4a9bac3366287727c5`.
@@ -28,11 +31,11 @@ source-distribution SHA-256 is
 - Upstream repository: `https://github.com/huggingface/trl`
 - Upstream base: `59c4a8e104413fa9f4ca1a54eaf2ff93c0f299be` (`v1.12.0`)
 - CarbonTeq repository: `https://github.com/carbonteq-ai/trl`
-- Release branch: `v1.9.2.post5-release` (publishing `1.9.2.post11`; the
+- Historical release branch: `v1.9.2.post5-release` (published `1.9.2.post11`; the
   already-reserved `carbonteq-v1.9.2.post5` through `post7` tags name
   unrelated commits)
-- Published package release: `trl==1.9.2.post8`
-- Published release commit: `9a219ce5a593d85fe6058025de211ce42267e6b6`
+- Historical package release: `trl==1.9.2.post8`
+- Historical release commit: `9a219ce5a593d85fe6058025de211ce42267e6b6`
 
 The Posttrain dependency declaration and lockfile are the executable consumer
 authority. A candidate capability is not published until its fork commit,
@@ -41,6 +44,18 @@ immutable release tag, package hashes, and clean-install verification exist.
 ## Maintained delta
 
 ### Stable-base integration (2026-09-06)
+
+The post1 CUDA lifecycle gate exposed a checkpoint recovery failure in the
+upstream IW-OPD `_RepeatBatchDataLoader` optimization: Accelerate reconstructs
+an ordinary CPU loader, losing both prepared-device placement and accumulation
+repetition. Post2 keeps repetition in `RepeatSampler` or the existing iterable
+dataset helper and returns the native prepared loader, matching the maintained
+DistillationTrainer pattern. This trades repeated collation for correct resume;
+generation still happens once per optimizer window. Map and streaming loader
+regressions cover accumulation 1/2/3 and checkpoint skipping. Native tiny-model
+CUDA IW-OPD at accumulation 1 and 2 completes two nonzero-gradient updates,
+resumes checkpoint 1 to matching final weights, and exports/reloads/generates.
+This is not a vLLM, LoRA, multi-rank GPU, or model-quality qualification.
 
 The upstream generation-window correction supersedes our Liger 0.8.0 adaptation
 at `7fe16760`. The new candidate requires Liger >=0.8.2 and passes the full

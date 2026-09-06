@@ -29,7 +29,6 @@ from trl.experimental.iw_opd import iw_opd_trainer as iw_opd_trainer_module
 from trl.experimental.iw_opd.iw_opd_trainer import (
     _add_tail_bucket,
     _jsd_divergence,
-    _RepeatBatchDataLoader,
     build_teacher_request_inputs,
 )
 
@@ -1232,23 +1231,42 @@ class TestIWOPDTrainerServerPath(TrlTestCase):
             assert math.isfinite(record["loss"])
 
 
-def test_repeat_batch_dataloader_delegates_set_epoch_via_getattr():
-    class DummyDataLoader:
-        def __init__(self):
-            self.epoch = None
+@pytest.mark.parametrize("accumulation", [1, 2, 3])
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("generations", [1, 2])
+def test_checkpoint_skip_preserves_prepared_loader_and_repeated_batches(tmp_path, accumulation, streaming, generations):
+    from accelerate import Accelerator, skip_first_batches
+    from accelerate.data_loader import DataLoaderDispatcher, DataLoaderShard
 
-        def __iter__(self):
-            yield {"x": 1}
-
-        def __len__(self):
-            return 1
-
-        def set_epoch(self, epoch):
-            self.epoch = epoch
-
-    dataloader = DummyDataLoader()
-    wrapper = _RepeatBatchDataLoader(dataloader, repeat_count=2)
-
-    wrapper.set_epoch(7)
-
-    assert dataloader.epoch == 7
+    trainer = IWOPDTrainer.__new__(IWOPDTrainer)
+    trainer.args = IWOPDConfig(
+        output_dir=str(tmp_path),
+        use_cpu=True,
+        bf16=False,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=accumulation,
+        num_generations=generations,
+        dataloader_pin_memory=False,
+        report_to="none",
+    )
+    trainer.train_dataset = Dataset.from_dict({"x": list(range(24))})
+    if streaming:
+        trainer.train_dataset = trainer.train_dataset.to_iterable_dataset()
+    trainer.data_collator = lambda rows: {"x": torch.tensor([row["x"] for row in rows])}
+    trainer._train_batch_size = 2
+    trainer.num_generations = generations
+    trainer.accelerator = Accelerator(cpu=True)
+    loader = trainer.get_train_dataloader()
+    loader.set_epoch(0)
+    expected = list(loader)
+    for index in range(0, len(expected[0]["x"]), generations):
+        assert expected[0]["x"][index : index + generations].unique().numel() == 1
+    for index in range(accumulation):
+        torch.testing.assert_close(expected[index]["x"], expected[0]["x"])
+    skipped = skip_first_batches(trainer.get_train_dataloader(), accumulation)
+    assert isinstance(skipped, (DataLoaderShard, DataLoaderDispatcher))
+    skipped.set_epoch(0)
+    actual = list(skipped)
+    assert len(actual) == len(expected) - accumulation
+    for actual_batch, expected_batch in zip(actual, expected[accumulation:], strict=True):
+        torch.testing.assert_close(actual_batch["x"], expected_batch["x"])
