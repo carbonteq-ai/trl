@@ -3403,7 +3403,17 @@ class GRPOTrainer(_BaseTrainer):
         if self.beta != 0.0:
             self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).mean().item())
         self._metrics[mode]["clip_ratio"].append(self.accelerator.gather(clip_ratio).mean().item())
-        normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0  # no accum in eval
+        # Liger 0.8 normalizes by this microbatch's global tokens per rank. Undo
+        # that mean before applying the full generation-window denominator,
+        # matching the non-Liger loss without requiring a newer kernel API.
+        if self.loss_type in ["cispo", "dapo", "vespo"]:
+            microbatch_normalizer = self.accelerator.reduce(loss_mask.float().sum(), reduction="mean").clamp(min=1.0)
+            loss = loss * microbatch_normalizer / (inputs["num_items_in_batch"] / self.accelerator.num_processes)
+            normalizer = (
+                self.current_gradient_accumulation_steps / self.args.steps_per_generation if mode == "train" else 1.0
+            )
+        else:
+            normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0
         return loss / normalizer
 
     @profiling_decorator

@@ -29,6 +29,28 @@ immutable release tag, package hashes, and clean-install verification exist.
 
 ## Maintained delta
 
+### Unpublished generation-window correction (2026-09-06)
+
+The `codex/gdpo-capo-upstream-parity` worktree starts at consumer pin
+`69cf80a7319079ec5523841553467e119ebc1cec`. It adapts upstream correction
+`6297c47772df3ebb5eef48c3347f75465949256f` to Liger 0.8.0: undo the fused
+loss's global microbatch-token mean, then apply the complete generation-window
+denominator and generation/accumulation rescaling. GRPO's per-response mean
+is unchanged. Liger 0.8.0 cannot accept upstream's new `num_items_in_batch`
+argument; copying that patch literally breaks the retained consumer runtime.
+
+`tests/test_liger_window_normalization.py`: 19 passing CPU tests, including
+native Liger loss/gradient comparisons at beta zero and positive beta, and
+two-rank Gloo gradient parity against a complete-population PyTorch objective.
+Against the installed consumer pin, the first 18 tests fail 14 cases and pass
+the four unchanged GRPO cases. GPU/runtime-image qualification is still open;
+no new version or published artifact is claimed.
+
+On a v1.12.0 rebase, use the upstream interface only after selecting a compatible
+Liger dependency; never apply both corrections. Retain these regressions when
+removing the adaptation. Consumer state is recorded in Posttrain's
+`docs/tooling/trl/README.md` and `docs/plan/gdpo-capo-dual-backend-support.md`.
+
 The fork keeps the following behavior on top of upstream 1.9.2:
 
 - vLLM request waves and explicit resident sequence/token caps so a large
