@@ -6,7 +6,15 @@ job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
 Fork status: `candidate`, version `1.12.0.post2`, checkpoint-recovery correction.
-Publication identity for post2 is pending build-once/readback below.
+Post2 release commit: `95a787b6c04f91a5d485fd827d31b1e1fb67ae8e`.
+Tag: `carbonteq-v1.12.0.post2` (retained GitHub prerelease).
+Wheel SHA-256: `8b19cd7fad5a28cf9ced4a7fac93bfaaedaac154faf019a3d3dd6abeaaa45c26`.
+Source SHA-256: `0f6407d8280d59b433ef28ed5d007ddde95bb064cd28f12661fa8e59ef2e67c9`.
+GitHub asset digests match both build-once artifacts. Installed post2 wheel
+passes CUDA native IW-OPD train/resume/export at accumulation 1 and 2.
+Development publication: Posttrain run `34007394648` (verify its conclusion).
+Sixty-six IW-OPD tests passed before expanding the skip matrix; the expanded
+map/streaming x accumulation 1/2/3 x generations 1/2 matrix passes all 12 cases.
 
 Previous development candidate (not promoted): `1.12.0.post1`.
 Release commit: `6a5532e2f51e4e1cdc8a891582514a50f68a775a`.
