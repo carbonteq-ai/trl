@@ -5,7 +5,15 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
-Fork status: `candidate`, version `1.12.0.post1`, unpublished. The maintained
+Fork status: `candidate`, version `1.12.0.post1`, retained GitHub prerelease.
+Release commit: `6a5532e2f51e4e1cdc8a891582514a50f68a775a`.
+Tag: `carbonteq-v1.12.0.post1`.
+Wheel SHA-256: `cf242fafdfe476b7b8a250b300d6cbd52f502410a4053f4a9bac3366287727c5`.
+Source SHA-256: `1e7bae5ee846972be7763e66dbd0b1149d99fb44c51125e2499adf4773d2e127`.
+Both hashes match GitHub's asset digests. Forty-five retained-feature tests pass
+against the installed wheel, independent of source-checkout imports.
+Development publisher: Posttrain Actions run `34006220244`; stable promotion
+and runtime-image qualification remain open. The maintained
 features from consumer pin `69cf80a7319079ec5523841553467e119ebc1cec` are integrated
 on upstream v1.12.0. Current branch: `codex/trl-1.12-retained-features`.
 Historical publication record: `trl==1.9.2.post8` was a published CarbonTeq
