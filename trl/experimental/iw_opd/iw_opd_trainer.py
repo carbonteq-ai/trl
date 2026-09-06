@@ -41,13 +41,16 @@ from transformers.trainer_utils import EvalPrediction, seed_worker
 from transformers.utils import is_liger_kernel_available, is_peft_available, is_rich_available
 
 from ...extras.profiling import profiling_decorator
-from ...generation.vllm_generation import VLLMGeneration
+from ...generation.vllm_generation import VLLMGeneration, _accumulate_spec_decode_metrics
 from ...import_utils import is_vllm_available
 from ...models import prepare_deepspeed
 from ...models.utils import _ForwardRedirection, unwrap_model_for_generation
 from ...trainer.base_trainer import _BaseTrainer
 from ...trainer.utils import RepeatSampler, create_model_from_path, disable_dropout_in_model, pad, split_tensor_dict
 from .iw_opd_config import IWOPDConfig
+
+
+RolloutFunc = Callable[..., dict[str, Any]]
 
 
 if is_liger_kernel_available():
@@ -220,20 +223,24 @@ class _DistillationCollator:
         max_prompt_length: int,
         messages_key: str = "messages",
         ignore_index: int = -100,
+        preserve_messages: bool = False,
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.max_prompt_length = max_prompt_length
         self.messages_key = messages_key
         self.ignore_index = ignore_index
+        self.preserve_messages = preserve_messages
 
         if tokenizer.pad_token_id is None:
             raise ValueError("The tokenizer does not have a pad token. Please set `pad_token_id` in the tokenizer.")
 
-    def __call__(self, examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+    def __call__(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
         all_input_ids: list[list[int]] = []
         all_labels: list[list[int]] = []
         all_prompt_ids: list[list[int]] = []
+        all_messages: list[list[dict[str, Any]]] = []
+        all_rollout_inputs: list[dict[str, Any]] = []
 
         for example in examples:
             messages = example[self.messages_key]
@@ -287,6 +294,8 @@ class _DistillationCollator:
             all_input_ids.append(input_ids)
             all_labels.append(labels)
             all_prompt_ids.append(list(prompt_ids))
+            all_messages.append(messages)
+            all_rollout_inputs.append(dict(example))
 
         # Convert to tensors and left-pad
         pad_id = self.tokenizer.pad_token_id
@@ -316,13 +325,17 @@ class _DistillationCollator:
             padding_value=0,
         )
 
-        return {
+        batch: dict[str, Any] = {
             "input_ids": input_ids_t,
             "attention_mask": attention_mask_t,
             "labels": labels_t,
             "prompts": prompts_t,
             "prompt_attention_mask": prompt_mask_t,
         }
+        if self.preserve_messages:
+            batch["messages"] = all_messages
+            batch["rollout_inputs"] = all_rollout_inputs
+        return batch
 
 
 class _RepeatBatchDataLoader:
@@ -372,6 +385,7 @@ class IWOPDTrainer(_BaseTrainer):
     - On-policy / off-policy mixing via `lmbda` (buffered across gradient accumulation)
     - Local teacher model or external teacher via vLLM server
     - Student on-policy generation via vLLM or model.generate()
+    - Exact-token external environment rollouts via `rollout_func`
     - Liger kernel for memory-efficient fused JSD loss
     """
 
@@ -408,6 +422,7 @@ class IWOPDTrainer(_BaseTrainer):
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         peft_config: Optional["PeftConfig"] = None,
+        rollout_func: RolloutFunc | None = None,
     ):
         if args is None:
             args = IWOPDConfig(output_dir="tmp_iw_opd")
@@ -484,6 +499,7 @@ class IWOPDTrainer(_BaseTrainer):
                 tokenizer=processing_class,
                 max_length=args.max_length,
                 max_prompt_length=args.max_prompt_length,
+                preserve_messages=rollout_func is not None,
             )
 
         # ── Liger fused JSD loss ──
@@ -603,10 +619,14 @@ class IWOPDTrainer(_BaseTrainer):
         self.iw_opd_epsilon = args.iw_opd_epsilon
         self.temperature = args.temperature
         self.top_p = args.top_p
+        self.top_k = args.top_k
+        self.min_p = args.min_p
+        self.repetition_penalty = args.repetition_penalty
         self.num_generations = args.num_generations
         self.reverse_kl_top_1_mode = args.reverse_kl_top_1_mode
         self.loss_top_k = args.loss_top_k
         self.loss_add_tail = args.loss_add_tail
+        self.rollout_func = rollout_func
 
         # ── Buffer state ──
         self._buffered_inputs = None
@@ -627,8 +647,12 @@ class IWOPDTrainer(_BaseTrainer):
             "top_p": args.top_p,
             "do_sample": True,
             "top_k": args.top_k,
+            "min_p": args.min_p,
+            "repetition_penalty": args.repetition_penalty,
             "pad_token_id": self.processing_class.pad_token_id,
         }
+        if args.generation_kwargs is not None:
+            generation_kwargs.update(args.generation_kwargs)
         self.generation_config = GenerationConfig(**generation_kwargs)
         self.generation_kwargs = generation_kwargs
         if (
@@ -673,13 +697,19 @@ class IWOPDTrainer(_BaseTrainer):
                 max_model_length=args.vllm_max_model_length,
                 max_num_seqs=args.per_device_train_batch_size * args.gradient_accumulation_steps,
                 enable_sleep_mode=args.vllm_enable_sleep_mode,
+                speculative_config=args.vllm_speculative_config,
+                engine_kwargs=args.vllm_engine_kwargs,
+                weight_sync_mode=args.vllm_weight_sync_mode,
                 model_impl=args.vllm_model_impl,
                 trust_remote_code=args.trust_remote_code,
                 temperature=args.temperature,
                 top_p=args.top_p,
                 top_k=args.top_k,
+                min_p=args.min_p,
+                repetition_penalty=args.repetition_penalty,
                 max_completion_length=args.max_completion_length,
-                logprobs=0 if args.distillation_objective == "iw_opd" else None,
+                logprobs=0 if args.distillation_objective == "iw_opd" or rollout_func is not None else None,
+                generation_kwargs=args.generation_kwargs,
             )
             self.vllm_sync_frequency = args.vllm_sync_frequency
             self._last_vllm_sync_step = -1
@@ -703,6 +733,8 @@ class IWOPDTrainer(_BaseTrainer):
 
     def _compute_prompt_length(self, inputs: dict[str, torch.Tensor | Any]) -> int:
         """Compute the earliest prompt boundary that still includes every completion token in the batch."""
+        if inputs.get("prompt_length") is not None:
+            return int(inputs["prompt_length"])
         if inputs.get("labels") is not None:
             attention_mask = inputs["attention_mask"]
             labels = inputs["labels"]
@@ -862,9 +894,30 @@ class IWOPDTrainer(_BaseTrainer):
             self._textual_logs["prompt"].extend(gather_object(on_policy_prompts))
             self._textual_logs["completion"].extend(gather_object(on_policy_completions))
 
+        # The Trainer-level count comes from the raw dataloader batch, before on-policy generation has produced any
+        # completion labels. A fully on-policy window therefore arrives with `num_items_in_batch == 0`, even though
+        # the buffered slices above now contain valid completion tokens. Recompute the global count from those
+        # post-generation labels and carry it with each slice, matching the GRPO and DistillationTrainer paths.
+        local_valid_tokens = sum(
+            int((buffered["labels"] != -100).sum())
+            for buffered in self._buffered_inputs
+            if buffered is not None and buffered.get("labels") is not None
+        )
+        num_items_in_batch = (
+            self.accelerator.gather(torch.tensor(local_valid_tokens, device=self.accelerator.device))
+            .sum()
+            .clamp_min(1)
+        )
+        for buffered in self._buffered_inputs:
+            if buffered is not None:
+                buffered["num_items_in_batch"] = num_items_in_batch
+
     @profiling_decorator
     def _generate_student_completions(self, slices: list[dict[str, torch.Tensor | Any]], on_policy_indices: list[int]):
         """Generate completions from the student model for on-policy training."""
+        if self.rollout_func is not None:
+            self._generate_with_rollout_func(slices, on_policy_indices)
+            return
         if not self.use_vllm:
             self._generate_with_model(slices, on_policy_indices)
             return
@@ -899,11 +952,215 @@ class IWOPDTrainer(_BaseTrainer):
         _, completion_ids, logprobs, logprob_token_ids = self.vllm_generation.generate(
             prompts=prompt_ids_list, images=None, num_generations=self.num_generations
         )
+        _accumulate_spec_decode_metrics(self._metrics["train"], self.vllm_generation.last_generation_metrics)
 
         # Process completions into the buffer
         self._store_completions_in_buffer(
             slices, on_policy_indices, local_slice_indices, local_prompts, completion_ids, logprobs, logprob_token_ids
         )
+
+    def _generate_with_rollout_func(
+        self,
+        slices: list[dict[str, torch.Tensor | Any]],
+        on_policy_indices: list[int],
+    ) -> None:
+        """Generate exact-token environment rollouts through an external callback."""
+        prompts: list[Any] = []
+        rollout_inputs: list[dict[str, Any]] = []
+        local_slice_indices: list[int] = []
+        pad_token_id = self.processing_class.pad_token_id
+
+        for slice_idx in on_policy_indices:
+            slice_inputs = slices[slice_idx]
+            messages = slice_inputs.get("messages")
+            source_inputs = slice_inputs.get("rollout_inputs")
+            prompt_mask = slice_inputs.get("prompt_attention_mask")
+            for row_idx, prompt in enumerate(slice_inputs["prompts"]):
+                if prompt_mask is not None:
+                    prompt = prompt[prompt_mask[row_idx].bool()]
+                elif pad_token_id is not None:
+                    prompt = prompt[prompt != pad_token_id]
+                prompt_ids = prompt.tolist()
+                structured_prompt = messages[row_idx] if messages is not None else prompt_ids
+                prompts.append(structured_prompt)
+                rollout_input = dict(source_inputs[row_idx]) if source_inputs is not None else {}
+                rollout_input.update({"prompt_ids": prompt_ids, "input": structured_prompt})
+                rollout_inputs.append(rollout_input)
+                local_slice_indices.append(slice_idx)
+
+        output = self.rollout_func(prompts, self, inputs=rollout_inputs)
+        required_keys = {
+            "prompt_ids",
+            "prompt_lengths",
+            "completion_ids",
+            "completion_loss_mask",
+            "logprobs",
+        }
+        missing_keys = required_keys - output.keys()
+        if missing_keys:
+            raise ValueError(f"rollout_func must return keys {sorted(missing_keys)} in its output dict.")
+
+        expected = len(prompts)
+        for key in required_keys:
+            if len(output[key]) != expected:
+                raise ValueError(f"rollout_func field {key!r} must contain {expected} items, got {len(output[key])}.")
+
+        rollout_ids = output.get("rollout_ids")
+        if rollout_ids is not None:
+            if len(rollout_ids) != expected:
+                raise ValueError("rollout_func rollout_ids must align with generated items.")
+            if len(set(rollout_ids)) != len(rollout_ids):
+                raise ValueError("rollout_func rollout_ids must be unique.")
+
+        normalized: list[dict[str, Any]] = []
+        for idx in range(expected):
+            prompt_ids = list(output["prompt_ids"][idx])
+            completion_ids = list(output["completion_ids"][idx])
+            completion_loss_mask = [bool(value) for value in output["completion_loss_mask"][idx]]
+            logprobs = [float(value) for value in output["logprobs"][idx]]
+            prompt_length = output["prompt_lengths"][idx]
+            if not isinstance(prompt_length, int) or prompt_length <= 0:
+                raise ValueError("rollout_func prompt_lengths must contain positive integers.")
+            if prompt_length != len(prompt_ids):
+                raise ValueError("rollout_func prompt_lengths must equal the corresponding prompt_ids length.")
+            if not prompt_ids or not completion_ids:
+                raise ValueError("rollout_func must return non-empty prompt_ids and completion_ids.")
+            if len(completion_ids) > self.generation_config.max_new_tokens:
+                raise ValueError("rollout_func completion_ids exceed max_completion_length.")
+            if len(completion_loss_mask) != len(completion_ids):
+                raise ValueError("rollout_func completion_loss_mask must align with completion_ids.")
+            if len(logprobs) != len(completion_ids):
+                raise ValueError("rollout_func logprobs must align with completion_ids.")
+            if not any(completion_loss_mask):
+                raise ValueError("rollout_func completion_loss_mask must select at least one token.")
+            normalized.append(
+                {
+                    "prompt_ids": prompt_ids,
+                    "completion_ids": completion_ids,
+                    "completion_loss_mask": completion_loss_mask,
+                    "logprobs": logprobs,
+                }
+            )
+
+        device = self.accelerator.device
+        pad_id = pad_token_id if pad_token_id is not None else 0
+        for slice_idx in on_policy_indices:
+            owned_indices = [index for index, owner in enumerate(local_slice_indices) if owner == slice_idx]
+            items = [normalized[index] for index in owned_indices]
+            prompt_width = max(len(item["prompt_ids"]) for item in items)
+            completion_width = max(len(item["completion_ids"]) for item in items)
+            input_rows = []
+            attention_rows = []
+            label_rows = []
+            prompt_mask_rows = []
+            rollout_logprob_rows = []
+            prompt_texts = []
+            completion_texts = []
+
+            for item in items:
+                prompt_padding = prompt_width - len(item["prompt_ids"])
+                completion_padding = completion_width - len(item["completion_ids"])
+                prompt_row = [pad_id] * prompt_padding + item["prompt_ids"]
+                completion_row = item["completion_ids"] + [pad_id] * completion_padding
+                loss_mask = item["completion_loss_mask"] + [False] * completion_padding
+                labels = [-100] * prompt_width + [
+                    token if keep else -100 for token, keep in zip(completion_row, loss_mask, strict=True)
+                ]
+                input_rows.append(prompt_row + completion_row)
+                attention_rows.append(
+                    [0] * prompt_padding
+                    + [1] * len(item["prompt_ids"])
+                    + [1] * len(item["completion_ids"])
+                    + [0] * completion_padding
+                )
+                label_rows.append(labels)
+                prompt_mask_rows.append([0] * prompt_padding + [1] * len(item["prompt_ids"]))
+                rollout_logprob_rows.append([0.0] * prompt_width + item["logprobs"] + [0.0] * completion_padding)
+                prompt_texts.append(self.processing_class.decode(item["prompt_ids"], skip_special_tokens=False))
+                completion_texts.append(
+                    self.processing_class.decode(item["completion_ids"], skip_special_tokens=False)
+                )
+
+            updated = dict(slices[slice_idx])
+            updated["input_ids"] = torch.tensor(input_rows, dtype=torch.long, device=device)
+            updated["attention_mask"] = torch.tensor(attention_rows, dtype=torch.long, device=device)
+            updated["labels"] = torch.tensor(label_rows, dtype=torch.long, device=device)
+            updated["prompts"] = updated["input_ids"][:, :prompt_width]
+            updated["prompt_attention_mask"] = torch.tensor(prompt_mask_rows, dtype=torch.long, device=device)
+            updated["prompt_length"] = prompt_width
+            updated["rollout_logprobs"] = torch.tensor(rollout_logprob_rows, dtype=torch.float32, device=device)
+            updated["completion_loss_mask"] = torch.tensor(
+                [
+                    item["completion_loss_mask"] + [False] * (completion_width - len(item["completion_ids"]))
+                    for item in items
+                ],
+                dtype=torch.bool,
+                device=device,
+            )
+            if rollout_ids is not None:
+                updated["rollout_ids"] = [rollout_ids[index] for index in owned_indices]
+            self._buffered_inputs[slice_idx] = updated
+            self._buffered_text_logs[slice_idx] = (prompt_texts, completion_texts)
+
+    def _generate_single_turn(
+        self,
+        prompt_ids: list[list[int]],
+        images: Any = None,
+        multimodal_fields: dict[str, Any] | None = None,
+    ) -> tuple[list[list[int]], list[list[float]]]:
+        """Generate one sampled completion per exact-token prompt for an external rollout."""
+        if images is not None or multimodal_fields:
+            raise NotImplementedError("IW-OPD rollout_func generation currently supports text-only prompts")
+        if not prompt_ids or any(not prompt for prompt in prompt_ids):
+            raise ValueError("IW-OPD rollout prompts must contain exact token ids")
+
+        if self.use_vllm:
+            if (
+                self.state.global_step != self._last_vllm_sync_step
+                and self.state.global_step % self.vllm_sync_frequency == 0
+            ):
+                self.vllm_generation.sync_weights()
+                self._last_vllm_sync_step = self.state.global_step
+            _, completion_ids, logprobs, _ = self.vllm_generation.generate(
+                prompts=prompt_ids,
+                images=None,
+                num_generations=1,
+            )
+            mode = "train" if self.model.training else "eval"
+            _accumulate_spec_decode_metrics(self._metrics[mode], self.vllm_generation.last_generation_metrics)
+            if logprobs is None:
+                raise RuntimeError("vLLM must return sampled-token logprobs for external IW-OPD rollouts")
+            return completion_ids, [[float(token_logprobs[0]) for token_logprobs in row] for row in logprobs]
+
+        completions: list[list[int]] = []
+        sampled_logprobs: list[list[float]] = []
+        with (
+            unwrap_model_for_generation(
+                self.model, self.accelerator, generation_kwargs=self.generation_kwargs
+            ) as unwrapped_model,
+            torch.no_grad(),
+        ):
+            for prompt in prompt_ids:
+                prompt_tensor = torch.tensor([prompt], dtype=torch.long, device=self.accelerator.device)
+                generated = unwrapped_model.generate(
+                    input_ids=prompt_tensor,
+                    attention_mask=torch.ones_like(prompt_tensor),
+                    generation_config=self.generation_config,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                )
+                completion = generated.sequences[0, len(prompt) :].tolist()
+                if not completion:
+                    raise RuntimeError("student generation returned an empty completion")
+                if len(generated.scores) != len(completion):
+                    raise RuntimeError("student generation scores do not align with completion token ids")
+                logprobs = [
+                    float(F.log_softmax(score[0], dim=-1)[token_id].item())
+                    for score, token_id in zip(generated.scores, completion, strict=True)
+                ]
+                completions.append(completion)
+                sampled_logprobs.append(logprobs)
+        return completions, sampled_logprobs
 
     def _generate_with_model(self, slices: list[dict[str, torch.Tensor | Any]], on_policy_indices: list[int]):
         """Fallback generation using model.generate() (no vLLM)."""
@@ -1242,6 +1499,13 @@ class IWOPDTrainer(_BaseTrainer):
         student_actual_logprobs = student_log_probs.gather(dim=-1, index=completion_tokens.unsqueeze(-1)).squeeze(-1)
 
         valid_mask = labels != -100
+        nonfinite_student = valid_mask & ~torch.isfinite(student_actual_logprobs)
+        if nonfinite_student.any():
+            nonfinite_count = int(nonfinite_student.sum().item())
+            total_required = int(valid_mask.sum().item())
+            raise FloatingPointError(
+                f"Student logprobs are non-finite for required IW-OPD positions: {nonfinite_count}/{total_required}."
+            )
         missing_teacher = valid_mask & ~torch.isfinite(teacher_actual_logprobs)
         if missing_teacher.any():
             missing_count = int(missing_teacher.sum().item())
@@ -1253,6 +1517,15 @@ class IWOPDTrainer(_BaseTrainer):
         safe_teacher_logprobs = torch.where(valid_mask, teacher_actual_logprobs, 0.0)
         if rollout_logprobs is None:
             rollout_logprobs = student_actual_logprobs
+        else:
+            nonfinite_rollout = valid_mask & ~torch.isfinite(rollout_logprobs)
+            if nonfinite_rollout.any():
+                nonfinite_count = int(nonfinite_rollout.sum().item())
+                total_required = int(valid_mask.sum().item())
+                raise ValueError(
+                    "Rollout logprobs are non-finite for required IW-OPD positions: "
+                    f"{nonfinite_count}/{total_required}."
+                )
         safe_rollout_logprobs = torch.where(valid_mask, rollout_logprobs, 0.0)
         a_opd = (safe_teacher_logprobs - safe_rollout_logprobs).detach()
         a_opd = torch.where(valid_mask, a_opd, torch.zeros_like(a_opd))
@@ -1265,6 +1538,23 @@ class IWOPDTrainer(_BaseTrainer):
 
         loss = -student_actual_logprobs * advantages
         loss = torch.where(valid_mask, loss, torch.zeros_like(loss))
+        nonfinite_loss = valid_mask & ~torch.isfinite(loss)
+        if nonfinite_loss.any():
+
+            def _range(values: torch.Tensor) -> str:
+                required = values[valid_mask]
+                return f"[{required.min().item():.6g}, {required.max().item():.6g}]"
+
+            nonfinite_count = int(nonfinite_loss.sum().item())
+            total_required = int(valid_mask.sum().item())
+            raise FloatingPointError(
+                "IW-OPD token loss is non-finite after finite inputs: "
+                f"{nonfinite_count}/{total_required}; "
+                f"student_logprobs={_range(student_actual_logprobs)}, "
+                f"teacher_logprobs={_range(safe_teacher_logprobs)}, "
+                f"rollout_logprobs={_range(safe_rollout_logprobs)}, "
+                f"advantages={_range(advantages)}, weights={_range(weights)}."
+            )
 
         with torch.no_grad():
             mode = "train" if self.model.training else "eval"
@@ -1430,8 +1720,11 @@ class IWOPDTrainer(_BaseTrainer):
             if comp_len == 0:
                 completion_offsets.append(0)
                 continue
-            completion_start = int(torch.nonzero(sample_mask, as_tuple=False)[0].item())
-            completion_offsets.append(completion_start - aligned_prompt_length)
+            if inputs.get("prompt_length") is not None:
+                completion_offsets.append(0)
+            else:
+                completion_start = int(torch.nonzero(sample_mask, as_tuple=False)[0].item())
+                completion_offsets.append(completion_start - aligned_prompt_length)
 
         # Size the output tensors to tightly fit the teacher logprobs. Using the full padded
         # sequence length would include padding positions with -inf teacher logprobs, producing
@@ -1578,6 +1871,9 @@ class IWOPDTrainer(_BaseTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         self._raise_if_local_teacher_tokenizer_mismatch()
+        # Prefer the post-generation count stamped by `_fill_buffer`: the Trainer-level value was counted before
+        # on-policy generation populated completion labels and can therefore be zero for a non-empty batch.
+        num_items_in_batch = inputs.get("num_items_in_batch", num_items_in_batch)
 
         if self.use_liger_loss:
             loss = self._compute_liger_loss(model, inputs, num_items_in_batch=num_items_in_batch)

@@ -70,6 +70,48 @@ where  \\( p_M \\)  is the  \\( \beta \\) -mixture of the two distributions. The
 
 In practice, the projection to vocabulary logits and the divergence are computed in chunks, so peak activation memory does not scale with the full vocabulary × sequence-length logits tensor. See [Reducing Memory Usage](reducing_memory_usage).
 
+### Experimental IW-OPD environment rollouts
+
+External environment rollouts belong to the experimental `IWOPDTrainer`, not
+the stable `DistillationTrainer`. Pass `rollout_func` when an environment owns
+student interaction. The callback receives structured prompts, the trainer,
+and source dataset records. It must return exact token ids rather than decoded
+text:
+
+```python
+from trl.experimental.iw_opd import IWOPDConfig, IWOPDTrainer
+
+
+def rollout_func(prompts, trainer, inputs):
+    trajectories = environment.run(prompts, policy=trainer.model)
+    return {
+        "prompt_ids": [trajectory.prompt_ids for trajectory in trajectories],
+        "prompt_lengths": [len(trajectory.prompt_ids) for trajectory in trajectories],
+        "completion_ids": [trajectory.completion_ids for trajectory in trajectories],
+        "completion_loss_mask": [trajectory.model_token_mask for trajectory in trajectories],
+        "logprobs": [trajectory.sampling_logprobs for trajectory in trajectories],
+        "rollout_ids": [trajectory.id for trajectory in trajectories],
+    }
+
+config = IWOPDConfig(
+    output_dir="student-iw-opd",
+    distillation_objective="iw_opd",
+    lmbda=1.0,
+)
+trainer = IWOPDTrainer(
+    model=student,
+    args=config,
+    train_dataset=prompt_dataset,
+    rollout_func=rollout_func,
+)
+```
+
+`completion_ids` may include tool or environment tokens needed as context for
+later student turns. Set the corresponding `completion_loss_mask` entries to
+`False`; the trainer keeps those tokens in the sequence while excluding them
+from the distillation loss. `logprobs` must align with every completion token,
+and each optional `rollout_id` must be unique within the generated batch.
+
 ### Expected dataset type
 
 The dataset should be formatted as a [conversational](dataset_formats#conversational) [prompt-only](dataset_formats#prompt-only) dataset. The student generates its own completions on-policy, so only the prompt is needed:

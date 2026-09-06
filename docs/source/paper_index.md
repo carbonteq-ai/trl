@@ -161,7 +161,7 @@ The DAPO algorithm includes 5 key components:
 - Clip-Higher
 - Soft Overlong Punishment
 - Token-level Loss
-- Dynamic Sampling (⚠️ Not supported in TRL)
+- Dynamic Sampling
 
 To reproduce the paper's setting, use this configuration:
 
@@ -176,6 +176,9 @@ training_args = GRPOConfig(
     # Clip-Higher
     epsilon_high=0.28, # DAPO paper: section 4.1
     epsilon=0.2, # DAPO paper: section 4.1
+    # Dynamic Sampling
+    dynamic_sampling=True,
+    dynamic_sampling_max_batches=10,
     # Other parameters used
     per_device_train_batch_size=512, # mini-batch size for training in the paper, DAPO paper: section 4.1
     num_generations=16, # number of sample responses in the paper, DAPO paper: section 4.1

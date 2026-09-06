@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import warnings
 from dataclasses import dataclass, field
 from typing import Any
@@ -164,6 +165,23 @@ class GRPOConfig(_BaseConfig):
         vllm_enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Enable vLLM sleep mode to offload weights/cache during the optimizer step. Keeps GPU memory usage low, but
             waking the engine adds host–device transfer latency.
+        vllm_speculative_config (`dict`, *optional*):
+            Engine-level speculative decoding configuration for colocated vLLM. For example,
+            `{"method": "qwen3_next_mtp", "num_speculative_tokens": 2}` enables native MTP on a compatible Qwen
+            model. This is ignored in server mode, where speculative decoding belongs to the separately launched
+            server.
+        vllm_engine_kwargs (`dict`, *optional*):
+            Additional colocated vLLM `LLM` engine arguments that TRL does not expose directly, such as
+            `{"skip_mm_profiling": True}` for a text-only run of a multimodal model. Keys already controlled by TRL
+            cannot be overridden. This is ignored in server mode, where engine arguments belong to the server.
+        vllm_weight_name_prefix (`str`, *optional*):
+            Prefix added to every training-model parameter name before synchronizing weights into vLLM. This supports
+            text-only training models whose vLLM implementation retains a composite-model namespace, such as
+            `"language_model."`. The prefix must end with `"."`.
+        vllm_weight_sync_mode (`str`, *optional*, defaults to `"full"`):
+            Colocated weight synchronization mode. `"full"` synchronizes merged model parameters. `"lora"` keeps
+            vLLM's base weights unchanged and dynamically reloads the active PEFT LoRA adapter. Use `"lora"` for
+            QLoRA policies because packed 4-bit parameter storage is not a full-precision weight tensor.
 
         > Parameters that control generation acceleration powered by transformers continuous batching
 
@@ -271,6 +289,25 @@ class GRPOConfig(_BaseConfig):
             - `"vespo"`: Variational Sequence-Level Soft Policy Optimization. Replaces hard clipping with a smooth,
               asymmetric Gamma weighting function applied directly to sequence-level importance weights. Introduced in
               the [VESPO paper](https://huggingface.co/papers/2602.10693).
+        dynamic_sampling (`bool`, *optional*, defaults to `False`):
+            Whether to keep only prompt groups whose rewards have non-zero variance and draw replacement prompt groups
+            until the generation batch is full. This is the dynamic sampling component of
+            [DAPO](https://huggingface.co/papers/2503.14476). Valid prompt groups are retained while bounded full-size
+            candidate batches are generated until the target is met.
+        dynamic_sampling_max_batches (`int`, *optional*, defaults to `10`):
+            Maximum number of candidate generation batches evaluated for one optimizer generation batch when dynamic
+            sampling is enabled. Training raises an error instead of silently using a partial batch when this limit is
+            exhausted.
+        dynamic_sampling_reward_std_epsilon (`float`, *optional*, defaults to `0.0`):
+            Minimum within-group reward standard deviation required to retain a prompt group during dynamic sampling.
+        active_sampling (`bool`, *optional*, defaults to `False`):
+            Filter prompt groups with zero reward spread and refill only the synchronized number of missing rows.
+            This preserves a full informative batch without regenerating an entire candidate batch on each refill,
+            following the active-sampling acceptance semantics published with OLMo 3.
+        active_sampling_max_batches (`int`, *optional*, defaults to `10`):
+            Maximum generation rounds used to fill one active-sampling training batch.
+        active_sampling_reward_std_epsilon (`float`, *optional*, defaults to `0.0`):
+            Minimum within-group reward standard deviation retained by active sampling.
         mask_truncated_completions (`bool`, *optional*, defaults to `False`):
             When enabled, truncated completions are excluded from the loss calculation, preventing them from being
             incorrectly penalized and introducing noise during training. According to the
@@ -325,6 +362,10 @@ class GRPOConfig(_BaseConfig):
             Maximum number of tool-calling turns when training an agent. If `None`, there is no limit and generation
             stops when the model generates a response turn with no tool calls or when the total response length reaches
             `max_model_length`.
+        logits_chunk_size (`int`, *optional*):
+            Maximum number of sequence positions projected through the language-model head at once when computing
+            per-token log probabilities. This reduces peak memory for long completions with large vocabularies without
+            changing the resulting log probabilities. If `None`, all requested positions are projected together.
         vllm_importance_sampling_correction (`bool`, *optional*, defaults to `True`):
             Whether to apply Importance Sampling (IS) to correct for the mismatch between vLLM completion logprobs and
             recomputed training logprobs. If set to `False`, no IS is applied regardless of
@@ -609,6 +650,35 @@ class GRPOConfig(_BaseConfig):
             "usage low, but waking the engine adds host–device transfer latency."
         },
     )
+    vllm_speculative_config: dict | None = field(
+        default=None,
+        metadata={
+            "help": "Engine-level speculative decoding configuration for colocated vLLM. In server mode this must "
+            "be configured on the server instead."
+        },
+    )
+    vllm_engine_kwargs: dict | None = field(
+        default=None,
+        metadata={
+            "help": "Additional non-conflicting LLM engine arguments for colocated vLLM. In server mode these must "
+            "be configured on the server instead."
+        },
+    )
+    vllm_weight_name_prefix: str | None = field(
+        default=None,
+        metadata={
+            "help": "Prefix added to training parameter names before vLLM weight synchronization. If provided, it "
+            "must end with `.`."
+        },
+    )
+    vllm_weight_sync_mode: str = field(
+        default="full",
+        metadata={
+            "help": "Colocated vLLM weight synchronization mode: `full` for model parameters or `lora` for the "
+            "active PEFT LoRA adapter. With sleep mode enabled, `lora` uses level-1 sleep so an immutable quantized "
+            "base can be restored without unsupported checkpoint reloading."
+        },
+    )
     vllm_structured_outputs_regex: str | None = field(
         default=None,
         metadata={"help": "Regex for vLLM structured outputs. If `None` (default), structured outputs is disabled."},
@@ -826,6 +896,43 @@ class GRPOConfig(_BaseConfig):
             "the [VESPO paper](https://huggingface.co/papers/2602.10693)."
         },
     )
+    dynamic_sampling: bool = field(
+        default=False,
+        metadata={
+            "help": "Keep prompt groups with non-zero reward variance and generate bounded full-size candidate "
+            "batches until the target is met, as introduced by DAPO."
+        },
+    )
+    dynamic_sampling_max_batches: int = field(
+        default=10,
+        metadata={"help": "Maximum candidate generation batches used to fill one dynamic-sampling training batch."},
+    )
+    dynamic_sampling_reward_std_epsilon: float = field(
+        default=0.0,
+        metadata={"help": "Minimum within-group reward standard deviation retained by dynamic sampling."},
+    )
+    active_sampling: bool = field(
+        default=False,
+        metadata={
+            "help": "Keep prompt groups with non-zero reward variance and refill only the synchronized number of "
+            "missing rows, following the active-sampling acceptance semantics published with OLMo 3."
+        },
+    )
+    active_sampling_max_batches: int = field(
+        default=10,
+        metadata={"help": "Maximum generation rounds used to fill one active-sampling training batch."},
+    )
+    active_sampling_reward_std_epsilon: float = field(
+        default=0.0,
+        metadata={"help": "Minimum within-group reward standard deviation retained by active sampling."},
+    )
+    use_precomputed_advantages: bool = field(
+        default=False,
+        metadata={
+            "help": "Use token-aligned advantages returned by rollout_func instead of trainer-computed scalar "
+            "group advantages. Intended for hierarchical agentic objectives such as SAMPO."
+        },
+    )
     mask_truncated_completions: bool = field(
         default=False,
         metadata={
@@ -915,6 +1022,13 @@ class GRPOConfig(_BaseConfig):
             "response length reaches `max_model_length`."
         },
     )
+    logits_chunk_size: int | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum sequence positions per language-model-head projection when computing per-token "
+            "log probabilities. Reduces peak memory for long completions without changing the objective."
+        },
+    )
     vllm_importance_sampling_correction: bool = field(
         default=True,
         metadata={
@@ -922,6 +1036,23 @@ class GRPOConfig(_BaseConfig):
             "completion logprobs and recomputed training logprobs. If set to `False`, no IS is applied "
             "regardless of `vllm_importance_sampling_mode`. When `True`, the selected mode determines how "
             "IS ratios are computed and constrained."
+        },
+    )
+    vllm_policy_parity_max_mean_logp_delta: float | None = field(
+        default=0.05,
+        metadata={
+            "help": "Maximum allowed mean absolute per-token raw log-probability difference between a teacher-forced "
+            "vLLM parity probe and the training actor on the first training rollout. The trainer fails before "
+            "optimization when the difference exceeds this value. Behavior-policy log-probabilities after sampling "
+            "processors remain separate and are used for importance sampling. Set to `None` only to opt out for "
+            "deliberately off-policy research."
+        },
+    )
+    vllm_policy_parity_max_tokens: int = field(
+        default=16384,
+        metadata={
+            "help": "Maximum selected completion tokens per process in the first-rollout vLLM weight-parity probe. "
+            "This bounds the one-time teacher-forced prefill without weakening the configured delta threshold."
         },
     )
     vllm_importance_sampling_mode: str = field(
@@ -1124,6 +1255,74 @@ class GRPOConfig(_BaseConfig):
                 "GRPO requires at least 2 generations per prompt to calculate the advantages. You provided "
                 f"{self.num_generations}, which is less than the minimum required."
             )
+
+        if self.dynamic_sampling:
+            if self.loss_type != "dapo" and not self.use_precomputed_advantages:
+                raise ValueError(
+                    "dynamic_sampling requires loss_type='dapo' unless rollout_func supplies precomputed advantages"
+                )
+            if self.multi_objective_aggregation != "sum_then_normalize" or self.scale_rewards not in ["group", "none"]:
+                raise ValueError(
+                    "dynamic_sampling requires sum_then_normalize aggregation and group-local reward statistics"
+                )
+            if self.dynamic_sampling_max_batches < 1:
+                raise ValueError("dynamic_sampling_max_batches must be a positive integer")
+            if (
+                not math.isfinite(self.dynamic_sampling_reward_std_epsilon)
+                or self.dynamic_sampling_reward_std_epsilon < 0
+            ):
+                raise ValueError("dynamic_sampling_reward_std_epsilon must be a finite non-negative number")
+            local_generation_batch_size = self.generation_batch_size // num_processes
+            if local_generation_batch_size % self.num_generations != 0:
+                raise ValueError(
+                    "dynamic_sampling requires each process's generation batch to contain complete prompt groups; "
+                    f"generation_batch_size / world_size ({local_generation_batch_size}) must be divisible by "
+                    f"num_generations ({self.num_generations})"
+                )
+        if self.active_sampling:
+            if self.dynamic_sampling:
+                raise ValueError(
+                    "active_sampling and dynamic_sampling are separate refill strategies; enable only one"
+                )
+            if self.loss_type != "dapo" and not self.use_precomputed_advantages:
+                raise ValueError(
+                    "active_sampling requires loss_type='dapo' unless rollout_func supplies precomputed advantages"
+                )
+            if self.multi_objective_aggregation != "sum_then_normalize" or self.scale_rewards not in ["group", "none"]:
+                raise ValueError(
+                    "active_sampling requires sum_then_normalize aggregation and group-local reward statistics"
+                )
+            if self.active_sampling_max_batches < 1:
+                raise ValueError("active_sampling_max_batches must be a positive integer")
+            if (
+                not math.isfinite(self.active_sampling_reward_std_epsilon)
+                or self.active_sampling_reward_std_epsilon < 0
+            ):
+                raise ValueError("active_sampling_reward_std_epsilon must be a finite non-negative number")
+            local_generation_batch_size = self.generation_batch_size // num_processes
+            if local_generation_batch_size % self.num_generations != 0:
+                raise ValueError(
+                    "active_sampling requires each process's generation batch to contain complete prompt groups; "
+                    f"generation_batch_size / world_size ({local_generation_batch_size}) must be divisible by "
+                    f"num_generations ({self.num_generations})"
+                )
+        if self.use_precomputed_advantages and self.use_liger_kernel:
+            raise ValueError("use_precomputed_advantages is not supported by the Liger GRPO kernel")
+
+        if self.logits_chunk_size is not None and self.logits_chunk_size < 1:
+            raise ValueError("logits_chunk_size must be a positive integer when provided.")
+
+        if self.vllm_policy_parity_max_mean_logp_delta is not None and (
+            not math.isfinite(self.vllm_policy_parity_max_mean_logp_delta)
+            or self.vllm_policy_parity_max_mean_logp_delta <= 0
+        ):
+            raise ValueError("vllm_policy_parity_max_mean_logp_delta must be a finite positive number or None")
+        if (
+            isinstance(self.vllm_policy_parity_max_tokens, bool)
+            or not isinstance(self.vllm_policy_parity_max_tokens, int)
+            or self.vllm_policy_parity_max_tokens < 1
+        ):
+            raise ValueError("vllm_policy_parity_max_tokens must be a positive integer")
 
         if self.vllm_importance_sampling_cap is not None:
             warnings.warn(

@@ -25,6 +25,7 @@ from datasets import Dataset, DatasetDict, IterableDatasetDict, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from trl.experimental.iw_opd import IWOPDConfig, IWOPDTrainer
+from trl.experimental.iw_opd import iw_opd_trainer as iw_opd_trainer_module
 from trl.experimental.iw_opd.iw_opd_trainer import (
     _add_tail_bucket,
     _jsd_divergence,
@@ -97,6 +98,106 @@ class RecordingTeacherClient:
         return self.result
 
 
+class TinyDecodeTokenizer:
+    pad_token_id = 0
+
+    @staticmethod
+    def decode(token_ids, skip_special_tokens=False):
+        return " ".join(str(token_id) for token_id in token_ids)
+
+
+def _external_rollout_trainer(rollout_func):
+    trainer = MagicMock()
+    trainer.rollout_func = rollout_func
+    trainer.processing_class = TinyDecodeTokenizer()
+    trainer.accelerator.device = torch.device("cpu")
+    trainer.generation_config.max_new_tokens = 8
+    trainer._buffered_inputs = [None]
+    trainer._buffered_text_logs = [None]
+    return trainer
+
+
+def _external_rollout_slice():
+    return {
+        "prompts": torch.tensor([[10, 11]], dtype=torch.long),
+        "prompt_attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
+        "messages": [[{"role": "user", "content": "question"}]],
+        "rollout_inputs": [{"example_id": "example-1"}],
+    }
+
+
+def test_external_rollout_preserves_sparse_multiturn_tokens_and_iw_opd_logprobs():
+    def rollout_func(prompts, trainer, inputs):
+        assert prompts == [[{"role": "user", "content": "question"}]]
+        assert inputs == [{"example_id": "example-1", "prompt_ids": [10, 11], "input": prompts[0]}]
+        return {
+            "prompt_ids": [[10, 11]],
+            "prompt_lengths": [2],
+            "completion_ids": [[20, 30, 21]],
+            "completion_loss_mask": [[True, False, True]],
+            "logprobs": [[-0.1, 0.0, -0.2]],
+            "rollout_ids": ["rollout-1"],
+        }
+
+    trainer = _external_rollout_trainer(rollout_func)
+    IWOPDTrainer._generate_with_rollout_func(trainer, [_external_rollout_slice()], [0])
+
+    buffered = trainer._buffered_inputs[0]
+    assert buffered["input_ids"].tolist() == [[10, 11, 20, 30, 21]]
+    assert buffered["attention_mask"].tolist() == [[1, 1, 1, 1, 1]]
+    assert buffered["labels"].tolist() == [[-100, -100, 20, -100, 21]]
+    assert buffered["completion_loss_mask"].tolist() == [[True, False, True]]
+    assert buffered["rollout_logprobs"].tolist()[0] == pytest.approx([0.0, 0.0, -0.1, 0.0, -0.2])
+    assert buffered["prompt_length"] == 2
+    assert buffered["rollout_ids"] == ["rollout-1"]
+    assert IWOPDTrainer._compute_prompt_length(trainer, buffered) == 2
+
+    sequences, prompt_lengths, completion_lengths = build_teacher_request_inputs(
+        buffered["input_ids"],
+        buffered["attention_mask"],
+        prompt_attention_mask=buffered["prompt_attention_mask"],
+        labels=buffered["labels"],
+    )
+    assert sequences == [[10, 11, 20, 30, 21]]
+    assert prompt_lengths == [2]
+    assert completion_lengths == [3]
+
+
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        ({"prompt_lengths": []}, "must contain 1 items"),
+        ({"prompt_lengths": [1]}, "must equal"),
+        ({"completion_loss_mask": [[True]]}, "must align"),
+        ({"completion_loss_mask": [[False, False, False]]}, "must select at least one"),
+        ({"rollout_ids": ["same", "same"]}, "must align"),
+    ],
+)
+def test_external_rollout_rejects_malformed_results(update, message):
+    output = {
+        "prompt_ids": [[10, 11]],
+        "prompt_lengths": [2],
+        "completion_ids": [[20, 30, 21]],
+        "completion_loss_mask": [[True, False, True]],
+        "logprobs": [[-0.1, 0.0, -0.2]],
+    }
+    output.update(update)
+    trainer = _external_rollout_trainer(lambda *args, **kwargs: output)
+
+    with pytest.raises(ValueError, match=message):
+        IWOPDTrainer._generate_with_rollout_func(trainer, [_external_rollout_slice()], [0])
+
+
+def test_generate_student_completions_uses_default_model_path_without_rollout_func():
+    trainer = MagicMock()
+    trainer.rollout_func = None
+    trainer.use_vllm = False
+
+    IWOPDTrainer._generate_student_completions.__wrapped__(trainer, [{}], [0])
+
+    trainer._generate_with_model.assert_called_once_with([{}], [0])
+
+
 def _ragged_server_response():
     # Two samples with completion lengths 1 and 3 respectively; matches the wire format
     # of VLLMClient.get_sequence_logprobs (per-sample shape (comp_len, top_k=1)).
@@ -151,6 +252,131 @@ def test_distillation_config_rejects_liger_with_teacher_server(tmp_path):
 def test_distillation_config_rejects_invalid_reverse_kl_top_1_mode(tmp_path):
     with pytest.raises(ValueError, match="reverse_kl_top_1_mode must be one of"):
         IWOPDConfig(**_make_distillation_config_kwargs(tmp_path), reverse_kl_top_1_mode="invalid")
+
+
+def test_distillation_config_accepts_colocated_vllm_engine_options(tmp_path):
+    speculative = {"method": "mtp", "num_speculative_tokens": 3}
+    config = IWOPDConfig(
+        **_make_distillation_config_kwargs(tmp_path),
+        use_vllm=True,
+        vllm_mode="colocate",
+        vllm_weight_sync_mode="lora",
+        vllm_speculative_config=speculative,
+        vllm_engine_kwargs={"kv_cache_dtype": "turboquant_k8v4"},
+    )
+
+    assert config.vllm_speculative_config == speculative
+    assert config.vllm_engine_kwargs == {"kv_cache_dtype": "turboquant_k8v4"}
+    assert config.vllm_weight_sync_mode == "lora"
+
+
+def test_distillation_config_accepts_generic_sampling_controls(tmp_path):
+    config = IWOPDConfig(
+        **_make_distillation_config_kwargs(tmp_path),
+        min_p=0.01,
+        repetition_penalty=1.1,
+        generation_kwargs={"presence_penalty": 1.5},
+    )
+
+    assert config.min_p == 0.01
+    assert config.repetition_penalty == 1.1
+    assert config.generation_kwargs == {"presence_penalty": 1.5}
+
+
+def test_iw_opd_trainer_forwards_complete_sampling_controls(monkeypatch, tmp_path):
+    captured = {}
+
+    class DummyModel:
+        def __init__(self):
+            config = SimpleNamespace(_name_or_path="student", vocab_size=17)
+            config.get_text_config = lambda: config
+            self.config = config
+            self.generation_config = SimpleNamespace(eos_token_id=2)
+
+    class DummyProcessingClass:
+        pad_token_id = 0
+        pad_token = "<pad>"
+
+    def fake_base_init(
+        self,
+        model,
+        args=None,
+        data_collator=None,
+        train_dataset=None,
+        eval_dataset=None,
+        processing_class=None,
+        compute_metrics=None,
+        callbacks=None,
+        optimizers=None,
+        preprocess_logits_for_metrics=None,
+    ):
+        del (
+            data_collator,
+            train_dataset,
+            eval_dataset,
+            compute_metrics,
+            callbacks,
+            optimizers,
+            preprocess_logits_for_metrics,
+        )
+        self.model = model
+        self.args = args
+        self.processing_class = processing_class
+        self.accelerator = SimpleNamespace(device=torch.device("cpu"), num_processes=1)
+        self.is_deepspeed_enabled = False
+
+    class CapturingVLLMGeneration:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(iw_opd_trainer_module._BaseTrainer, "__init__", fake_base_init)
+    monkeypatch.setattr(iw_opd_trainer_module, "is_vllm_available", lambda: True)
+    monkeypatch.setattr(iw_opd_trainer_module, "VLLMGeneration", CapturingVLLMGeneration)
+
+    config = IWOPDConfig(
+        **_make_distillation_config_kwargs(tmp_path),
+        use_vllm=True,
+        disable_dropout=False,
+        min_p=0.01,
+        repetition_penalty=1.1,
+        generation_kwargs={"presence_penalty": 1.5},
+    )
+    trainer = IWOPDTrainer(
+        model=DummyModel(),
+        teacher_model=None,
+        args=config,
+        data_collator=object(),
+        processing_class=DummyProcessingClass(),
+    )
+
+    assert trainer.top_k == 0
+    assert trainer.min_p == 0.01
+    assert trainer.repetition_penalty == 1.1
+    assert trainer.generation_config.min_p == 0.01
+    assert trainer.generation_config.repetition_penalty == 1.1
+    assert trainer.generation_config.presence_penalty == 1.5
+    assert captured["min_p"] == 0.01
+    assert captured["repetition_penalty"] == 1.1
+    assert captured["generation_kwargs"] == {"presence_penalty": 1.5}
+
+
+@pytest.mark.parametrize("value", ["adapter", "", "FULL"])
+def test_distillation_config_rejects_invalid_vllm_weight_sync_mode(tmp_path, value):
+    with pytest.raises(ValueError, match="vllm_weight_sync_mode must be either"):
+        IWOPDConfig(
+            **_make_distillation_config_kwargs(tmp_path),
+            vllm_weight_sync_mode=value,
+        )
+
+
+def test_distillation_config_rejects_lora_weight_sync_in_server_mode(tmp_path):
+    with pytest.raises(ValueError, match="requires vllm_mode='colocate'"):
+        IWOPDConfig(
+            **_make_distillation_config_kwargs(tmp_path),
+            use_vllm=True,
+            vllm_mode="server",
+            vllm_weight_sync_mode="lora",
+        )
 
 
 def test_distillation_config_rejects_invalid_distillation_objective(tmp_path):
@@ -309,6 +535,33 @@ def test_build_teacher_request_inputs(
 
 
 class TestGetTeacherTokenLogprobsFromServer(TrlTestCase):
+    def test_explicit_prompt_boundary_keeps_sparse_multiturn_positions_aligned(self):
+        mock_self = MagicMock()
+        mock_self.teacher_client.get_sequence_logprobs = MagicMock(
+            return_value={
+                "logprobs": [[[-1.0], [-2.0], [-3.0]]],
+                "logprob_token_ids": [[[20], [30], [21]]],
+                "actual_logprobs": [[[-1.0], [-2.0], [-3.0]]],
+            }
+        )
+        mock_self.loss_top_k = 1
+        mock_self.temperature = 1.0
+        inputs = {
+            "input_ids": torch.tensor([[10, 11, 20, 30, 21]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 1, 1]]),
+            "prompt_attention_mask": torch.tensor([[1, 1]]),
+            "prompt_length": 2,
+            "labels": torch.tensor([[-100, -100, 20, -100, 21]]),
+        }
+
+        out = IWOPDTrainer._get_teacher_token_logprobs_from_server(mock_self, inputs, aligned_prompt_length=2)
+
+        torch.testing.assert_close(out["actual_logprobs"], torch.tensor([[-1.0, -2.0, -3.0]]))
+        assert out["topk_token_ids"].squeeze(-1).tolist() == [[20, 30, 21]]
+        call = mock_self.teacher_client.get_sequence_logprobs.call_args.kwargs
+        assert call["sequences"] == [[10, 11, 20, 30, 21]]
+        assert call["prompt_lengths"] == [2]
+
     def test_variable_lengths_use_neg_inf_sentinel_at_padding(self):
         mock_self = MagicMock()
         mock_self.teacher_client.get_sequence_logprobs = MagicMock(return_value=_ragged_server_response())
@@ -606,6 +859,48 @@ class TestIWOPDTrainer(TrlTestCase):
         # Doubling the global count exactly halves the loss (sum / num_items is linear in 1/num_items).
         torch.testing.assert_close(loss_double, loss_mean / 2, rtol=1e-4, atol=1e-6)
 
+    def test_on_policy_rollout_stamps_post_generation_num_items_in_batch(self):
+        dataset = Dataset.from_list([{"messages": [{"role": "user", "content": "Hello"}]}] * 4)
+
+        def rollout_func(prompts, trainer, *, inputs):
+            del trainer, prompts
+            prompt_ids = [row["prompt_ids"] for row in inputs]
+            completion_ids = [[7, 8, 9] for _ in inputs]
+            return {
+                "prompt_ids": prompt_ids,
+                "prompt_lengths": [len(prompt) for prompt in prompt_ids],
+                "completion_ids": completion_ids,
+                "completion_loss_mask": [[True, True, True] for _ in inputs],
+                "logprobs": [[0.0, 0.0, 0.0] for _ in inputs],
+                "rollout_ids": [f"trace-{index}" for index in range(len(inputs))],
+            }
+
+        trainer = IWOPDTrainer(
+            model=self.model_id,
+            teacher_model=self.model_id,
+            args=self._make_args(lmbda=1.0, distillation_objective="iw_opd"),
+            train_dataset=dataset,
+            processing_class=self.tokenizer,
+            rollout_func=rollout_func,
+        )
+
+        recorded = {}
+        original_compute_loss = trainer.compute_loss
+
+        def spy_compute_loss(model, inputs, return_outputs=False, num_items_in_batch=None):
+            recorded["stamped"] = inputs.get("num_items_in_batch")
+            recorded["trainer_level"] = num_items_in_batch
+            return original_compute_loss(
+                model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
+            )
+
+        trainer.compute_loss = spy_compute_loss
+        train_result = trainer.train()
+
+        assert int(recorded["trainer_level"]) == 0
+        assert int(recorded["stamped"]) == 6
+        assert math.isfinite(train_result.metrics["train_loss"])
+
     @require_liger_kernel
     @require_torch_accelerator
     def test_distillation_trainer_with_liger(self):
@@ -742,6 +1037,61 @@ class TestIWOPDTrainer(TrlTestCase):
         expected_advantage_sum = (teacher_actual_logprobs - rollout_logprobs).sum()
         expected = -current_student_logprob * expected_advantage_sum / 2
         torch.testing.assert_close(loss, expected)
+
+    def test_iw_opd_rejects_nonfinite_required_logprobs(self):
+        trainer = IWOPDTrainer.__new__(IWOPDTrainer)
+        trainer.temperature = 1.0
+        trainer.iw_opd_gamma = 0.0
+        trainer.iw_opd_epsilon = 1e-8
+        trainer._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        trainer.model = SimpleNamespace(training=True)
+
+        completion_tokens = torch.tensor([[0, 1]])
+        labels = torch.tensor([[0, 1]])
+        teacher_actual_logprobs = torch.tensor([[-0.2, -0.1]])
+        finite_logits = torch.zeros(1, 2, 4)
+
+        invalid_student_logits = finite_logits.clone()
+        invalid_student_logits[0, 0] = float("-inf")
+        with pytest.raises(FloatingPointError, match="Student logprobs.*1/2"):
+            trainer._compute_iw_opd_loss(
+                student_logits=invalid_student_logits,
+                completion_tokens=completion_tokens,
+                labels=labels,
+                teacher_actual_logprobs=teacher_actual_logprobs,
+            )
+
+        with pytest.raises(ValueError, match="Rollout logprobs.*1/2"):
+            trainer._compute_iw_opd_loss(
+                student_logits=finite_logits,
+                completion_tokens=completion_tokens,
+                labels=labels,
+                teacher_actual_logprobs=teacher_actual_logprobs,
+                rollout_logprobs=torch.tensor([[float("-inf"), -0.3]]),
+            )
+
+    def test_iw_opd_rejects_loss_overflow_with_input_ranges(self):
+        trainer = IWOPDTrainer.__new__(IWOPDTrainer)
+        trainer.temperature = 1.0
+        trainer.iw_opd_gamma = 0.0
+        trainer.iw_opd_epsilon = 1e-8
+        trainer._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        trainer.model = SimpleNamespace(training=True)
+
+        # The gathered student logprob is finite, but multiplying it by a
+        # finite advantage overflows float32. This must be diagnosed at the
+        # token-loss boundary instead of surfacing as an aggregate trainer log.
+        student_logits = torch.tensor([[[0.0, -3e38]]])
+        completion_tokens = torch.tensor([[1]])
+        labels = torch.tensor([[1]])
+        with pytest.raises(FloatingPointError, match="token loss is non-finite.*student_logprobs=.*advantages="):
+            trainer._compute_iw_opd_loss(
+                student_logits=student_logits,
+                completion_tokens=completion_tokens,
+                labels=labels,
+                teacher_actual_logprobs=torch.tensor([[1.0]]),
+                rollout_logprobs=torch.tensor([[-1.0]]),
+            )
 
         # Buffer layout: with mixed prompt lengths, prompt_length (shortest real prompt) is smaller than the
         # padded prompt width, so rollout logprobs must be stored at full sequence width to survive the

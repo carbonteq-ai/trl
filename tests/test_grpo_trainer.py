@@ -87,6 +87,81 @@ async def async_multiply_tool(a: int, b: int) -> int:
     return a * b
 
 
+def _policy_parity_trainer(limit: float | None = 0.05) -> GRPOTrainer:
+    trainer = object.__new__(GRPOTrainer)
+    trainer.vllm_policy_parity_max_mean_logp_delta = limit
+    trainer._vllm_policy_parity_checked = False
+    return trainer
+
+
+def test_vllm_policy_parity_gate_accepts_first_training_rollout_once():
+    trainer = _policy_parity_trainer()
+
+    trainer._enforce_vllm_policy_parity("train", 0.014, 128)
+    trainer._enforce_vllm_policy_parity("train", 1.0, 128)
+
+    assert trainer._vllm_policy_parity_checked is True
+
+
+def test_vllm_policy_parity_gate_rejects_mismatched_first_training_rollout():
+    trainer = _policy_parity_trainer()
+
+    with pytest.raises(RuntimeError, match=r"0\.253000 exceeds 0\.050000.*128 selected tokens"):
+        trainer._enforce_vllm_policy_parity("train", 0.253, 128)
+
+    assert trainer._vllm_policy_parity_checked is False
+
+
+def test_vllm_policy_parity_gate_ignores_eval_and_allows_explicit_opt_out():
+    trainer = _policy_parity_trainer()
+    trainer._enforce_vllm_policy_parity("eval", 1.0, 128)
+    assert trainer._vllm_policy_parity_checked is False
+
+    disabled = _policy_parity_trainer(None)
+    disabled._enforce_vllm_policy_parity("train", 1.0, 0)
+    assert disabled._vllm_policy_parity_checked is False
+
+
+def test_vllm_policy_parity_gate_rejects_empty_evidence():
+    trainer = _policy_parity_trainer()
+
+    with pytest.raises(RuntimeError, match="no selected tokens"):
+        trainer._enforce_vllm_policy_parity("train", 0.0, 0)
+
+
+def test_vllm_policy_parity_probe_is_token_bounded_and_skips_masked_rows():
+    prompts, completions, masks, rows = GRPOTrainer._build_vllm_policy_parity_probe(
+        prompt_ids=[[1], [2], [3]],
+        completion_ids=[[10, 11, 12], [20, 21], [30, 31, 32]],
+        loss_mask=torch.tensor(
+            [
+                [0, 0, 0],
+                [1, 0, 0],
+                [1, 0, 1],
+            ],
+            dtype=torch.bool,
+        ),
+        max_tokens=2,
+    )
+
+    assert prompts == [[2], [3]]
+    assert completions == [[20], [30]]
+    assert [mask.tolist() for mask in masks] == [[True], [True]]
+    assert rows == [1, 2]
+
+
+@pytest.mark.parametrize("value", [0, -1, True])
+def test_vllm_policy_parity_token_budget_requires_positive_value(tmp_path, value):
+    with pytest.raises(ValueError, match="max_tokens must be a positive integer"):
+        GRPOConfig(output_dir=tmp_path, vllm_policy_parity_max_tokens=value)
+
+
+@pytest.mark.parametrize("value", [0.0, -0.1, float("inf"), float("nan")])
+def test_vllm_policy_parity_limit_requires_positive_finite_value(tmp_path, value):
+    with pytest.raises(ValueError, match="finite positive"):
+        GRPOConfig(output_dir=tmp_path, vllm_policy_parity_max_mean_logp_delta=value)
+
+
 class TestGetHighEntropyMask(TrlTestCase):
     def get_high_entropy_mask(self, entropies, mask, threshold):
         """Helper method to test the get_high_entropy_mask functionality."""
@@ -173,6 +248,7 @@ class TestGRPORolloutDispatch:
         trainer._last_loaded_step = 1
         trainer.use_vllm = False
         trainer.use_transformers_continuous_batching = False
+        trainer.mask_truncated_completions = False
         trainer.vllm_generation = SimpleNamespace(sync_weights=MagicMock())
         trainer.processing_class = SimpleNamespace(
             batch_decode=MagicMock(return_value=["decoded"]),
@@ -214,7 +290,37 @@ class TestGRPORolloutDispatch:
         assert result[0] == [[1]]  # prompt_ids
         assert result[1] == [[2]]  # completion_ids
         assert result[2] == [[1]]  # tool_mask (from env_mask)
-        trainer.rollout_func.assert_called_once_with(["prompt"], trainer)
+        trainer.rollout_func.assert_called_once_with(["prompt"], trainer, inputs=None)
+
+    def test_generate_passes_aligned_dataset_rows_to_rollout_func(self):
+        trainer = self._make_trainer()
+        trainer.rollout_func = MagicMock(
+            return_value={
+                "prompt_ids": [[1]],
+                "completion_ids": [[2]],
+                "logprobs": [[-0.1]],
+            }
+        )
+        inputs = [{"prompt": "prompt", "example_id": "task/1"}]
+
+        trainer._generate(["prompt"], inputs=inputs)
+
+        trainer.rollout_func.assert_called_once_with(["prompt"], trainer, inputs=inputs)
+
+    def test_generate_uses_rollout_truncation_state(self):
+        trainer = self._make_trainer()
+        trainer.rollout_func = MagicMock(
+            return_value={
+                "prompt_ids": [[1]],
+                "completion_ids": [[7]],
+                "logprobs": [[-0.1]],
+                "is_truncated": [False],
+            }
+        )
+
+        trainer._generate(["prompt"])
+
+        assert trainer._metrics["train"]["completions/clipped_ratio"] == [0.0]
 
     def test_generate_rollout_func_syncs_vllm_weights_when_needed(self):
         trainer = self._make_trainer()
@@ -227,7 +333,7 @@ class TestGRPORolloutDispatch:
 
         trainer.vllm_generation.sync_weights.assert_called_once()
         assert trainer._last_loaded_step == trainer.state.global_step
-        trainer.rollout_func.assert_called_once_with(["prompt"], trainer)
+        trainer.rollout_func.assert_called_once_with(["prompt"], trainer, inputs=None)
 
     def test_generate_rollout_func_raises_when_required_keys_are_missing(self):
         trainer = self._make_trainer()
@@ -274,6 +380,26 @@ class TestTransformersContinuousBatchingContract:
 
 
 class TestGRPOTrainer(TrlTestCase):
+    def test_config_accepts_colocated_vllm_speculative_config(self):
+        speculative = {"method": "qwen3_next_mtp", "num_speculative_tokens": 2}
+
+        config = GRPOConfig(
+            output_dir=self.tmp_dir,
+            use_vllm=True,
+            vllm_mode="colocate",
+            vllm_enable_sleep_mode=True,
+            vllm_speculative_config=speculative,
+            vllm_engine_kwargs={"skip_mm_profiling": True},
+            vllm_weight_name_prefix="language_model.",
+            vllm_weight_sync_mode="full",
+            report_to="none",
+        )
+
+        assert config.vllm_speculative_config == speculative
+        assert config.vllm_engine_kwargs == {"skip_mm_profiling": True}
+        assert config.vllm_weight_name_prefix == "language_model."
+        assert config.vllm_weight_sync_mode == "full"
+
     def test_init_minimal(self):
         # Test that GRPOTrainer can be instantiated with only model, reward_model and train_dataset
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
@@ -2238,6 +2364,38 @@ class TestGRPOTrainer(TrlTestCase):
             model, input_ids, attention_mask, logits_to_keep=4, compute_entropy=True
         )
         assert not entropies.requires_grad
+
+    def test_logits_chunking_matches_unchunked_logprobs_and_entropy(self):
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+        trainer = GRPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            reward_funcs="trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5",
+            args=GRPOConfig(output_dir=self.tmp_dir, report_to="none", logits_chunk_size=2),
+            train_dataset=dataset,
+        )
+        model = trainer.model
+        input_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], device=model.device)
+        attention_mask = torch.ones_like(input_ids)
+
+        with torch.no_grad():
+            chunked_logps, chunked_entropies, _ = trainer._get_per_token_logps_and_entropies(
+                model,
+                input_ids,
+                attention_mask,
+                logits_to_keep=4,
+                compute_entropy=True,
+            )
+            trainer.logits_chunk_size = None
+            full_logps, full_entropies, _ = trainer._get_per_token_logps_and_entropies(
+                model,
+                input_ids,
+                attention_mask,
+                logits_to_keep=4,
+                compute_entropy=True,
+            )
+
+        torch.testing.assert_close(chunked_logps, full_logps)
+        torch.testing.assert_close(chunked_entropies, full_entropies)
 
     def test_train_with_entropy_filter(self):
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
