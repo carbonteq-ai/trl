@@ -128,6 +128,24 @@ trainer suite remains subject to its optional Flash Attention `kernels`
 runtime dependency. This local candidate is not part of the published post5
 package and has not passed changed-weight GPU qualification.
 
+### Async changed-weight parity gate (2026-09-09)
+
+`scripts/qualify_async_vllm_changed_weight.py` is the bounded native NCCL
+release gate left open by the lifecycle probe. It assigns distinct visible
+trainer and inference GPUs, teacher-forces one actor-selected token before and
+after changing the final normalization weight, sends the changed tensor through
+vLLM's native weight-transfer engine, resets the prefix cache, and requires the
+changed sampler log probability to match the reference actor within an
+explicit tolerance. It fails before engine construction unless two distinct
+GPUs are available.
+
+Two exploratory single-GPU attempts on the local RTX 3070 Ti were rejected and
+are not qualification evidence. The first confirmed that AsyncLLM's process
+boundary does not support sending an arbitrary callable through the frontend;
+the second used the supported NCCL transfer API and NCCL rejected assigning
+both ranks to one device. The probe now uses only the native NCCL path and
+requires a two-GPU job. No changed-weight parity result has passed yet.
+
 ### Custom async worker consumption and recovery seam (2026-09-09)
 
 The experimental async GRPO trainer now offers optional, backend-neutral hooks
@@ -338,6 +356,14 @@ artifacts.
 The bounded-sequence parity correction is covered by
 `test_vllm_policy_parity_probe_bounds_each_sequence_and_left_truncates_prompt`
 and the associated configuration validation in `tests/test_grpo_trainer.py`.
+
+Run the changed-weight gate only on a job with two distinct visible GPUs:
+
+    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    python scripts/qualify_async_vllm_changed_weight.py \
+      --model Qwen/Qwen2.5-0.5B-Instruct \
+      --trainer-device 0 --inference-device 1 \
+      --max-model-len 512 --gpu-memory-utilization 0.45
 
 Then run Ruff, the complete TRL test suite, and the Posttrain adapter contract
 tests. Publication is manual from Posttrain's repository-scoped retained-asset
