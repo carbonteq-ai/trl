@@ -9,6 +9,7 @@ commands:
     print(json.dumps({"torch": torch.__version__, "transformers": transformers.__version__, "vllm": vllm.__version__}, sort_keys=True))'
   - >-
     exec env VLLM_SERVER_DEV_MODE=1 HF_HUB_CACHE=/root/.cache/huggingface/hub
+    NCCL_SOCKET_IFNAME=enp209s0f1np1 GLOO_SOCKET_IFNAME=enp209s0f1np1
     vllm serve Qwen/Qwen2.5-0.5B-Instruct
     --host 0.0.0.0 --port 8000 --dtype half --enforce-eager
     --max-model-len 512 --max-num-seqs 2 --gpu-memory-utilization 0.45
