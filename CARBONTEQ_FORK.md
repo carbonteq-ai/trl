@@ -180,6 +180,25 @@ must still benchmark the FlashInfer path in a runtime with its kernels
 available; this qualification result is not evidence that disabling the
 sampler is throughput-neutral for other modes.
 
+`scripts/qualify_async_vllm_failure_boundary.py` exercises the corresponding
+live fail-closed path against the same external server. After initializing the
+real NCCL group, it deliberately requests `finish_weight_update` before
+`start_weight_update`. On 2026-09-09 vLLM rejected the transition with HTTP
+500; TRL prepared version 1 but published no version, its authoritative model
+version remained 0, and the server's selected-token log probability was
+exactly unchanged at `-1.2563054562` after explicit qualification cleanup.
+This closes the single-rank live control-failure gate. It does not qualify
+distributed multi-rank failure propagation, an optimizer update, or resume.
+
+The qualification server is disposable. vLLM 0.25.1 retains an initialized
+NCCL transfer group for the server lifetime, so a new probe process must use a
+fresh server process. A failed harness attempt also showed that the native
+client's server-initialization request runs in a background thread while the
+trainer joins the NCCL store; if the server rejects initialization immediately,
+the trainer can wait until the store timeout. Production initializes this group
+once per server, but bounded initialization-failure propagation remains an
+explicit distributed-runtime gate rather than a claimed result.
+
 ### Custom async worker consumption and recovery seam (2026-09-09)
 
 The experimental async GRPO trainer now offers optional, backend-neutral hooks
@@ -403,6 +422,13 @@ Then run the gate on a distinct trainer GPU that can reach the server and can
 itself be reached by the server's NCCL rank:
 
     python scripts/qualify_async_vllm_changed_weight.py \
+      --model Qwen/Qwen2.5-0.5B-Instruct \
+      --server-url http://SERVER_IP:8000 --trainer-device cuda:0
+
+Use a fresh server process, then run the live fail-closed gate from the trainer
+GPU:
+
+    python scripts/qualify_async_vllm_failure_boundary.py \
       --model Qwen/Qwen2.5-0.5B-Instruct \
       --server-url http://SERVER_IP:8000 --trainer-device cuda:0
 
