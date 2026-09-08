@@ -5,7 +5,10 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
-Fork status: `candidate`, version `1.12.0.post2`, checkpoint-recovery correction.
+Fork status: `candidate`, version `1.12.0.post3`, bounded raw-parity correction.
+Post3 source branch: `codex/trl-parity-probe-bound`. Publication and live GPU
+qualification remain open.
+Previous post2 checkpoint-recovery release follows.
 Post2 release commit: `95a787b6c04f91a5d485fd827d31b1e1fb67ae8e`.
 Tag: `carbonteq-v1.12.0.post2` (retained GitHub prerelease).
 Wheel SHA-256: `8b19cd7fad5a28cf9ced4a7fac93bfaaedaac154faf019a3d3dd6abeaaa45c26`.
@@ -170,6 +173,14 @@ deterministic, token-bounded probe through vLLM prompt-logprob collection;
 existing processed delta remains the TIS input and diagnostic. Truncated or
 masked rows are excluded from the parity probe.
 
+The one-time raw-parity probe also has an independent prompt-plus-completion
+sequence bound. It left-truncates only the probe prompt and sends that exact
+bounded context to both vLLM and the actor. Actor recomputation runs only over
+the selected probe rows, rather than the full padded rollout batch. This keeps
+the synchronization gate meaningful while preventing a safety check from
+materializing an unrelated production-sized actor forward; rollout and update
+sequences are unchanged.
+
 ## Compatibility constraints
 
 - Package baseline: Python 3.10+, Transformers as declared by upstream 1.12.0,
@@ -231,6 +242,10 @@ Before publication, the exact candidate wheel must also pass a real colocated
 LoRA canary that records finite raw parity below the configured tolerance,
 independent processed TIS evidence, one optimizer update, and adapter-only
 artifacts.
+
+The bounded-sequence parity correction is covered by
+`test_vllm_policy_parity_probe_bounds_each_sequence_and_left_truncates_prompt`
+and the associated configuration validation in `tests/test_grpo_trainer.py`.
 
 Then run Ruff, the complete TRL test suite, and the Posttrain adapter contract
 tests. Publication is manual from Posttrain's repository-scoped retained-asset

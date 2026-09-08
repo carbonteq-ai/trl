@@ -2624,8 +2624,9 @@ class GRPOTrainer(_BaseTrainer):
         completion_ids: list[list[int]],
         loss_mask: torch.Tensor,
         max_tokens: int,
+        max_sequence_tokens: int,
     ) -> tuple[list[list[int]], list[list[int]], list[torch.Tensor], list[int]]:
-        """Select a deterministic, token-bounded prefix of locally trainable completions."""
+        """Select deterministic parity samples bounded by token count and sequence length."""
         probe_prompts: list[list[int]] = []
         probe_completions: list[list[int]] = []
         probe_masks: list[torch.Tensor] = []
@@ -2634,12 +2635,14 @@ class GRPOTrainer(_BaseTrainer):
         for row_index, (prompt, completion) in enumerate(zip(prompt_ids, completion_ids, strict=True)):
             row_mask = loss_mask[row_index, : len(completion)].bool()
             selected_positions = torch.nonzero(row_mask, as_tuple=False).flatten()
+            selected_positions = selected_positions[selected_positions < max_sequence_tokens - 1]
             if selected_positions.numel() == 0:
                 continue
             selected_count = min(int(selected_positions.numel()), remaining)
             last_position = int(selected_positions[selected_count - 1].item())
             prefix_length = last_position + 1
-            probe_prompts.append(prompt)
+            prompt_budget = max_sequence_tokens - prefix_length
+            probe_prompts.append(prompt[-prompt_budget:])
             probe_completions.append(completion[:prefix_length])
             probe_masks.append(row_mask[:prefix_length])
             source_rows.append(row_index)
@@ -2861,13 +2864,51 @@ class GRPOTrainer(_BaseTrainer):
                 completion_ids_list,
                 loss_mask.bool(),
                 self.vllm_policy_parity_max_tokens,
+                self.vllm_policy_parity_max_sequence_tokens,
             )
+            if not probe_prompts:
+                raise RuntimeError("vLLM policy parity probe found no trainable tokens within its sequence bound")
             with profiling_context(self, "vllm_policy_parity"):
                 vllm_raw_logps = self.vllm_generation.score_completion_logprobs(
                     probe_prompts,
                     probe_completions,
                 )
-            parity_probe = (vllm_raw_logps, probe_masks, source_rows)
+            probe_prompt_ids = [torch.tensor(ids) for ids in probe_prompts]
+            probe_prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in probe_prompt_ids]
+            probe_prompt_ids = pad(
+                probe_prompt_ids,
+                padding_value=self._tokenizer.pad_token_id,
+                padding_side="left",
+                pad_to_multiple_of=self.pad_to_multiple_of,
+            ).to(device=device)
+            probe_prompt_mask = pad(
+                probe_prompt_mask,
+                padding_value=0,
+                padding_side="left",
+                pad_to_multiple_of=self.pad_to_multiple_of,
+            ).to(device=device)
+            probe_completion_ids = [torch.tensor(ids) for ids in probe_completions]
+            probe_completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in probe_completion_ids]
+            probe_completion_ids = pad(
+                probe_completion_ids,
+                padding_value=self._tokenizer.pad_token_id,
+                padding_side="right",
+                pad_to_multiple_of=self.pad_to_multiple_of,
+            ).to(device=device)
+            probe_completion_mask = pad(
+                probe_completion_mask,
+                padding_value=0,
+                padding_side="right",
+                pad_to_multiple_of=self.pad_to_multiple_of,
+            ).to(device=device)
+            parity_probe = (
+                vllm_raw_logps,
+                probe_masks,
+                source_rows,
+                torch.cat([probe_prompt_ids, probe_completion_ids], dim=1),
+                torch.cat([probe_prompt_mask, probe_completion_mask], dim=1),
+                probe_completion_ids.size(1),
+            )
 
         # Concatenate prompt_mask with completion_mask for logit computation
         prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # (B, P+C)
@@ -3324,29 +3365,30 @@ class GRPOTrainer(_BaseTrainer):
             if parity_pending:
                 if parity_probe is None:
                     raise RuntimeError("vLLM policy parity probe evidence is missing")
-                vllm_raw_logps, probe_masks, source_rows = parity_probe
-                if self.temperature == 1.0:
-                    actor_raw_logps = old_per_token_logps
-                else:
-                    actor_raw_logps, _, _ = self._get_per_token_logps_and_entropies(
-                        self.model,
-                        prompt_completion_ids,
-                        attention_mask,
-                        logits_to_keep,
-                        batch_size,
-                        num_images=num_images,
-                        num_tiles=num_tiles,
-                        temperature=1.0,
-                        **forward_kwargs,
-                    )
+                (
+                    vllm_raw_logps,
+                    probe_masks,
+                    source_rows,
+                    probe_input_ids,
+                    probe_attention_mask,
+                    probe_logits_to_keep,
+                ) = parity_probe
+                actor_raw_logps, _, _ = self._get_per_token_logps_and_entropies(
+                    self.model,
+                    probe_input_ids,
+                    probe_attention_mask,
+                    probe_logits_to_keep,
+                    batch_size,
+                    temperature=1.0,
+                )
 
                 parity_deltas = []
-                for row_index, vllm_row, probe_mask in zip(
+                for _source_row, vllm_row, probe_mask in zip(
                     source_rows, vllm_raw_logps, probe_masks, strict=True
                 ):
                     if len(vllm_row) != len(probe_mask):
                         raise RuntimeError("vLLM parity log-probabilities do not align with the probe completion")
-                    row_actor_logps = actor_raw_logps[row_index, : len(vllm_row)]
+                    row_actor_logps = actor_raw_logps[len(parity_deltas), : len(vllm_row)]
                     row_vllm_logps = torch.tensor(vllm_row, device=device, dtype=row_actor_logps.dtype)
                     parity_deltas.append(torch.abs(row_actor_logps - row_vllm_logps).float()[probe_mask])
                 local_parity_delta = (

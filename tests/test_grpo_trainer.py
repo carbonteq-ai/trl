@@ -142,6 +142,7 @@ def test_vllm_policy_parity_probe_is_token_bounded_and_skips_masked_rows():
             dtype=torch.bool,
         ),
         max_tokens=2,
+        max_sequence_tokens=8,
     )
 
     assert prompts == [[2], [3]]
@@ -150,10 +151,31 @@ def test_vllm_policy_parity_probe_is_token_bounded_and_skips_masked_rows():
     assert rows == [1, 2]
 
 
+def test_vllm_policy_parity_probe_bounds_each_sequence_and_left_truncates_prompt():
+    prompts, completions, masks, rows = GRPOTrainer._build_vllm_policy_parity_probe(
+        prompt_ids=[[1, 2, 3, 4, 5]],
+        completion_ids=[[10, 11, 12, 13]],
+        loss_mask=torch.ones((1, 4), dtype=torch.bool),
+        max_tokens=4,
+        max_sequence_tokens=6,
+    )
+
+    assert prompts == [[4, 5]]
+    assert completions == [[10, 11, 12, 13]]
+    assert [mask.tolist() for mask in masks] == [[True, True, True, True]]
+    assert rows == [0]
+
+
 @pytest.mark.parametrize("value", [0, -1, True])
 def test_vllm_policy_parity_token_budget_requires_positive_value(tmp_path, value):
     with pytest.raises(ValueError, match="max_tokens must be a positive integer"):
         GRPOConfig(output_dir=tmp_path, vllm_policy_parity_max_tokens=value)
+
+
+@pytest.mark.parametrize("value", [0, 1, -1, True])
+def test_vllm_policy_parity_sequence_budget_requires_at_least_two_tokens(tmp_path, value):
+    with pytest.raises(ValueError, match="max_sequence_tokens must be an integer greater than one"):
+        GRPOConfig(output_dir=tmp_path, vllm_policy_parity_max_sequence_tokens=value)
 
 
 @pytest.mark.parametrize("value", [0.0, -0.1, float("inf"), float("nan")])

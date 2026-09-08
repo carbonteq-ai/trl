@@ -1055,6 +1055,13 @@ class GRPOConfig(_BaseConfig):
             "This bounds the one-time teacher-forced prefill without weakening the configured delta threshold."
         },
     )
+    vllm_policy_parity_max_sequence_tokens: int = field(
+        default=4096,
+        metadata={
+            "help": "Maximum prompt-plus-completion length of each teacher-forced vLLM policy-parity sample. "
+            "The probe left-truncates its prompt only; rollout and training sequences are unchanged."
+        },
+    )
     vllm_importance_sampling_mode: str = field(
         default="sequence_mask",
         metadata={
@@ -1323,6 +1330,12 @@ class GRPOConfig(_BaseConfig):
             or self.vllm_policy_parity_max_tokens < 1
         ):
             raise ValueError("vllm_policy_parity_max_tokens must be a positive integer")
+        if (
+            isinstance(self.vllm_policy_parity_max_sequence_tokens, bool)
+            or not isinstance(self.vllm_policy_parity_max_sequence_tokens, int)
+            or self.vllm_policy_parity_max_sequence_tokens < 2
+        ):
+            raise ValueError("vllm_policy_parity_max_sequence_tokens must be an integer greater than one")
 
         if self.vllm_importance_sampling_cap is not None:
             warnings.warn(
