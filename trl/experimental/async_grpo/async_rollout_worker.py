@@ -15,6 +15,7 @@
 import asyncio
 import enum
 import inspect
+import logging
 import multiprocessing as mp
 import os
 import pickle
@@ -34,7 +35,6 @@ from typing import Any, TypeAlias
 
 import aiohttp
 import numpy as np
-from accelerate.logging import get_logger
 from datasets import Dataset
 from transformers import PreTrainedTokenizerBase
 
@@ -49,12 +49,19 @@ from ...import_utils import is_vllm_available
 from ...trainer.utils import get_callable_name, print_prompt_completions_sample
 
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 Messages: TypeAlias = list[dict[str, str]]
 RolloutId: TypeAlias = str
 
 _RETRYABLE_HTTP_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError, ConnectionResetError)
+
+
+def _completed_task_result(task: asyncio.Task, stop_event: asyncio.Event) -> Any | None:
+    """Return a generation result, treating cancellation as normal only during shutdown."""
+    if task.cancelled() and stop_event.is_set():
+        return None
+    return task.result()
 
 
 @dataclass(frozen=True)
@@ -620,9 +627,9 @@ class _AsyncRolloutLoop:
                 for task in done:
                     group_id, slot, name, environment, prompt = inflight_tasks.pop(task)
                     free_slots.add(slot)
-                    if task.exception() is not None:
-                        raise task.exception()
-
+                    result = _completed_task_result(task, stop_event)
+                    if result is None:
+                        continue
                     (
                         completion,
                         completion_ids,
@@ -630,7 +637,7 @@ class _AsyncRolloutLoop:
                         tool_call_count,
                         tool_failure_count,
                         rollout_reward,
-                    ) = task.result()
+                    ) = result
                     group = pending_groups[group_id]
                     group.prompts.append(prompt)
                     group.completions.append(completion)

@@ -203,11 +203,12 @@ explicit distributed-runtime gate rather than a claimed result.
 
 The experimental async GRPO trainer now offers optional, backend-neutral hooks
 for custom rollout workers to receive the group identity of every sample
-admitted into a learner microbatch and to save or restore JSON scheduling state
-with the trainer checkpoint. The acknowledgement occurs at learner collation,
-not generation or queue publication, so an external task cursor does not move
-merely because speculative work was produced. Duplicate group identities are
-preserved because one microbatch may consume multiple siblings.
+actually dispatched to `training_step` and to save or restore JSON scheduling
+state with the trainer checkpoint. The collator only transports group IDs:
+Hugging Face dataloaders may prefetch and collate a later microbatch before the
+learner uses it, so acknowledging in the collator incorrectly advances an
+external task cursor. Duplicate group identities are preserved because one
+microbatch may consume multiple siblings.
 
 The trainer persists only the custom worker's declared scheduling metadata.
 It does not serialize queues, environments, model requests, subprocesses, or
@@ -217,6 +218,26 @@ their prior behavior. Focused tests cover per-sample acknowledgement and custom
 state save/load ordering. The Posttrain consumer must still enforce whole-group
 checkpoint boundaries for algorithms whose replay cannot tolerate a partially
 consumed group; this generic hook does not invent that algorithm policy.
+
+### Native async agent rollout qualification (2026-09-09)
+
+`scripts/qualify_async_agent_rollouts.py` exercises the original
+`AsyncRolloutWorker` rather than Posttrain's custom producer. A local
+Qwen3.5-2B vLLM server completed 16 groups of four trajectories with 64/64
+successful `record_choice` tool calls and zero tool failures. With the same
+model, prompt set, sampling controls, and 128-token cap, producer/server
+concurrency 32 completed in 18.7395 seconds (3.4152 samples/s), versus 46.7045
+seconds (1.3703 samples/s) at concurrency one: a 2.49x throughput increase and
+27.965 seconds, or 59.9%, less wall time for this bounded workload.
+
+The first live attempt exposed two standalone-lifecycle defects now covered by
+regressions: parent worker logging depended on pre-existing Accelerate state,
+and normal shutdown reported deliberately cancelled generation tasks as worker
+failures under Python 3.13. Worker lifecycle logging is now independent of the
+trainer and cancellation is suppressed only when the stop event is set; an
+unexpected cancellation still propagates. This gate establishes tool-capable
+async rollout behavior and concurrency benefit on one RTX 3070 Ti. It does not
+establish a 2B learner optimizer update or linear scaling to 32 requests.
 
 ### Stable-base integration (2026-09-06)
 

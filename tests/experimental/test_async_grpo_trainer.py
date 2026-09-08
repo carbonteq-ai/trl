@@ -15,6 +15,7 @@
 import asyncio
 import itertools
 import json
+import logging
 import math
 import multiprocessing as mp
 import os
@@ -51,6 +52,7 @@ from trl.experimental.async_grpo.async_rollout_worker import (
     _AsyncRolloutLoop,
     _chain_to_sequences,
     _common_prefix_len,
+    _completed_task_result,
     _SampleBuilder,
 )
 from trl.trainer.base_trainer import _BaseTrainer
@@ -77,6 +79,7 @@ class _StubRolloutWorker:
         self._samples_per_weight_sync = samples_per_weight_sync
         self._model_version = 0
         self._fork_k = fork_k
+        self.consumed_group_ids = []
         self._sample_iter = self._make_sample_iter(tokenizer, dataset, num_generations)
 
     def _make_sample_iter(self, tokenizer, dataset, num_generations):
@@ -132,6 +135,9 @@ class _StubRolloutWorker:
 
     def check_health(self, stale_after_s):
         pass
+
+    def acknowledge_consumed_samples(self, group_ids):
+        self.consumed_group_ids.extend(group_ids)
 
 
 class _StubWeightTransfer:
@@ -249,6 +255,28 @@ def test_prepare_model_update_waits_for_admitted_model_requests():
     thread.join()
 
 
+def test_rollout_worker_lifecycle_logging_is_trainer_independent():
+    """The standalone producer must not require Accelerate state just to log lifecycle events."""
+    assert isinstance(worker.logger, logging.Logger)
+
+
+def test_cancelled_generation_is_not_a_worker_failure_during_shutdown():
+    async def scenario():
+        task = asyncio.create_task(asyncio.sleep(60))
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        stop_event = asyncio.Event()
+        stop_event.set()
+        assert _completed_task_result(task, stop_event) is None
+
+        stop_event.clear()
+        with pytest.raises(asyncio.CancelledError):
+            _completed_task_result(task, stop_event)
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.skipif(
     not is_ampere_or_newer() and torch_device != "xpu",
     reason="Flash Attention 2 requires Ampere or newer GPU, or XPU",
@@ -275,17 +303,19 @@ class TestAsyncGRPOTrainer(TrlTestCase):
             learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
             per_device_train_batch_size=3,  # reduce the batch size to reduce memory usage
             num_generations=3,  # reduce the number of generations to reduce memory usage
+            max_steps=1,
             max_completion_length=8,  # reduce the completion length to reduce memory usage
-            token_budget=256,  # set explicitly; the stub worker has no real vLLM server to query for max_model_len
+            token_budget=-1,  # fixed count also exposes any acknowledgement caused only by dataloader prefetch
             vllm_server_timeout=5.0,  # short timeout so test fails fast if queue runs dry
             report_to="none",
         )
+        rollout_worker = _StubRolloutWorker(AutoTokenizer.from_pretrained(model_id), dataset, num_generations=3)
         trainer = AsyncGRPOTrainer(
             model=model_id,
             reward_funcs=dummy_reward_func,  # unused: the stub pre-computes rewards, but the trainer requires this argument
             args=training_args,
             train_dataset=dataset,
-            rollout_worker=_StubRolloutWorker(AutoTokenizer.from_pretrained(model_id), dataset, num_generations=3),
+            rollout_worker=rollout_worker,
             weight_transfer=_StubWeightTransfer(),
         )
 
@@ -294,6 +324,7 @@ class TestAsyncGRPOTrainer(TrlTestCase):
         trainer.train()
 
         assert trainer.state.log_history[-1]["train_loss"] is not None
+        assert rollout_worker.consumed_group_ids == [0, 0, 0]
 
         # Check that the params have changed
         for n, param in previous_trainable_params.items():
@@ -788,13 +819,8 @@ class TestPackingAwareBatching(TrlTestCase):
         assert collator.metrics["batch/samples_per_row"] == [2.0]
         assert collator.metrics["batch/pad_frac"] == [(0, 10)]  # rows pack equal -> no inter-rank padding
 
-    def test_collator_acknowledges_each_samples_group_identity(self):
-        acknowledged = []
-        collator = DataCollatorForRollout(
-            pad_token_id=0,
-            num_processes=2,
-            acknowledge_consumed_samples=lambda group_ids: acknowledged.append(tuple(group_ids)),
-        )
+    def test_collator_broadcasts_group_identity_without_consuming_prefetched_samples(self):
+        collator = DataCollatorForRollout(pad_token_id=0, num_processes=2)
         first = _rollout_sample(2)
         first["group_id"] = 7
         sibling = _rollout_sample(2)
@@ -802,10 +828,10 @@ class TestPackingAwareBatching(TrlTestCase):
         second = _rollout_sample(2)
         second["group_id"] = 9
 
-        collator([[[first, sibling], [second]]])
+        batch = collator([[[first, sibling], [second]]])
 
-        assert acknowledged == [(7, 7, 9)]
-        assert collator.groups_trained == {7, 9}
+        assert batch["consumed_group_ids"].tolist() == [[7, 7, 9], [7, 7, 9]]
+        assert collator.groups_trained == set()
 
     def test_collator_handles_a_ragged_metric_key_set(self):
         # A micro-batch mixes samples that carry `tools/*` with samples that do not. Both orderings matter: a first

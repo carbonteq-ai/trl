@@ -562,8 +562,6 @@ class DataCollatorForRollout(DataCollatorMixin):
     metrics: dict[str, list] = field(default_factory=lambda: defaultdict(list))
     # Per-row token cap of the planner,
     token_budget: int = 0
-    acknowledge_consumed_samples: Callable[[Sequence[int]], None] | None = None
-
     def torch_call(self, examples: list[Any]) -> dict[str, Any]:
         # The dataloader uses batch_size=1 over a planner that pre-partitions each micro-batch into `num_processes`
         # rows, so `examples` is a length-1 list holding that single micro-batch (one group per rank).
@@ -597,9 +595,12 @@ class DataCollatorForRollout(DataCollatorMixin):
 
         all_examples = [example for group in groups for example in group]
         consumed_group_ids = tuple(int(example["group_id"]) for example in all_examples)
-        self.groups_trained.update(consumed_group_ids)
-        if self.acknowledge_consumed_samples is not None:
-            self.acknowledge_consumed_samples(consumed_group_ids)
+        # The Trainer may collate one microbatch ahead of the optimizer. Carry
+        # the identities through dispatch, but defer all durable consumption
+        # side effects until `training_step` actually receives the batch.
+        consumed_group_ids_tensor = torch.tensor(consumed_group_ids, dtype=torch.long).repeat(
+            self.num_processes, 1
+        )
 
         # Total valid completion tokens across all samples in the full batch.
         # Repeated per rank so that DataLoaderDispatcher (dispatch_batches=True) slices correctly on dim=0
@@ -624,6 +625,7 @@ class DataCollatorForRollout(DataCollatorMixin):
             "global_n_tokens": global_n_tokens,
             "global_n_forward_tokens": global_n_forward_tokens,
             "mean_seq_len": mean_seq_len_t,
+            "consumed_group_ids": consumed_group_ids_tensor,
         }
 
     def _log_metrics(
@@ -1083,9 +1085,6 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     # `or 0` because only rank 0 fills an unset budget from the vLLM server above; the other ranks
                     # construct the collator (and never use it) while `token_budget` is still `None`.
                     token_budget=max(self.args.token_budget or 0, 0),
-                    acknowledge_consumed_samples=getattr(
-                        self.rollout_worker, "acknowledge_consumed_samples", None
-                    ),
                 ),
                 num_workers=0,
                 # NOTE(@aminediro):
@@ -1110,6 +1109,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 "global_n_tokens",
                 "global_n_forward_tokens",
                 "mean_seq_len",
+                "consumed_group_ids",
             ]
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -1245,6 +1245,12 @@ class AsyncGRPOTrainer(_BaseTrainer):
         return loss
 
     def training_step(self, model, inputs, num_items_in_batch):
+        consumed_group_ids = tuple(int(value) for value in inputs.pop("consumed_group_ids")[0].tolist())
+        if self.accelerator.is_main_process:
+            self._trained_groups.update(consumed_group_ids)
+            acknowledge = getattr(self.rollout_worker, "acknowledge_consumed_samples", None)
+            if acknowledge is not None:
+                acknowledge(consumed_group_ids)
         time_before = time.perf_counter()
         output = super().training_step(model, inputs, num_items_in_batch)
         self._step_microbatches += 1
