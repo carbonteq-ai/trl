@@ -5,7 +5,21 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
-Fork status: `candidate`, version `1.12.0.post4`, bounded raw-parity correction.
+Fork status: `candidate`, version `1.12.0.post5`, complete-group admission.
+Post5 consumes validated `retained_input_indices` from external rollouts before
+reward calculation, preserving source identity and whole groups. Ordinary
+single-process GRPO pads only scored tensors to its scheduled accumulation
+window with zero credit and retained-row sequence-mean normalization. Active
+sampling accepts partial/empty candidate rounds within its existing bound.
+No rewards or native episodes are invented. Partial multi-process, multimodal,
+fixed alternate objectives, fused loss, entropy bonus and auxiliary loss paths
+remain unsupported. Files: `trl/trainer/rollout_admission.py`,
+`trl/trainer/grpo_trainer.py`, `tests/test_rollout_admission.py`. Regression
+coverage includes two actual trainer updates for GRPO and active sampling,
+source-row identity, empty candidate rounds and gradients at microbatch 1/2/4.
+Run `python -m pytest tests/test_rollout_admission.py tests/test_olmo3_grpo_config.py`.
+The consuming GPU qualification remains open; do not infer throughput fixes.
+Previous post4 commit: `19e6c89a18617f1bd6e6385212705a67f5434962`.
 Post4 source branch: `codex/trl-parity-probe-bound`. It includes the trainer
 initializer plumbing required by the post3 configuration surface; publication
 and live GPU qualification remain open. Previous post3/post2 releases follow.

@@ -75,6 +75,7 @@ from ..models.utils import _ForwardRedirection, disable_gradient_checkpointing
 from .base_trainer import _BaseTrainer
 from .callbacks import SyncRefModelCallback
 from .grpo_config import GRPOConfig
+from .rollout_admission import NoAdmittedRollouts, pad_admitted_rollout_batch, retained_rollout_indices
 from .utils import (
     RepeatSampler,
     create_model_from_path,
@@ -1669,7 +1670,17 @@ class GRPOTrainer(_BaseTrainer):
                 elif self.dynamic_sampling:
                     generation_batch = self._prepare_dynamic_sampling_inputs(generation_batch)
                 else:
+                    scheduled_rows = len(generation_batch)
                     generation_batch = self._generate_and_score_completions(generation_batch)
+                    if generation_batch["completion_ids"].shape[0] != scheduled_rows:
+                        if (
+                            self.loss_type != "grpo"
+                            or self.use_liger_kernel
+                            or self._entropy_bonus_enabled
+                            or self.aux_loss_enabled
+                        ):
+                            raise ValueError("partial fixed rollout batches currently require ordinary GRPO loss")
+                        generation_batch = pad_admitted_rollout_batch(generation_batch, scheduled_rows)
                 generation_batch = split_pixel_values_by_grid(generation_batch)
                 generation_batch = shuffle_sequence_dict(generation_batch)
                 generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
@@ -1699,7 +1710,12 @@ class GRPOTrainer(_BaseTrainer):
         for candidate_batch in (
             candidate_inputs[index : index + target_size] for index in range(0, len(candidate_inputs), target_size)
         ):
-            scored_batch = self._generate_and_score_completions(candidate_batch)
+            try:
+                scored_batch = self._generate_and_score_completions(candidate_batch)
+            except NoAdmittedRollouts:
+                candidate_batches_used += 1
+                candidate_count += len(candidate_batch)
+                continue
             group_reward_std = scored_batch.pop("group_reward_std")
             keep = group_reward_std > self.dynamic_sampling_reward_std_epsilon
             candidate_batches_used += 1
@@ -1772,11 +1788,16 @@ class GRPOTrainer(_BaseTrainer):
                 raise RuntimeError("active sampling exhausted its bounded candidate pool")
             candidate_cursor += synchronized_missing
 
-            scored_batch = self._generate_and_score_completions(candidate_batch)
+            try:
+                scored_batch = self._generate_and_score_completions(candidate_batch)
+            except NoAdmittedRollouts:
+                generation_rounds += 1
+                candidate_count += len(candidate_batch)
+                continue
             group_reward_std = scored_batch.pop("group_reward_std")
             keep = group_reward_std > self.active_sampling_reward_std_epsilon
             generation_rounds += 1
-            candidate_count += len(keep)
+            candidate_count += len(candidate_batch)
             if keep.any():
                 retained_batches.append(self._select_dynamic_sampling_rows(scored_batch, keep))
                 retained_count += int(keep.sum().item())
@@ -2498,6 +2519,18 @@ class GRPOTrainer(_BaseTrainer):
                 raise ValueError(f"rollout_func must return keys {missing_keys_list} in its output dict.")
             extra_fields = {k: v for k, v in output.items() if k not in required_keys}
             prompt_ids, completion_ids, logprobs = output["prompt_ids"], output["completion_ids"], output["logprobs"]
+            retained = output.get("retained_input_indices")
+            if self.accelerator.num_processes > 1:
+                partial = torch.tensor(retained is not None, device=device)
+                if self.accelerator.gather(partial).any():
+                    raise ValueError("partial external rollout admission currently requires a single process")
+            if retained is not None:
+                retained_rollout_indices(retained, len(prompts), len(completion_ids), self.num_generations)
+                if self.tools or any("image" in row or "images" in row for row in inputs):
+                    raise ValueError("partial external rollout admission requires text-only external tools")
+                prompts = [prompts[index] for index in retained]
+            elif len(completion_ids) != len(prompts):
+                raise ValueError("partial rollout output requires retained_input_indices")
             images = None
             multimodal_fields = {}
         else:
@@ -2764,6 +2797,10 @@ class GRPOTrainer(_BaseTrainer):
             images,
             tool_images,
         ) = self._generate(prompts, inputs=inputs)
+        retained = extra_fields.pop("retained_input_indices", None)
+        if retained is not None:
+            inputs = [inputs[index] for index in retained]
+            prompts = [prompts[index] for index in retained]
         if images is None:
             images = dataset_images  # restore dataset images (rollout_func path returns None)
 
@@ -3569,7 +3606,10 @@ class GRPOTrainer(_BaseTrainer):
             # Compute the loss using the liger grpo loss
             unwrapped_model = self.accelerator.unwrap_model(model)
             return self._forward_redirection(model, unwrapped_model, self.compute_liger_loss, unwrapped_model, inputs)
-        return self._compute_loss(model, inputs)
+        loss = self._compute_loss(model, inputs)
+        # Sequence-mean GRPO must average over admitted rows, even though the
+        # Trainer still executes the original number of accumulation slots.
+        return loss * inputs.get("admission_loss_scale", 1.0)
 
     @staticmethod
     def get_off_policy_mask(
