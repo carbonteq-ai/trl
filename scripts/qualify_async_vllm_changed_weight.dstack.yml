@@ -1,0 +1,59 @@
+type: task
+name: trl-async-changed-weight-parity
+nodes: 2
+image: registry.carbonteq.com/carbonteq/posttrain/nanbeige-vllm@sha256:bfbeee151fb59c687f7e27d5e5e287716a7c1c6dd58ebf0a4ffe99b13702a3aa
+shell: /bin/bash
+commands:
+  - >-
+    python -m pip install --no-deps --force-reinstall
+    /opt/trl-candidate/trl-1.12.0.post5-py3-none-any.whl
+  - |-
+    set -euo pipefail
+    mapfile -t task_nodes <<< "${DSTACK_NODES_IPS}"
+    if [[ "${#task_nodes[@]}" -ne 2 ]]; then
+      echo "expected exactly two task node addresses" >&2
+      exit 2
+    fi
+    if [[ "${DSTACK_NODE_RANK}" == "1" ]]; then
+      exec env VLLM_SERVER_DEV_MODE=1 vllm serve Qwen/Qwen2.5-0.5B-Instruct \
+        --host 0.0.0.0 \
+        --port 8000 \
+        --dtype half \
+        --enforce-eager \
+        --max-model-len 512 \
+        --max-num-seqs 2 \
+        --gpu-memory-utilization 0.45 \
+        --logprobs-mode processed_logprobs \
+        --weight-transfer-config '{"backend":"nccl"}'
+    fi
+    python /opt/trl-candidate/qualify_async_vllm_changed_weight.py \
+      --model Qwen/Qwen2.5-0.5B-Instruct \
+      --server-url "http://${task_nodes[1]}:8000" \
+      --server-timeout 600
+files:
+  - ../dist-async/trl-1.12.0.post5-py3-none-any.whl:/opt/trl-candidate/trl-1.12.0.post5-py3-none-any.whl
+  - ./qualify_async_vllm_changed_weight.py:/opt/trl-candidate/qualify_async_vllm_changed_weight.py
+resources:
+  cpu: 8..
+  memory: 24GB..
+  gpu:
+    vendor: nvidia
+    count: 1
+    memory: 8GB..
+  disk: 100GB
+backends:
+  - runpod
+regions:
+  - EUR-IS-1
+  - US-KS-2
+  - US-WA-1
+spot_policy: on-demand
+max_price: 1.75
+stop_criteria: master-done
+max_duration: 30m
+stop_duration: 2m
+retry: false
+tags:
+  purpose: trl-async-changed-weight-parity
+  trl_revision: pending
+  model: qwen2.5-0.5b-instruct

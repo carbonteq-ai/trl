@@ -131,20 +131,29 @@ package and has not passed changed-weight GPU qualification.
 ### Async changed-weight parity gate (2026-09-09)
 
 `scripts/qualify_async_vllm_changed_weight.py` is the bounded native NCCL
-release gate left open by the lifecycle probe. It assigns distinct visible
-trainer and inference GPUs, teacher-forces one actor-selected token before and
-after changing the final normalization weight, sends the changed tensor through
-vLLM's native weight-transfer engine, resets the prefix cache, and requires the
-changed sampler log probability to match the reference actor within an
-explicit tolerance. It fails before engine construction unless two distinct
-GPUs are available.
+release gate left open by the lifecycle probe. It runs on a trainer GPU against
+a separately launched `vllm serve` process, teacher-forces one actor-selected
+token before and after changing the final normalization weight, sends the
+changed tensor through async GRPO's production HTTP/NCCL clients, resets the
+prefix cache, and requires the changed server log probability to match the
+reference actor within an explicit tolerance. The server may be on another
+host when both hosts expose mutually routable addresses. The accompanying
+dstack task describes a two-node on-demand shape without embedding a local
+checkout or machine-specific path.
+
+The async control client now checks every HTTP response and uses explicit
+timeouts. A rejected pause, resume, introspection, or weight-update request is
+an exception rather than a false acknowledgement; focused client tests cover
+this fail-closed boundary.
 
 Two exploratory single-GPU attempts on the local RTX 3070 Ti were rejected and
 are not qualification evidence. The first confirmed that AsyncLLM's process
 boundary does not support sending an arbitrary callable through the frontend;
 the second used the supported NCCL transfer API and NCCL rejected assigning
-both ranks to one device. The probe now uses only the native NCCL path and
-requires a two-GPU job. No changed-weight parity result has passed yet.
+both ranks to one device. The obsolete in-process topology was then replaced
+by the production external-server topology. A two-node RunPod plan parsed
+successfully on 2026-09-09 but had no matching clustered offer and was not
+submitted. No changed-weight parity result has passed yet.
 
 ### Custom async worker consumption and recovery seam (2026-09-09)
 
@@ -357,13 +366,20 @@ The bounded-sequence parity correction is covered by
 `test_vllm_policy_parity_probe_bounds_each_sequence_and_left_truncates_prompt`
 and the associated configuration validation in `tests/test_grpo_trainer.py`.
 
-Run the changed-weight gate only on a job with two distinct visible GPUs:
+Launch a vLLM server on one GPU:
 
-    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    VLLM_SERVER_DEV_MODE=1 vllm serve Qwen/Qwen2.5-0.5B-Instruct \
+      --host 0.0.0.0 --port 8000 --dtype half --enforce-eager \
+      --max-model-len 512 --max-num-seqs 2 \
+      --weight-transfer-config '{"backend":"nccl"}' \
+      --logprobs-mode processed_logprobs
+
+Then run the gate on a distinct trainer GPU that can reach the server and can
+itself be reached by the server's NCCL rank:
+
     python scripts/qualify_async_vllm_changed_weight.py \
       --model Qwen/Qwen2.5-0.5B-Instruct \
-      --trainer-device 0 --inference-device 1 \
-      --max-model-len 512 --gpu-memory-utilization 0.45
+      --server-url http://SERVER_IP:8000 --trainer-device cuda:0
 
 Then run Ruff, the complete TRL test suite, and the Posttrain adapter contract
 tests. Publication is manual from Posttrain's repository-scoped retained-asset

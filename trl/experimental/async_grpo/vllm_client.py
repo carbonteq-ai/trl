@@ -41,6 +41,16 @@ class VLLMClient:
         self.server_url = server_url.rstrip("/")
         self.server_timeout = server_timeout
 
+    def _get(self, path: str, **kwargs) -> requests.Response:
+        response = requests.get(f"{self.server_url}{path}", **kwargs)
+        response.raise_for_status()
+        return response
+
+    def _post(self, path: str, **kwargs) -> requests.Response:
+        response = requests.post(f"{self.server_url}{path}", **kwargs)
+        response.raise_for_status()
+        return response
+
     def wait_for_server_ready(self, poll_interval_s: float = 2.0) -> None:
         """Block until the server answers `/health`, or raise `TimeoutError` after `server_timeout` seconds."""
         logger.info(f"Waiting for vLLM server at {self.server_url} ...")
@@ -66,8 +76,7 @@ class VLLMClient:
 
     def get_max_model_len(self) -> int:
         """Return the served model's `max_model_len` (the cap on prompt + completion tokens)."""
-        response = requests.get(f"{self.server_url}/v1/models")
-        response.raise_for_status()
+        response = self._get("/v1/models", timeout=self.server_timeout)
         return response.json()["data"][0]["max_model_len"]
 
     def get_dtype(self) -> str:
@@ -78,35 +87,38 @@ class VLLMClient:
         sits behind `VLLM_SERVER_DEV_MODE=1`, which this trainer already requires: `/pause` and
         `/init_weight_transfer_engine` are gated by the same flag.
         """
-        response = requests.get(f"{self.server_url}/server_info", params={"config_format": "json"})
-        response.raise_for_status()
+        response = self._get(
+            "/server_info",
+            params={"config_format": "json"},
+            timeout=self.server_timeout,
+        )
         return response.json()["vllm_config"]["model_config"]["dtype"]
 
     def get_world_size(self) -> int:
         """Return the vLLM server's inference world size (tensor/pipeline parallel processes)."""
-        response = requests.get(f"{self.server_url}/get_world_size")
+        response = self._get("/get_world_size", timeout=self.server_timeout)
         return response.json()["world_size"]
 
     def pause(self) -> None:
         """Pause generation while keeping the KV cache warm (`mode=keep`), so weights can be swapped in."""
-        requests.post(f"{self.server_url}/pause", params={"mode": "keep"})
+        self._post("/pause", params={"mode": "keep"}, timeout=self.server_timeout)
 
     def resume(self) -> None:
         """Resume generation after a weight update."""
-        requests.post(f"{self.server_url}/resume")
+        self._post("/resume", timeout=self.server_timeout)
 
     def init_weight_transfer_engine(self, init_info: dict, timeout: int) -> None:
         """Initialise the server side of the NCCL weight-transfer group."""
-        requests.post(f"{self.server_url}/init_weight_transfer_engine", json={"init_info": init_info}, timeout=timeout)
+        self._post("/init_weight_transfer_engine", json={"init_info": init_info}, timeout=timeout)
 
     def start_weight_update(self, timeout: int = 1800) -> None:
         """Prepare the workers for a weight reload; must complete before any weights are sent."""
-        requests.post(f"{self.server_url}/start_weight_update", json={"is_checkpoint_format": True}, timeout=timeout)
+        self._post("/start_weight_update", json={"is_checkpoint_format": True}, timeout=timeout)
 
     def update_weights(self, update_info: dict, timeout: int = 1800) -> None:
         """Drive the workers' blocking NCCL recv (call on a thread, concurrently with the trainer-side broadcast)."""
-        requests.post(f"{self.server_url}/update_weights", json={"update_info": update_info}, timeout=timeout)
+        self._post("/update_weights", json={"update_info": update_info}, timeout=timeout)
 
     def finish_weight_update(self, timeout: int = 1800) -> None:
         """Finalise the weight update on the server."""
-        requests.post(f"{self.server_url}/finish_weight_update", timeout=timeout)
+        self._post("/finish_weight_update", timeout=timeout)
