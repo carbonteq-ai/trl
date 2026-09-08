@@ -443,6 +443,7 @@ class RolloutWorkerProtocol(Protocol):
 
     def start(self) -> None: ...
     def stop(self) -> None: ...
+    def prepare_model_update(self, model_version: int) -> None: ...
     def update_model_version(self, model_version: int) -> None: ...
     def check_health(self, stale_after_s: float) -> None: ...
 
@@ -1468,6 +1469,9 @@ class AsyncDistillationTrainer(_BaseTrainer):
 
     def _sync_weight(self):
         t0 = time.time()
+        next_model_version = self.model_version + 1
+        if self.accelerator.is_main_process and self.rollout_worker:
+            self.rollout_worker.prepare_model_update(next_model_version)
         logger.info("Weight sync: pausing vLLM...")
         if self.accelerator.is_main_process and self.weight_transfer:
             self.weight_transfer.pause()
@@ -1492,7 +1496,7 @@ class AsyncDistillationTrainer(_BaseTrainer):
         if self.accelerator.is_main_process:
             if self.weight_transfer:
                 self.weight_transfer.resume()
-            self.model_version += 1
+            self.model_version = next_model_version
             if self.rollout_worker:
                 self.rollout_worker.update_model_version(self.model_version)
         weight_sync_s = time.time() - t0

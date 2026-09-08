@@ -99,6 +99,32 @@ request scheduling paused until the KV cache is restored. Actor-to-engine
 changed-weight parity remains open, so the consumer must retain the existing
 actor/sampler parity gate before this can be promoted.
 
+### Async trainer model-request drain (2026-09-08)
+
+The experimental async GRPO and async distillation trainers now use a
+two-phase rollout-worker notification around weight publication. Before vLLM
+is paused, `prepare_model_update(next_version)` atomically closes admission for
+new model requests and waits for already-admitted requests to finish. An
+episode executing a tool is not cancelled or replayed; its next model request
+waits at the closed gate. After weight transfer and vLLM resume,
+`update_model_version(version)` publishes the new version and reopens request
+admission. Top-level group admission is closed over the same interval.
+
+The shared active-request counter and admission condition make the drain
+acknowledged rather than a best-effort event check: a request cannot race from
+the child process into vLLM after the trainer has observed a completed drain.
+The trainer continues to own update timing and stale-sample policy. The worker
+does not abort tool calls, discard samples, compute importance weights, or
+change reward semantics. Equivalent lifecycle changes are retained in both
+experimental trainers to avoid divergent update behavior.
+
+`tests/experimental/test_async_grpo_trainer.py` proves the exact
+prepare/pause/transfer/resume/publish order and that preparation blocks until
+an admitted model request acknowledges completion. The broader experimental
+trainer suite remains subject to its optional Flash Attention `kernels`
+runtime dependency. This local candidate is not part of the published post5
+package and has not passed changed-weight GPU qualification.
+
 ### Stable-base integration (2026-09-06)
 
 The post1 CUDA lifecycle gate exposed a checkpoint recovery failure in the

@@ -123,6 +123,9 @@ class _StubRolloutWorker:
     def start(self):
         self._fill_queue()
 
+    def prepare_model_update(self, version):
+        pass
+
     def update_model_version(self, version):
         self._model_version = version
         self._fill_queue()

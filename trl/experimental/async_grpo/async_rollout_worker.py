@@ -251,6 +251,9 @@ def _child_main(
     loop_kwargs: dict[str, Any],
     samples_queue: MPQueue,
     model_version_value: MPValue,
+    admission_open_event: MPEvent,
+    admission_condition: Any,
+    active_model_requests: MPValue,
     stop_event: MPEvent,
     child_ready_event: MPEvent,
     heartbeat_value: MPValue,
@@ -268,6 +271,9 @@ def _child_main(
         **loop_kwargs,
         rollout_buffer=samples_queue,
         model_version_value=model_version_value,
+        admission_open_event=admission_open_event,
+        admission_condition=admission_condition,
+        active_model_requests=active_model_requests,
         heartbeat_value=heartbeat_value,
         failed_event=failed_event,
         exception_info_queue=exception_info_queue,
@@ -302,6 +308,9 @@ class _AsyncRolloutLoop:
         processing_class: PreTrainedTokenizerBase,
         rollout_buffer: MPQueue,
         model_version_value: MPValue,
+        admission_open_event: MPEvent,
+        admission_condition: Any,
+        active_model_requests: MPValue,
         heartbeat_value: MPValue,
         failed_event: MPEvent,
         exception_info_queue: MPQueue,
@@ -352,6 +361,9 @@ class _AsyncRolloutLoop:
         self.tokenizer = processing_class
         self.rollout_buffer = rollout_buffer  # shared mp.Queue
         self._model_version_value = model_version_value  # shared mp.Value
+        self._admission_open_event = admission_open_event
+        self._admission_condition = admission_condition
+        self._active_model_requests = active_model_requests
         self._heartbeat_value = heartbeat_value  # shared mp.Value('d'); wall-clock seconds
         self._failed_event = failed_event  # shared mp.Event
         self._exception_info_queue = exception_info_queue  # shared mp.Queue(maxsize=1)
@@ -510,7 +522,7 @@ class _AsyncRolloutLoop:
             while True:
                 # Wall-clock for cross-process comparison; parent uses time.time() in check_health.
                 self._heartbeat_value.value = time.time()
-                while free_slots and not stop_event.is_set():
+                while free_slots and self._admission_open_event.is_set() and not stop_event.is_set():
                     group_id, row = next(work_iter)
                     slot = free_slots.pop()
                     # The environment is selected per example via its `environment` field (multi-env); only its tools
@@ -948,6 +960,7 @@ class _AsyncRolloutLoop:
         return tool_messages, n_calls, n_failures
 
     async def _generate_one_turn(self, prompt_ids: list[int]) -> tuple[list[int], list[float]]:
+        await self._enter_model_request()
         payload = {
             "model": self.model_name,
             "prompt": prompt_ids,
@@ -962,13 +975,31 @@ class _AsyncRolloutLoop:
         }
         if self.min_p is not None:
             payload["min_p"] = self.min_p
-        output = await self._retry(
-            lambda: self._post("/v1/completions", payload, self.request_timeout),
-            max_attempts=30,
-            label="vllm /v1/completions",
-        )
+        try:
+            output = await self._retry(
+                lambda: self._post("/v1/completions", payload, self.request_timeout),
+                max_attempts=30,
+                label="vllm /v1/completions",
+            )
+        finally:
+            self._leave_model_request()
         choice = output["choices"][0]
         return choice["token_ids"], choice["logprobs"]["token_logprobs"]
+
+    async def _enter_model_request(self) -> None:
+        while True:
+            if self._stop_event.is_set():
+                raise asyncio.CancelledError
+            with self._admission_condition:
+                if self._admission_open_event.is_set():
+                    self._active_model_requests.value += 1
+                    return
+            await asyncio.sleep(0.01)
+
+    def _leave_model_request(self) -> None:
+        with self._admission_condition:
+            self._active_model_requests.value -= 1
+            self._admission_condition.notify_all()
 
     async def _score_group(self, group: RolloutGroup) -> list[RolloutSample]:
         kwargs = dict(
@@ -1116,6 +1147,10 @@ class AsyncRolloutWorker:
         self._mp_ctx = ctx
         self.rollout_buffer = ctx.Queue(maxsize=queue_maxsize)
         self._model_version_value = ctx.Value("i", 0)
+        self._admission_open_event = ctx.Event()
+        self._admission_open_event.set()
+        self._admission_condition = ctx.Condition()
+        self._active_model_requests = ctx.Value("i", 0, lock=False)
         self._stop_event_mp = ctx.Event()
         self._child_ready_event = ctx.Event()
         # Liveness state shared with the child. Wall-clock seconds because monotonic() is per-process.
@@ -1143,8 +1178,18 @@ class AsyncRolloutWorker:
         with self._model_version_value.get_lock():
             self._model_version_value.value = int(value)
 
+    def prepare_model_update(self, model_version: int) -> None:
+        if model_version <= self.model_version:
+            raise ValueError("next model version must be greater than the live version")
+        with self._admission_condition:
+            self._admission_open_event.clear()
+            while self._active_model_requests.value:
+                self._admission_condition.wait(timeout=1.0)
+                self.check_health(self._child_ready_timeout)
+
     def update_model_version(self, model_version: int) -> None:
         self.model_version = model_version
+        self._admission_open_event.set()
 
     def start(self) -> None:
         if self._process is not None:
@@ -1168,6 +1213,9 @@ class AsyncRolloutWorker:
                 self._loop_kwargs,
                 self.rollout_buffer,
                 self._model_version_value,
+                self._admission_open_event,
+                self._admission_condition,
+                self._active_model_requests,
                 self._stop_event_mp,
                 self._child_ready_event,
                 self._heartbeat_value,

@@ -19,6 +19,7 @@ import math
 import multiprocessing as mp
 import os
 import queue
+import threading
 from collections import defaultdict
 from unittest.mock import MagicMock, patch
 
@@ -119,6 +120,9 @@ class _StubRolloutWorker:
     def start(self):
         self._fill_queue()
 
+    def prepare_model_update(self, model_version):
+        pass
+
     def update_model_version(self, model_version):
         self._model_version = model_version
         self._fill_queue()
@@ -148,6 +152,62 @@ class _StubWeightTransfer:
 
     def destroy(self):
         pass
+
+
+def test_weight_sync_closes_admission_before_pause_and_reopens_after_resume():
+    PartialState()
+    events = []
+    trainer = AsyncGRPOTrainer.__new__(AsyncGRPOTrainer)
+    trainer.model_version = 4
+    trainer.model = MagicMock()
+    trainer.model.named_parameters.return_value = ()
+    trainer._metrics = {"train": defaultdict(list)}
+    trainer.accelerator = MagicMock()
+    trainer.accelerator.is_main_process = True
+    trainer.accelerator.device = torch.device("cpu")
+    trainer.accelerator.wait_for_everyone.side_effect = lambda: events.append("barrier")
+    trainer.rollout_worker = MagicMock()
+    trainer.rollout_worker.prepare_model_update.side_effect = lambda version: events.append(("prepare", version))
+    trainer.rollout_worker.update_model_version.side_effect = lambda version: events.append(("publish", version))
+    trainer.weight_transfer = MagicMock()
+    trainer.weight_transfer.pause.side_effect = lambda: events.append("pause")
+    trainer.weight_transfer.send_weights.side_effect = lambda iterator: (tuple(iterator), events.append("transfer"))
+    trainer.weight_transfer.resume.side_effect = lambda: events.append("resume")
+
+    trainer._sync_weight()
+
+    assert trainer.model_version == 5
+    assert events == [("prepare", 5), "pause", "barrier", "transfer", "barrier", "resume", ("publish", 5)]
+
+
+def test_prepare_model_update_waits_for_admitted_model_requests():
+    ctx = mp.get_context("spawn")
+    rollout_worker = AsyncRolloutWorker.__new__(AsyncRolloutWorker)
+    rollout_worker._model_version_value = ctx.Value("i", 4)
+    rollout_worker._admission_open_event = ctx.Event()
+    rollout_worker._admission_open_event.set()
+    rollout_worker._admission_condition = ctx.Condition()
+    rollout_worker._active_model_requests = ctx.Value("i", 1, lock=False)
+    rollout_worker._child_ready_timeout = 300
+    rollout_worker.check_health = MagicMock()
+
+    prepared = threading.Event()
+
+    def prepare():
+        rollout_worker.prepare_model_update(5)
+        prepared.set()
+
+    thread = threading.Thread(target=prepare)
+    thread.start()
+    assert not prepared.wait(timeout=0.05)
+    assert not rollout_worker._admission_open_event.is_set()
+
+    with rollout_worker._admission_condition:
+        rollout_worker._active_model_requests.value -= 1
+        rollout_worker._admission_condition.notify_all()
+
+    assert prepared.wait(timeout=1.0)
+    thread.join()
 
 
 @pytest.mark.skipif(
@@ -309,6 +369,9 @@ class TestRolloutStateCheckpoint(TrlTestCase):
 
     def _make_rollout_loop(self, dataset, dataset_start_index=0, num_generations=2):
         ctx = mp.get_context("spawn")
+        admission_open_event = ctx.Event()
+        admission_open_event.set()
+        admission_condition = ctx.Condition()
         kwargs = dict(
             model_name="test",
             dataset=dataset,
@@ -317,6 +380,9 @@ class TestRolloutStateCheckpoint(TrlTestCase):
             rollout_buffer=ctx.Queue(),
             metrics_queue=ctx.Queue(),
             model_version_value=ctx.Value("i", 0),
+            admission_open_event=admission_open_event,
+            admission_condition=admission_condition,
+            active_model_requests=ctx.Value("i", 0, lock=False),
             heartbeat_value=ctx.Value("d", 0.0),
             failed_event=ctx.Event(),
             exception_info_queue=ctx.Queue(),
@@ -416,6 +482,9 @@ class TestAsyncRolloutWorkerEnvironments(TrlTestCase):
         if dataset is None:
             dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_only", split="train")
         # `_AsyncRolloutLoop.__init__` only sets up state (no vLLM connection / generation happens here).
+        admission_open_event = mp.Event()
+        admission_open_event.set()
+        admission_condition = mp.Condition()
         return _AsyncRolloutLoop(
             model_name=model_id,
             dataset=dataset,
@@ -423,6 +492,9 @@ class TestAsyncRolloutWorkerEnvironments(TrlTestCase):
             processing_class=AutoTokenizer.from_pretrained(model_id),
             rollout_buffer=mp.Queue(),
             model_version_value=mp.Value("i", 0),
+            admission_open_event=admission_open_event,
+            admission_condition=admission_condition,
+            active_model_requests=mp.Value("i", 0, lock=False),
             heartbeat_value=mp.Value("d", 0.0),
             failed_event=mp.Event(),
             exception_info_queue=mp.Queue(),
