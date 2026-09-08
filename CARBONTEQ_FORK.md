@@ -6,6 +6,12 @@ job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
 Fork status: `candidate`, version `1.12.0.post5`, complete-group admission.
+Published development candidate source: `b9f3a09369d9cfa21950feef3e110e1fdf779c54`,
+tag `carbonteq-v1.12.0.post5`. Retained-asset publisher `34224729623` passed
+clean installation and exact-byte readback. Wheel SHA-256:
+`1f42571c28e178bb292eb7b904940f0d0e4b0ccdf936b23b8bec9704190b6ecb`;
+sdist: `ceb581cc5a3d7a4a8a34cbc1b7fbc64e7aba9e3c55a6508b4a14ce257d341bc9`.
+Stable promotion remains pending GPU qualification.
 Post5 consumes validated `retained_input_indices` from external rollouts before
 reward calculation, preserving source identity and whole groups. Ordinary
 single-process GRPO pads only scored tensors to its scheduled accumulation
