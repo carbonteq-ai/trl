@@ -126,7 +126,8 @@ never resumes inference or publishes/reopens the pending version; the error is
 run-fatal and propagates to the trainer. The broader experimental
 trainer suite remains subject to its optional Flash Attention `kernels`
 runtime dependency. This local candidate is not part of the published post5
-package and has not passed changed-weight GPU qualification.
+package; the changed-weight gate below qualifies its transfer boundary but not
+a complete optimizer update or package publication.
 
 ### Async changed-weight parity gate (2026-09-09)
 
@@ -144,7 +145,11 @@ checkout or machine-specific path.
 The async control client now checks every HTTP response and uses explicit
 timeouts. A rejected pause, resume, introspection, or weight-update request is
 an exception rather than a false acknowledgement; focused client tests cover
-this fail-closed boundary.
+this fail-closed boundary. The clients use ordinary Python logging so they can
+run in a standalone qualification process without first initializing
+Accelerate state. The shared vLLM control client also accepts a successful
+empty response body, as returned by the server's prefix-cache reset endpoint,
+instead of attempting to decode it as JSON.
 
 Two exploratory single-GPU attempts on the local RTX 3070 Ti were rejected and
 are not qualification evidence. The first confirmed that AsyncLLM's process
@@ -153,7 +158,27 @@ the second used the supported NCCL transfer API and NCCL rejected assigning
 both ranks to one device. The obsolete in-process topology was then replaced
 by the production external-server topology. A two-node RunPod plan parsed
 successfully on 2026-09-09 but had no matching clustered offer and was not
-submitted. No changed-weight parity result has passed yet.
+submitted, so it incurred no cloud workload.
+
+The external-server gate passed on 2026-09-09 with the candidate source at
+`2308ab41aeedc082e154734f33cfe44809b1fdea`. The actor ran on an RTX 3070 Ti
+and the server ran on an RTX PRO 6000 Blackwell Workstation Edition using
+`registry.carbonteq.com/carbonteq/posttrain-kind-online-rl-trl-py312@sha256:8230413ea572158e59e3f4099b218474d339869fb3eb1676ebaf23e35d35d03d`
+with vLLM 0.25.1, Torch 2.11.0+cu130, and Transformers 5.14.1. Base
+actor/server log-probability delta was `0.0022419691`; after transferring the
+changed `model.norm.weight` tensor the delta was exactly `0.0`, while the
+server log probability itself moved by `10.6749088764`. This proves both
+numerical parity and that the server used the transferred weight rather than
+returning an unchanged cached result.
+
+The immutable slim runtime has no CUDA compiler. Its server therefore sets
+`VLLM_USE_FLASHINFER_SAMPLER=0` explicitly. This does not disable FlashInfer
+attention or NCCL transfer, and vLLM 0.25.1 already requires the native sampler
+for this gate's `processed_logprobs` mode because FlashInfer sampling cannot
+return post-top-k/top-p log probabilities. Production rollout-only sampling
+must still benchmark the FlashInfer path in a runtime with its kernels
+available; this qualification result is not evidence that disabling the
+sampler is throughput-neutral for other modes.
 
 ### Custom async worker consumption and recovery seam (2026-09-09)
 
