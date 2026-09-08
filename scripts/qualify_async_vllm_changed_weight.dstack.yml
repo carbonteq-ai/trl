@@ -1,7 +1,7 @@
 type: task
 name: trl-async-changed-weight-parity
 nodes: 2
-image: registry.carbonteq.com/carbonteq/posttrain/nanbeige-vllm@sha256:bfbeee151fb59c687f7e27d5e5e287716a7c1c6dd58ebf0a4ffe99b13702a3aa
+image: registry.carbonteq.com/carbonteq/posttrain-kind-online-rl-trl-py312@sha256:8230413ea572158e59e3f4099b218474d339869fb3eb1676ebaf23e35d35d03d
 shell: /bin/bash
 commands:
   - >-
