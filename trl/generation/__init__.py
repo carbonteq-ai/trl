@@ -23,3 +23,7 @@ if is_vllm_available():
     from .vllm_generation import VLLMGeneration
 
     __all__.append("VLLMGeneration")
+
+from .async_vllm_session import AsyncGenerationRequest, AsyncVllmSession, SessionPhase
+
+__all__.extend(["AsyncGenerationRequest", "AsyncVllmSession", "SessionPhase"])

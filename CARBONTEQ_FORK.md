@@ -75,6 +75,20 @@ immutable release tag, package hashes, and clean-install verification exist.
 
 ## Maintained delta
 
+### Asynchronous rollout session foundation (2026-09-08)
+
+`trl/generation/async_vllm_session.py` introduces a narrow, trainer-owned
+per-request vLLM session. It fences one synchronized policy version, admits
+independent asynchronous requests, explicitly aborts and drains them, and only
+then allows inference residency to sleep for an optimizer update. The session
+does not own environments, rewards, worker processes, or actor computation.
+It is an additive foundation for the Posttrain rollout-execution workstream;
+it is not yet connected to a trainer's vLLM construction path or qualified on
+a GPU. `tests/test_async_vllm_session.py` proves independent completion,
+policy-version fencing, abort, drain, sleep/wake ordering, and idempotent
+shutdown with a deterministic async engine double. The consumer must retain
+the existing actor/sampler parity gate before this can be promoted.
+
 ### Stable-base integration (2026-09-06)
 
 The post1 CUDA lifecycle gate exposed a checkpoint recovery failure in the
