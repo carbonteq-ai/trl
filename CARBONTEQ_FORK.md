@@ -5,10 +5,10 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
-Fork status: `candidate`, version `1.12.0.post3`, bounded raw-parity correction.
-Post3 source branch: `codex/trl-parity-probe-bound`. Publication and live GPU
-qualification remain open.
-Previous post2 checkpoint-recovery release follows.
+Fork status: `candidate`, version `1.12.0.post4`, bounded raw-parity correction.
+Post4 source branch: `codex/trl-parity-probe-bound`. It includes the trainer
+initializer plumbing required by the post3 configuration surface; publication
+and live GPU qualification remain open. Previous post3/post2 releases follow.
 Post2 release commit: `95a787b6c04f91a5d485fd827d31b1e1fb67ae8e`.
 Tag: `carbonteq-v1.12.0.post2` (retained GitHub prerelease).
 Wheel SHA-256: `8b19cd7fad5a28cf9ced4a7fac93bfaaedaac154faf019a3d3dd6abeaaa45c26`.

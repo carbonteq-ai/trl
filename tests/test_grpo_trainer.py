@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import inspect
 import os
 import warnings
 from collections.abc import Callable
@@ -176,6 +177,14 @@ def test_vllm_policy_parity_token_budget_requires_positive_value(tmp_path, value
 def test_vllm_policy_parity_sequence_budget_requires_at_least_two_tokens(tmp_path, value):
     with pytest.raises(ValueError, match="max_sequence_tokens must be an integer greater than one"):
         GRPOConfig(output_dir=tmp_path, vllm_policy_parity_max_sequence_tokens=value)
+
+
+def test_vllm_policy_parity_sequence_budget_is_copied_to_trainer():
+    init_source = inspect.getsource(GRPOTrainer.__init__)
+
+    assert (
+        "self.vllm_policy_parity_max_sequence_tokens = args.vllm_policy_parity_max_sequence_tokens" in init_source
+    )
 
 
 @pytest.mark.parametrize("value", [0.0, -0.1, float("inf"), float("nan")])

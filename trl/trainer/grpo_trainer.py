@@ -807,6 +807,7 @@ class GRPOTrainer(_BaseTrainer):
         self.vllm_importance_sampling_clip_min = args.vllm_importance_sampling_clip_min
         self.vllm_policy_parity_max_mean_logp_delta = args.vllm_policy_parity_max_mean_logp_delta
         self.vllm_policy_parity_max_tokens = args.vllm_policy_parity_max_tokens
+        self.vllm_policy_parity_max_sequence_tokens = args.vllm_policy_parity_max_sequence_tokens
         self._vllm_policy_parity_checked = False
         self.logits_chunk_size = args.logits_chunk_size
         self.use_liger_kernel = args.use_liger_kernel
