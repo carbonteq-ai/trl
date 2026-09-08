@@ -1,0 +1,36 @@
+type: task
+name: trl-async-parity-server
+image: registry.carbonteq.com/carbonteq/posttrain/nanbeige-vllm@sha256:bfbeee151fb59c687f7e27d5e5e287716a7c1c6dd58ebf0a4ffe99b13702a3aa
+shell: /bin/bash
+commands:
+  - >-
+    python -c
+    'import json, torch, transformers, vllm;
+    print(json.dumps({"torch": torch.__version__, "transformers": transformers.__version__, "vllm": vllm.__version__}, sort_keys=True))'
+  - >-
+    exec env VLLM_SERVER_DEV_MODE=1 HF_HUB_CACHE=/root/.cache/huggingface/hub
+    vllm serve Qwen/Qwen2.5-0.5B-Instruct
+    --host 0.0.0.0 --port 8000 --dtype half --enforce-eager
+    --max-model-len 512 --max-num-seqs 2 --gpu-memory-utilization 0.45
+    --logprobs-mode processed_logprobs
+    --weight-transfer-config '{"backend":"nccl"}'
+ports:
+  - 8000
+volumes:
+  - /var/lib/posttrain/cache/huggingface:/root/.cache/huggingface
+resources:
+  cpu: 8..
+  memory: 24GB..
+  gpu:
+    vendor: nvidia
+    count: 1
+    memory: 96GB..
+fleets:
+  - local-gpu-workers
+max_duration: 30m
+stop_duration: 2m
+retry: false
+tags:
+  purpose: trl-async-changed-weight-parity-server
+  trl_revision: c5b3f5adc2806dd1e8f15be182d8dda74e84e3bb
+  model: qwen2.5-0.5b-instruct
