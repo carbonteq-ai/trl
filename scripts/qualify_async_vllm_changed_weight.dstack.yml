@@ -55,5 +55,5 @@ stop_duration: 2m
 retry: false
 tags:
   purpose: trl-async-changed-weight-parity
-  trl_revision: c5b3f5ad3484d79d5d1f665282169b3b8938b6d0
+  trl_revision: c5b3f5adc2806dd1e8f15be182d8dda74e84e3bb
   model: qwen2.5-0.5b-instruct
