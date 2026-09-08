@@ -87,6 +87,11 @@ class AsyncVllmSession:
         self._sleep_level = sleep_level
         self._phase = SessionPhase.READY
         self._policy_version: str | None = None
+        # AsyncLLM starts resident. vLLM supports a staged wake: weights can be
+        # restored for synchronization while KV cache and request scheduling
+        # remain suspended, then generation capacity is restored on open.
+        self._weights_resident = True
+        self._generation_ready = True
         self._requests: dict[str, asyncio.Task[Any]] = {}
         self._lock = asyncio.Lock()
 
@@ -110,7 +115,9 @@ class AsyncVllmSession:
             self._require_phase(SessionPhase.READY, SessionPhase.SUSPENDED)
             if self._requests:
                 raise RuntimeError("cannot synchronize a policy while generation requests are active")
-            await self._engine.wake_up(tags=["weights"])
+            if not self._weights_resident:
+                await self._engine.wake_up(tags=["weights"])
+                self._weights_resident = True
             result = self._synchronize(version)
             if inspect.isawaitable(result):
                 await result
@@ -125,6 +132,11 @@ class AsyncVllmSession:
                 raise RuntimeError(
                     f"cannot open policy {version!r}; synchronized policy is {self._policy_version!r}"
                 )
+            if not self._generation_ready:
+                # A weights-only wake intentionally leaves vLLM's scheduler
+                # paused until the KV cache is resident again.
+                await self._engine.wake_up(tags=["kv_cache"])
+                self._generation_ready = True
             self._phase = SessionPhase.COLLECTING
 
     async def generate(self, request: AsyncGenerationRequest) -> Any:
@@ -164,12 +176,22 @@ class AsyncVllmSession:
             self._phase = SessionPhase.DRAINING
 
     async def abort(self, request_id: str) -> bool:
-        """Abort a live request.  ``False`` means it already reached a terminal state."""
+        """Cancel a live request and wait for its engine-abort acknowledgement.
+
+        ``False`` means the request already reached a terminal state.  A
+        successful return guarantees that the request task cannot later be
+        mistaken for a completed rollout.
+        """
         async with self._lock:
-            live = request_id in self._requests
-        if live:
-            await self._engine.abort(request_id)
-        return live
+            task = self._requests.get(request_id)
+        if task is None:
+            return False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return True
 
     async def drain(self) -> None:
         """Wait until every admitted request is terminal without admitting new work."""
@@ -189,6 +211,8 @@ class AsyncVllmSession:
             if self._requests:
                 raise RuntimeError("cannot suspend vLLM while generation requests are active")
             await self._engine.sleep(level=self._sleep_level)
+            self._weights_resident = False
+            self._generation_ready = False
             self._phase = SessionPhase.SUSPENDED
 
     async def aclose(self) -> None:
@@ -199,14 +223,23 @@ class AsyncVllmSession:
             request_ids = tuple(self._requests)
             self._phase = SessionPhase.DRAINING
         for request_id in request_ids:
-            await self._engine.abort(request_id)
+            await self.abort(request_id)
         async with self._lock:
             requests = tuple(self._requests.values())
         if requests:
             await asyncio.gather(*requests, return_exceptions=True)
-        self._engine.shutdown()
-        async with self._lock:
-            self._phase = SessionPhase.CLOSED
+        try:
+            # vLLM's CUDA allocator expects sleeping allocations to be mapped
+            # before engine teardown. This is a close-only transition; request
+            # admission remains fenced.
+            if not self._generation_ready:
+                await self._engine.wake_up()
+                self._weights_resident = True
+                self._generation_ready = True
+        finally:
+            self._engine.shutdown()
+            async with self._lock:
+                self._phase = SessionPhase.CLOSED
 
     def _require_phase(self, *allowed: SessionPhase) -> None:
         if self._phase not in allowed:

@@ -69,8 +69,9 @@ async def test_requests_complete_independently_and_policy_cannot_change_while_co
     assert engine.sleeps == [1]
 
     await session.synchronize_policy("policy-2")
+    await session.open_policy("policy-2")
     assert synchronized == ["policy-1", "policy-2"]
-    assert engine.wakes == [["weights"], ["weights"]]
+    assert engine.wakes == [["weights"], ["kv_cache"]]
 
 
 @pytest.mark.asyncio
@@ -85,10 +86,26 @@ async def test_abort_and_close_fence_requests_and_shutdown_once():
     await engine.started["one"].wait()
 
     assert await session.abort("one") is True
-    assert await task == {"request_id": "one"}
+    with pytest.raises(asyncio.CancelledError):
+        await task
     assert await session.abort("one") is False
     await session.aclose()
     await session.aclose()
     assert engine.aborted == ["one"]
     assert engine.shutdowns == 1
     assert session.phase is SessionPhase.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_close_wakes_a_suspended_engine_before_shutdown():
+    engine = FakeAsyncEngine()
+    session = AsyncVllmSession(engine, lambda _version: None)
+    await session.synchronize_policy("policy-1")
+    await session.open_policy("policy-1")
+    await session.suspend_for_update()
+
+    await session.aclose()
+
+    assert engine.sleeps == [1]
+    assert engine.wakes == [None]
+    assert engine.shutdowns == 1

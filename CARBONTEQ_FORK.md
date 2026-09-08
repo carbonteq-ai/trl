@@ -83,11 +83,21 @@ independent asynchronous requests, explicitly aborts and drains them, and only
 then allows inference residency to sleep for an optimizer update. The session
 does not own environments, rewards, worker processes, or actor computation.
 It is an additive foundation for the Posttrain rollout-execution workstream;
-it is not yet connected to a trainer's vLLM construction path or qualified on
-a GPU. `tests/test_async_vllm_session.py` proves independent completion,
+it is not yet connected to a trainer's vLLM construction path.
+`tests/test_async_vllm_session.py` proves independent completion,
 policy-version fencing, abort, drain, sleep/wake ordering, and idempotent
-shutdown with a deterministic async engine double. The consumer must retain
-the existing actor/sampler parity gate before this can be promoted.
+shutdown with a deterministic async engine double. The selected vLLM 0.25.1
+surface is checked by `tests/test_async_vllm_runtime_contract.py`.
+`scripts/qualify_async_vllm_lifecycle.py` is the bounded real-engine gate. On
+2026-09-08 it passed locally with `Qwen/Qwen2.5-0.5B-Instruct`, two resident
+sequences, a 512-token context, and vLLM 0.25.1: one request was explicitly
+cancelled, two collection rounds completed with sampled-token logprobs, and
+the engine drained, slept, restored weights and KV cache in separate stages,
+and shut down cleanly. This exposed and fixed two native lifecycle details:
+the initial resident engine must not be woken, and a weights-only wake leaves
+request scheduling paused until the KV cache is restored. Actor-to-engine
+changed-weight parity remains open, so the consumer must retain the existing
+actor/sampler parity gate before this can be promoted.
 
 ### Stable-base integration (2026-09-06)
 
