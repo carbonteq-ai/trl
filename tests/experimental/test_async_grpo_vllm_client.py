@@ -50,3 +50,10 @@ def test_server_introspection_request_checks_status():
     with patch("requests.get", return_value=_response(status_code=401)):
         with pytest.raises(requests.HTTPError, match="HTTP 401"):
             client.get_world_size()
+
+
+def test_readiness_client_works_without_accelerate_state():
+    client = VLLMClient("http://rollout.internal:8000")
+
+    with patch("requests.get", return_value=_response()):
+        client.wait_for_server_ready()

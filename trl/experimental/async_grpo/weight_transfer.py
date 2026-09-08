@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import threading
 import time
 from collections import Counter
-
-from accelerate.logging import get_logger
 
 from ...import_utils import is_vllm_available
 from .vllm_client import VLLMClient
@@ -27,7 +26,7 @@ if is_vllm_available(min_version="0.22.0"):
     from vllm.utils.network_utils import get_ip, get_open_port
 
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class WeightTransferClient:
