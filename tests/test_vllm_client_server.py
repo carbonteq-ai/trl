@@ -15,6 +15,7 @@
 import os
 import subprocess
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
@@ -72,6 +73,15 @@ class TestParseLogprobs(TrlTestCase):
 
     def test_returns_none_when_logprobs_missing(self):
         assert parse_logprobs([None]) == (None, None)
+
+
+def test_vllm_client_accepts_successful_post_without_json_body():
+    client = VLLMClient.__new__(VLLMClient)
+    client.session = Mock()
+    response = Mock(status_code=200, content=b"", text="")
+    client.session.post.return_value = response
+
+    assert client._post("http://rollout.internal/reset_prefix_cache") == {}
 
 
 class TestExtractLogprobs(TrlTestCase):

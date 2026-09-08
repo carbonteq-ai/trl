@@ -252,6 +252,8 @@ class VLLMClient:
         response = self.session.post(url, **kwargs)
         if response.status_code != 200:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
+        if not response.content:
+            return {}
         return response.json()
 
     def check_server(self, total_timeout: float = 0.0, retry_interval: float = 2.0):
