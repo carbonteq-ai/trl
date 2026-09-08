@@ -120,7 +120,10 @@ experimental trainers to avoid divergent update behavior.
 
 `tests/experimental/test_async_grpo_trainer.py` proves the exact
 prepare/pause/transfer/resume/publish order and that preparation blocks until
-an admitted model request acknowledges completion. The broader experimental
+an admitted model request acknowledges completion. It also proves that a
+weight-transfer exception leaves the prior model version authoritative and
+never resumes inference or publishes/reopens the pending version; the error is
+run-fatal and propagates to the trainer. The broader experimental
 trainer suite remains subject to its optional Flash Attention `kernels`
 runtime dependency. This local candidate is not part of the published post5
 package and has not passed changed-weight GPU qualification.

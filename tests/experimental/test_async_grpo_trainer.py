@@ -180,6 +180,45 @@ def test_weight_sync_closes_admission_before_pause_and_reopens_after_resume():
     assert events == [("prepare", 5), "pause", "barrier", "transfer", "barrier", "resume", ("publish", 5)]
 
 
+def test_weight_sync_failure_never_publishes_or_reopens_rollout_admission():
+    PartialState()
+    events = []
+    trainer = AsyncGRPOTrainer.__new__(AsyncGRPOTrainer)
+    trainer.model_version = 4
+    trainer.model = MagicMock()
+    trainer.model.named_parameters.return_value = ()
+    trainer._metrics = {"train": defaultdict(list)}
+    trainer.accelerator = MagicMock()
+    trainer.accelerator.is_main_process = True
+    trainer.accelerator.device = torch.device("cpu")
+    trainer.accelerator.wait_for_everyone.side_effect = lambda: events.append("barrier")
+    trainer.rollout_worker = MagicMock()
+    trainer.rollout_worker.prepare_model_update.side_effect = lambda version: events.append(
+        ("prepare", version)
+    )
+    trainer.rollout_worker.update_model_version.side_effect = lambda version: events.append(
+        ("publish", version)
+    )
+    trainer.weight_transfer = MagicMock()
+    trainer.weight_transfer.pause.side_effect = lambda: events.append("pause")
+
+    def fail_transfer(iterator):
+        tuple(iterator)
+        events.append("transfer_failed")
+        raise RuntimeError("weight transport failed")
+
+    trainer.weight_transfer.send_weights.side_effect = fail_transfer
+    trainer.weight_transfer.resume.side_effect = lambda: events.append("resume")
+
+    with pytest.raises(RuntimeError, match="weight transport failed"):
+        trainer._sync_weight()
+
+    assert trainer.model_version == 4
+    assert events == [("prepare", 5), "pause", "barrier", "transfer_failed"]
+    trainer.weight_transfer.resume.assert_not_called()
+    trainer.rollout_worker.update_model_version.assert_not_called()
+
+
 def test_prepare_model_update_waits_for_admitted_model_requests():
     ctx = mp.get_context("spawn")
     rollout_worker = AsyncRolloutWorker.__new__(AsyncRolloutWorker)
