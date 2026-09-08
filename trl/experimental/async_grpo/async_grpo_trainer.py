@@ -23,7 +23,7 @@ import textwrap
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from multiprocessing.queues import Queue as MPQueue
 from typing import Any, Protocol
@@ -143,6 +143,23 @@ class RolloutWorkerProtocol(Protocol):
     def check_health(self, stale_after_s: float) -> None:
         """Raise if the worker has crashed or stopped producing within `stale_after_s` seconds."""
         ...
+
+
+class StatefulRolloutWorkerProtocol(Protocol):
+    """Optional recovery hooks for custom rollout workers.
+
+    Each group id occurrence acknowledges one sample admitted into a learner
+    microbatch; duplicates are therefore meaningful. It does not mean that
+    generation or enqueueing consumed a task. State must contain only durable
+    scheduling metadata; live environment or inference-process state is never
+    serialized.
+    """
+
+    def acknowledge_consumed_samples(self, group_ids: Sequence[int]) -> None: ...
+
+    def rollout_state_dict(self) -> Mapping[str, Any]: ...
+
+    def load_rollout_state_dict(self, state: Mapping[str, Any]) -> None: ...
 
 
 class WeightTransferProtocol(Protocol):
@@ -545,6 +562,7 @@ class DataCollatorForRollout(DataCollatorMixin):
     metrics: dict[str, list] = field(default_factory=lambda: defaultdict(list))
     # Per-row token cap of the planner,
     token_budget: int = 0
+    acknowledge_consumed_samples: Callable[[Sequence[int]], None] | None = None
 
     def torch_call(self, examples: list[Any]) -> dict[str, Any]:
         # The dataloader uses batch_size=1 over a planner that pre-partitions each micro-batch into `num_processes`
@@ -578,7 +596,10 @@ class DataCollatorForRollout(DataCollatorMixin):
         advantages = pad(advantages, padding_value=0.0)
 
         all_examples = [example for group in groups for example in group]
-        self.groups_trained.update(example["group_id"] for example in all_examples)
+        consumed_group_ids = tuple(int(example["group_id"]) for example in all_examples)
+        self.groups_trained.update(consumed_group_ids)
+        if self.acknowledge_consumed_samples is not None:
+            self.acknowledge_consumed_samples(consumed_group_ids)
 
         # Total valid completion tokens across all samples in the full batch.
         # Repeated per rank so that DataLoaderDispatcher (dispatch_batches=True) slices correctly on dim=0
@@ -1062,6 +1083,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     # `or 0` because only rank 0 fills an unset budget from the vLLM server above; the other ranks
                     # construct the collator (and never use it) while `token_budget` is still `None`.
                     token_budget=max(self.args.token_budget or 0, 0),
+                    acknowledge_consumed_samples=getattr(
+                        self.rollout_worker, "acknowledge_consumed_samples", None
+                    ),
                 ),
                 num_workers=0,
                 # NOTE(@aminediro):
@@ -1359,16 +1383,23 @@ class AsyncGRPOTrainer(_BaseTrainer):
         logger.info(f"Weight sync: done. Total {weight_sync_s:.1f}s")
 
     def _save_checkpoint(self, model, trial):
-        if self.accelerator.is_main_process and isinstance(self.rollout_worker, AsyncRolloutWorker):
+        if self.accelerator.is_main_process and self.rollout_worker is not None:
             checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
             checkpoint_dir = os.path.join(self._get_output_dir(trial=trial), checkpoint_folder)
             os.makedirs(checkpoint_dir, exist_ok=True)
-            trained = self._trained_groups
-            first_untrained = next(g for g in itertools.count() if g not in trained)
-            prompt_index = self.rollout_worker._loop_kwargs["dataset_start_index"] + first_untrained
-            rollout_state = {"prompt_index": prompt_index}
-            with open(os.path.join(checkpoint_dir, "rollout_state.json"), "w") as f:
-                json.dump(rollout_state, f)
+            state_getter = getattr(self.rollout_worker, "rollout_state_dict", None)
+            if callable(state_getter):
+                rollout_state = {"format_version": 1, "worker": dict(state_getter())}
+            elif isinstance(self.rollout_worker, AsyncRolloutWorker):
+                trained = self._trained_groups
+                first_untrained = next(g for g in itertools.count() if g not in trained)
+                prompt_index = self.rollout_worker._loop_kwargs["dataset_start_index"] + first_untrained
+                rollout_state = {"prompt_index": prompt_index}
+            else:
+                rollout_state = None
+            if rollout_state is not None:
+                with open(os.path.join(checkpoint_dir, "rollout_state.json"), "w") as f:
+                    json.dump(rollout_state, f)
         super()._save_checkpoint(model, trial)
 
     def _inner_training_loop(self, *args, **kwargs):
@@ -1394,6 +1425,23 @@ class AsyncGRPOTrainer(_BaseTrainer):
                         rollout_state = json.load(f)
                     self.rollout_worker._loop_kwargs["dataset_start_index"] = rollout_state["prompt_index"]
                     self._groups_before_resume = rollout_state["prompt_index"]
+        elif self.rollout_worker is not None:
+            resume_from_checkpoint = kwargs.get("resume_from_checkpoint")
+            state_loader = getattr(self.rollout_worker, "load_rollout_state_dict", None)
+            if resume_from_checkpoint is not None and callable(state_loader):
+                rollout_state_file = os.path.join(resume_from_checkpoint, "rollout_state.json")
+                if not os.path.isfile(rollout_state_file):
+                    logger.warning(
+                        "rollout_state.json not found in the checkpoint; custom rollout scheduling restarts fresh."
+                    )
+                else:
+                    with open(rollout_state_file) as f:
+                        rollout_state = json.load(f)
+                    if rollout_state.get("format_version") != 1 or not isinstance(
+                        rollout_state.get("worker"), dict
+                    ):
+                        raise ValueError("checkpoint has an unsupported custom rollout worker state")
+                    state_loader(rollout_state["worker"])
         try:
             return super()._inner_training_loop(*args, **kwargs)
         finally:

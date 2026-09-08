@@ -473,6 +473,41 @@ class TestRolloutStateCheckpoint(TrlTestCase):
         # `num_train_epochs` more passes on top of the ones already done.
         assert trainer._groups_before_resume == 77
 
+    def test_custom_worker_state_is_saved_and_loaded_without_live_runtime_state(self):
+        class StatefulWorker:
+            def __init__(self):
+                self.loaded = None
+
+            def rollout_state_dict(self):
+                return {"cursor": 12, "replay_groups": [13, 15]}
+
+            def load_rollout_state_dict(self, state):
+                self.loaded = state
+
+        worker = StatefulWorker()
+        trainer = AsyncGRPOTrainer.__new__(AsyncGRPOTrainer)
+        trainer.accelerator = MagicMock()
+        trainer.accelerator.is_main_process = True
+        trainer.rollout_worker = worker
+        trainer.state = MagicMock(global_step=5)
+        trainer._get_output_dir = lambda trial: self.tmp_dir
+
+        with patch.object(_BaseTrainer, "_save_checkpoint"):
+            trainer._save_checkpoint(MagicMock(), None)
+
+        checkpoint_dir = os.path.join(self.tmp_dir, "checkpoint-5")
+        with open(os.path.join(checkpoint_dir, "rollout_state.json")) as f:
+            assert json.load(f) == {
+                "format_version": 1,
+                "worker": {"cursor": 12, "replay_groups": [13, 15]},
+            }
+
+        trainer.accelerator.is_main_process = False
+        with patch.object(_BaseTrainer, "_inner_training_loop", return_value=None):
+            trainer._inner_training_loop(resume_from_checkpoint=checkpoint_dir)
+
+        assert worker.loaded == {"cursor": 12, "replay_groups": [13, 15]}
+
 
 class TestAsyncRolloutWorkerEnvironments(TrlTestCase):
     """Unit tests for the rollout worker's environment/tool wiring (no vLLM required)."""
@@ -713,6 +748,25 @@ class TestPackingAwareBatching(TrlTestCase):
         assert collator.metrics["reward"] == [0.5]  # (0.5 + 0.25 + 0.75 + 0.5) / 4
         assert collator.metrics["batch/samples_per_row"] == [2.0]
         assert collator.metrics["batch/pad_frac"] == [(0, 10)]  # rows pack equal -> no inter-rank padding
+
+    def test_collator_acknowledges_each_samples_group_identity(self):
+        acknowledged = []
+        collator = DataCollatorForRollout(
+            pad_token_id=0,
+            num_processes=2,
+            acknowledge_consumed_samples=lambda group_ids: acknowledged.append(tuple(group_ids)),
+        )
+        first = _rollout_sample(2)
+        first["group_id"] = 7
+        sibling = _rollout_sample(2)
+        sibling["group_id"] = 7
+        second = _rollout_sample(2)
+        second["group_id"] = 9
+
+        collator([[[first, sibling], [second]]])
+
+        assert acknowledged == [(7, 7, 9)]
+        assert collator.groups_trained == {7, 9}
 
     def test_collator_handles_a_ragged_metric_key_set(self):
         # A micro-batch mixes samples that carry `tools/*` with samples that do not. Both orderings matter: a first

@@ -125,6 +125,25 @@ trainer suite remains subject to its optional Flash Attention `kernels`
 runtime dependency. This local candidate is not part of the published post5
 package and has not passed changed-weight GPU qualification.
 
+### Custom async worker consumption and recovery seam (2026-09-09)
+
+The experimental async GRPO trainer now offers optional, backend-neutral hooks
+for custom rollout workers to receive the group identity of every sample
+admitted into a learner microbatch and to save or restore JSON scheduling state
+with the trainer checkpoint. The acknowledgement occurs at learner collation,
+not generation or queue publication, so an external task cursor does not move
+merely because speculative work was produced. Duplicate group identities are
+preserved because one microbatch may consume multiple siblings.
+
+The trainer persists only the custom worker's declared scheduling metadata.
+It does not serialize queues, environments, model requests, subprocesses, or
+other live runtime state. Existing `AsyncRolloutWorker` prompt-index recovery
+remains unchanged, and workers that do not implement the optional hooks retain
+their prior behavior. Focused tests cover per-sample acknowledgement and custom
+state save/load ordering. The Posttrain consumer must still enforce whole-group
+checkpoint boundaries for algorithms whose replay cannot tolerate a partially
+consumed group; this generic hook does not invent that algorithm policy.
+
 ### Stable-base integration (2026-09-06)
 
 The post1 CUDA lifecycle gate exposed a checkpoint recovery failure in the
