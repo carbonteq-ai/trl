@@ -5,10 +5,11 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
-Fork status: `candidate`, version `1.12.0.post6`.
-Pushed development implementation `e3f49dc796d1013ff735bc383103ca552be51a34` on
-`codex/posttrain-v04-dev` adds padding-free parity scoring for heterogeneous
-hybrid-model rows. It is source-qualified but not yet a published distribution.
+Fork status: `candidate`, version `1.12.0.post7`.
+Post7 adds padding-free parity scoring for heterogeneous hybrid-model rows and
+documents the native LFM LoRA namespace. The functional implementation is
+`e3f49dc796d1013ff735bc383103ca552be51a34`; the release commit and retained
+artifact digests are recorded after the immutable build.
 Post6 consolidates the asynchronous rollout-session lifecycle, changed-weight
 transfer fencing, checkpointed custom rollout scheduling, bounded agent
 collection, and complete-group acknowledgement described below. Its immutable
