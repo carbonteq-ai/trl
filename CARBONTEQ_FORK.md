@@ -8,8 +8,14 @@ Posttrain framework.
 Fork status: `candidate`, version `1.12.0.post8`.
 Post8 publishes the continuous-batched colocated request mode, session-owned
 LoRA refresh, and async parity-probe routing described below. Its functional
-implementation is `3cb133fd8ed685d2ddad5d729cbc4f894b9e1209`; the immutable
-release commit and retained artifact digests are recorded after the build.
+implementation is `3cb133fd8ed685d2ddad5d729cbc4f894b9e1209`; immutable release
+commit `6dfc69db939144d270cbcbbed17294262b5ac6f4` is tagged
+`carbonteq-v1.12.0.post8`. Wheel SHA-256:
+`aabf5a52b9f8a20db32e9da5847fd2584e18ba8cfb12f2e79ec7db146db8ffa4`;
+sdist SHA-256:
+`74ff559792ee20df94b2576a09c8962508ee66e2571e7b353ec516b9320ac721`.
+Posttrain retained-asset publisher `34393365885` passed exact-byte development
+readback and clean installation.
 Post7 adds padding-free parity scoring for heterogeneous hybrid-model rows and
 documents the native LFM LoRA namespace. The functional implementation is
 `e3f49dc796d1013ff735bc383103ca552be51a34`; immutable release commit
