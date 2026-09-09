@@ -167,6 +167,28 @@ def test_vllm_policy_parity_probe_bounds_each_sequence_and_left_truncates_prompt
     assert rows == [0]
 
 
+def test_vllm_policy_parity_actor_scoring_does_not_pad_or_batch_heterogeneous_rows():
+    trainer = object.__new__(GRPOTrainer)
+    calls = []
+
+    def score(_model, input_ids, attention_mask, logits_to_keep, batch_size, temperature):
+        calls.append((input_ids.clone(), attention_mask.clone(), logits_to_keep, batch_size, temperature))
+        return torch.arange(logits_to_keep).unsqueeze(0).float(), None, None
+
+    trainer._get_per_token_logps_and_entropies = score
+    rows = trainer._score_vllm_policy_parity_actor_logps(
+        object(),
+        [[1, 2, 3], [4]],
+        [[10, 11], [20, 21, 22]],
+        torch.device("cpu"),
+    )
+
+    assert [call[0].tolist() for call in calls] == [[[1, 2, 3, 10, 11]], [[4, 20, 21, 22]]]
+    assert [call[1].tolist() for call in calls] == [[[1, 1, 1, 1, 1]], [[1, 1, 1, 1]]]
+    assert [(call[2], call[3], call[4]) for call in calls] == [(2, 1, 1.0), (3, 1, 1.0)]
+    assert [row.tolist() for row in rows] == [[0.0, 1.0], [0.0, 1.0, 2.0]]
+
+
 @pytest.mark.parametrize("value", [0, -1, True])
 def test_vllm_policy_parity_token_budget_requires_positive_value(tmp_path, value):
     with pytest.raises(ValueError, match="max_tokens must be a positive integer"):
@@ -182,9 +204,7 @@ def test_vllm_policy_parity_sequence_budget_requires_at_least_two_tokens(tmp_pat
 def test_vllm_policy_parity_sequence_budget_is_copied_to_trainer():
     init_source = inspect.getsource(GRPOTrainer.__init__)
 
-    assert (
-        "self.vllm_policy_parity_max_sequence_tokens = args.vllm_policy_parity_max_sequence_tokens" in init_source
-    )
+    assert "self.vllm_policy_parity_max_sequence_tokens = args.vllm_policy_parity_max_sequence_tokens" in init_source
 
 
 @pytest.mark.parametrize("value", [0.0, -0.1, float("inf"), float("nan")])

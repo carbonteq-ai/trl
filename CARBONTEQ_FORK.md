@@ -374,7 +374,13 @@ masked rows are excluded from the parity probe.
 The one-time raw-parity probe also has an independent prompt-plus-completion
 sequence bound. It left-truncates only the probe prompt and sends that exact
 bounded context to both vLLM and the actor. Actor recomputation runs only over
-the selected probe rows, rather than the full padded rollout batch. This keeps
+the selected probe rows, rather than the full padded rollout batch. Each probe
+row is scored independently without synthetic padding. Padding prompts and
+completions to separate batch maxima can nearly double the actor sequence width
+and changes recurrent/convolutional model state even when the attention mask is
+zero. A retained LFM2.5 AutomationBench trajectory measured `0.00658` mean
+selected-token delta unpadded and `0.06207` after 2,700 leading pad tokens,
+which falsely exceeded the `0.05` weight-parity limit. This keeps
 the synchronization gate meaningful while preventing a safety check from
 materializing an unrelated production-sized actor forward; rollout and update
 sequences are unchanged.

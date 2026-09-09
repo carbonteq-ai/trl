@@ -2685,6 +2685,30 @@ class GRPOTrainer(_BaseTrainer):
                 break
         return probe_prompts, probe_completions, probe_masks, source_rows
 
+    def _score_vllm_policy_parity_actor_logps(
+        self,
+        model,
+        prompt_ids: list[list[int]],
+        completion_ids: list[list[int]],
+        device: torch.device,
+    ) -> list[torch.Tensor]:
+        """Score parity rows without padding that can change hybrid-model state."""
+        rows = []
+        for prompt, completion in zip(prompt_ids, completion_ids, strict=True):
+            input_ids = torch.tensor([prompt + completion], dtype=torch.long, device=device)
+            attention_mask = torch.ones_like(input_ids)
+            with torch.no_grad():
+                logps, _, _ = self._get_per_token_logps_and_entropies(
+                    model,
+                    input_ids,
+                    attention_mask,
+                    len(completion),
+                    batch_size=1,
+                    temperature=1.0,
+                )
+            rows.append(logps[0, : len(completion)])
+        return rows
+
     def _generate_and_score_completions(
         self, inputs: list[dict[str, torch.Tensor | Any]]
     ) -> dict[str, torch.Tensor | Any]:
@@ -2911,41 +2935,12 @@ class GRPOTrainer(_BaseTrainer):
                     probe_prompts,
                     probe_completions,
                 )
-            probe_prompt_ids = [torch.tensor(ids) for ids in probe_prompts]
-            probe_prompt_mask = [torch.ones_like(ids, dtype=torch.long) for ids in probe_prompt_ids]
-            probe_prompt_ids = pad(
-                probe_prompt_ids,
-                padding_value=self._tokenizer.pad_token_id,
-                padding_side="left",
-                pad_to_multiple_of=self.pad_to_multiple_of,
-            ).to(device=device)
-            probe_prompt_mask = pad(
-                probe_prompt_mask,
-                padding_value=0,
-                padding_side="left",
-                pad_to_multiple_of=self.pad_to_multiple_of,
-            ).to(device=device)
-            probe_completion_ids = [torch.tensor(ids) for ids in probe_completions]
-            probe_completion_mask = [torch.ones_like(ids, dtype=torch.long) for ids in probe_completion_ids]
-            probe_completion_ids = pad(
-                probe_completion_ids,
-                padding_value=self._tokenizer.pad_token_id,
-                padding_side="right",
-                pad_to_multiple_of=self.pad_to_multiple_of,
-            ).to(device=device)
-            probe_completion_mask = pad(
-                probe_completion_mask,
-                padding_value=0,
-                padding_side="right",
-                pad_to_multiple_of=self.pad_to_multiple_of,
-            ).to(device=device)
             parity_probe = (
                 vllm_raw_logps,
                 probe_masks,
                 source_rows,
-                torch.cat([probe_prompt_ids, probe_completion_ids], dim=1),
-                torch.cat([probe_prompt_mask, probe_completion_mask], dim=1),
-                probe_completion_ids.size(1),
+                probe_prompts,
+                probe_completions,
             )
 
         # Concatenate prompt_mask with completion_mask for logit computation
@@ -3407,32 +3402,25 @@ class GRPOTrainer(_BaseTrainer):
                     vllm_raw_logps,
                     probe_masks,
                     source_rows,
-                    probe_input_ids,
-                    probe_attention_mask,
-                    probe_logits_to_keep,
+                    probe_prompts,
+                    probe_completions,
                 ) = parity_probe
-                actor_raw_logps, _, _ = self._get_per_token_logps_and_entropies(
+                actor_raw_logps = self._score_vllm_policy_parity_actor_logps(
                     self.model,
-                    probe_input_ids,
-                    probe_attention_mask,
-                    probe_logits_to_keep,
-                    batch_size,
-                    temperature=1.0,
+                    probe_prompts,
+                    probe_completions,
+                    device,
                 )
 
                 parity_deltas = []
-                for _source_row, vllm_row, probe_mask in zip(
-                    source_rows, vllm_raw_logps, probe_masks, strict=True
-                ):
+                for _source_row, vllm_row, probe_mask in zip(source_rows, vllm_raw_logps, probe_masks, strict=True):
                     if len(vllm_row) != len(probe_mask):
                         raise RuntimeError("vLLM parity log-probabilities do not align with the probe completion")
-                    row_actor_logps = actor_raw_logps[len(parity_deltas), : len(vllm_row)]
+                    row_actor_logps = actor_raw_logps[len(parity_deltas)]
                     row_vllm_logps = torch.tensor(vllm_row, device=device, dtype=row_actor_logps.dtype)
                     parity_deltas.append(torch.abs(row_actor_logps - row_vllm_logps).float()[probe_mask])
                 local_parity_delta = (
-                    torch.cat(parity_deltas)
-                    if parity_deltas
-                    else torch.empty(0, device=device, dtype=torch.float32)
+                    torch.cat(parity_deltas) if parity_deltas else torch.empty(0, device=device, dtype=torch.float32)
                 )
                 local_parity_stats = torch.tensor(
                     [local_parity_delta.sum().item(), local_parity_delta.numel()],
@@ -3452,9 +3440,7 @@ class GRPOTrainer(_BaseTrainer):
                 self._metrics[mode]["sampling/policy_parity_logp_difference/max"].append(
                     self.accelerator.gather(parity_max_delta).max().item()
                 )
-                self._metrics[mode]["sampling/policy_parity_logp_difference/token_count"].append(
-                    parity_token_count
-                )
+                self._metrics[mode]["sampling/policy_parity_logp_difference/token_count"].append(parity_token_count)
                 self._enforce_vllm_policy_parity(mode, parity_mean_delta, parity_token_count)
 
         if self.use_vllm and self.vllm_importance_sampling_correction:
