@@ -8,8 +8,14 @@ Posttrain framework.
 Fork status: `candidate`, version `1.12.0.post7`.
 Post7 adds padding-free parity scoring for heterogeneous hybrid-model rows and
 documents the native LFM LoRA namespace. The functional implementation is
-`e3f49dc796d1013ff735bc383103ca552be51a34`; the release commit and retained
-artifact digests are recorded after the immutable build.
+`e3f49dc796d1013ff735bc383103ca552be51a34`; immutable release commit
+`69012155a55923fd759eb43ac07d39df0777c53d` is tagged
+`carbonteq-v1.12.0.post7`. Wheel SHA-256:
+`6ba30192638c3d30cdd933558aa1684f5946684d1f5d843e88ead39fbf9a1efd`;
+sdist SHA-256:
+`6cae6e84014d45e458e48966ec121efede6173ef29b34cf8dd8e66f55d804b52`.
+Posttrain retained-asset publisher `34361897003` passed exact-byte development
+readback and clean installation.
 Post6 consolidates the asynchronous rollout-session lifecycle, changed-weight
 transfer fencing, checkpointed custom rollout scheduling, bounded agent
 collection, and complete-group acknowledgement described below. Its immutable
