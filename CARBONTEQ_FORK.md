@@ -5,7 +5,11 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
-Fork status: `candidate`, version `1.12.0.post7`.
+Fork status: `candidate`, version `1.12.0.post8`.
+Post8 publishes the continuous-batched colocated request mode, session-owned
+LoRA refresh, and async parity-probe routing described below. Its functional
+implementation is `3cb133fd8ed685d2ddad5d729cbc4f894b9e1209`; the immutable
+release commit and retained artifact digests are recorded after the build.
 Post7 adds padding-free parity scoring for heterogeneous hybrid-model rows and
 documents the native LFM LoRA namespace. The functional implementation is
 `e3f49dc796d1013ff735bc383103ca552be51a34`; immutable release commit
@@ -99,7 +103,7 @@ immutable release tag, package hashes, and clean-install verification exist.
 
 ## Maintained delta
 
-### Continuous-batched colocated request mode (unpublished candidate, 2026-09-09)
+### Continuous-batched colocated request mode (2026-09-09)
 
 `GRPOConfig.vllm_request_mode="async"` now selects a lazily constructed
 `AsyncLLM` for colocated LoRA rollouts. The engine is created on the owning
@@ -120,8 +124,9 @@ optimizer semantics; those remain consumer concerns.
 Focused tests in `tests/test_vllm_generation.py` and
 `tests/test_async_vllm_session.py` prove lazy loop ownership, LoRA refresh,
 session reuse, admission/drain/sleep ordering, and rejection of the batch API.
-This candidate is not yet published or pinned by Posttrain. A changed-weight
-GRPO GPU update through the consumer path remains the promotion gate.
+Post8 packages this mode for Posttrain development qualification. A
+changed-weight GRPO GPU update through the consumer path remains the stable
+promotion gate.
 
 ### Asynchronous rollout session foundation (2026-09-08)
 
