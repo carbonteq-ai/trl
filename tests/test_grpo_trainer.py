@@ -271,6 +271,7 @@ class TestGRPORolloutDispatch:
         trainer.accelerator = SimpleNamespace(
             device=torch.device("cpu"),
             is_main_process=True,
+            num_processes=1,
             gather=lambda t: t,
         )
         trainer.args = SimpleNamespace(report_to=[])
