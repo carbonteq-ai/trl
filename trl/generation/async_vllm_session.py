@@ -79,12 +79,14 @@ class AsyncVllmSession:
         synchronize: PolicySynchronizer,
         *,
         sleep_level: int = 1,
+        default_lora_request: Any | None = None,
     ) -> None:
         if sleep_level < 1:
             raise ValueError("async vLLM sleep level must be positive")
         self._engine = engine
         self._synchronize = synchronize
         self._sleep_level = sleep_level
+        self._default_lora_request = default_lora_request
         self._phase = SessionPhase.READY
         self._policy_version: str | None = None
         # AsyncLLM starts resident. vLLM supports a staged wake: weights can be
@@ -156,7 +158,7 @@ class AsyncVllmSession:
                 {"prompt_token_ids": list(request.prompt_token_ids)},
                 request.sampling_params,
                 request.request_id,
-                lora_request=request.lora_request,
+                lora_request=getattr(request, "lora_request", None) or self._default_lora_request,
             ):
                 final_output = output
             if final_output is None:

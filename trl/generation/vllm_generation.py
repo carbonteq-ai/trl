@@ -852,7 +852,12 @@ class VLLMGeneration:
                 raise RuntimeError("vLLM did not acknowledge the refreshed training LoRA adapter")
             await engine.reset_prefix_cache()
 
-        self._async_session = AsyncVllmSession(engine, synchronize_lora, sleep_level=1)
+        self._async_session = AsyncVllmSession(
+            engine,
+            synchronize_lora,
+            sleep_level=1,
+            default_lora_request=self._lora_request,
+        )
         return self._async_session
 
     def _place_features(self, features: dict | None, prompt_ids: list[int]) -> dict | None:

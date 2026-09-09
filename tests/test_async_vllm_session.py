@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,9 +14,11 @@ class FakeAsyncEngine:
         self.wakes = []
         self.sleeps = []
         self.shutdowns = 0
+        self.lora_requests = []
 
     async def generate(self, prompt, sampling_params, request_id, *, lora_request=None):
-        del prompt, sampling_params, lora_request
+        del prompt, sampling_params
+        self.lora_requests.append(lora_request)
         self.started[request_id].set()
         await self.release[request_id].wait()
         yield {"request_id": request_id}
@@ -36,6 +39,24 @@ class FakeAsyncEngine:
 
 def request(request_id):
     return AsyncGenerationRequest(request_id=request_id, prompt_token_ids=(1,), sampling_params={})
+
+
+@pytest.mark.asyncio
+async def test_session_applies_default_lora_to_endpoint_shaped_requests():
+    engine = FakeAsyncEngine()
+    engine.started = {"endpoint": asyncio.Event()}
+    engine.release = {"endpoint": asyncio.Event()}
+    engine.release["endpoint"].set()
+    adapter = object()
+    session = AsyncVllmSession(engine, lambda _version: None, default_lora_request=adapter)
+    await session.synchronize_policy("policy-1")
+    await session.open_policy("policy-1")
+
+    await session.generate(
+        SimpleNamespace(request_id="endpoint", prompt_token_ids=(1,), sampling_params={})
+    )
+
+    assert engine.lora_requests == [adapter]
 
 
 @pytest.mark.asyncio
