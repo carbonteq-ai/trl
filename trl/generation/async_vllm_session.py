@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
@@ -84,6 +84,7 @@ class AsyncVllmSession:
         if sleep_level < 1:
             raise ValueError("async vLLM sleep level must be positive")
         self._engine = engine
+        self._owner_loop = asyncio.get_running_loop()
         self._synchronize = synchronize
         self._sleep_level = sleep_level
         self._default_lora_request = default_lora_request
@@ -96,6 +97,53 @@ class AsyncVllmSession:
         self._generation_ready = True
         self._requests: dict[str, asyncio.Task[Any]] = {}
         self._lock = asyncio.Lock()
+
+    def generate_suspended_batch_blocking(self, requests: Sequence[AsyncGenerationRequest]) -> list[Any]:
+        """Run a bounded probe on the owner loop while training is blocked.
+
+        Synchronous trainers use this for operations such as actor/sampler
+        parity checks after a rollout collection has suspended inference. The
+        engine remains owned by its original event loop and returns to the
+        suspended state before this method returns.
+        """
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is self._owner_loop:
+            raise RuntimeError("blocking async vLLM probes cannot run on the session owner loop")
+        future = asyncio.run_coroutine_threadsafe(self.generate_suspended_batch(requests), self._owner_loop)
+        return future.result()
+
+    async def generate_suspended_batch(self, requests: Sequence[AsyncGenerationRequest]) -> list[Any]:
+        """Temporarily resume a suspended engine for one exclusive probe."""
+        if not requests:
+            raise ValueError("async vLLM probe requires at least one request")
+        async with self._lock:
+            self._require_phase(SessionPhase.SUSPENDED)
+            if self._requests:
+                raise RuntimeError("cannot run an async vLLM probe while generation requests are active")
+            if not self._weights_resident:
+                await self._engine.wake_up(tags=["weights"])
+                self._weights_resident = True
+            if not self._generation_ready:
+                await self._engine.wake_up(tags=["kv_cache"])
+                self._generation_ready = True
+            self._phase = SessionPhase.COLLECTING
+
+        tasks = [asyncio.create_task(self.generate(request)) for request in requests]
+        try:
+            return list(await asyncio.gather(*tasks))
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            if self._phase is SessionPhase.COLLECTING:
+                await self.stop_admission()
+            await self.suspend_for_update()
 
     @property
     def phase(self) -> SessionPhase:

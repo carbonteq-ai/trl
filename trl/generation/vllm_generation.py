@@ -1196,7 +1196,6 @@ class VLLMGeneration:
         local_sequences = [prompt + completion for prompt, completion in zip(prompt_ids, completion_ids, strict=True)]
         local_prompt_lengths = [len(prompt) for prompt in prompt_ids]
 
-        self._wake_weights_for_generation()
         if self.mode == "server":
             all_sequences = gather_object(local_sequences)
             all_prompt_lengths = gather_object(local_prompt_lengths)
@@ -1242,6 +1241,31 @@ class VLLMGeneration:
             prompt_logprobs=1,
             detokenize=False,
         )
+        if getattr(self, "request_mode", "batch") == "async":
+            if self._async_session is None:
+                raise RuntimeError("asynchronous vLLM parity scoring requires an initialized serving session")
+            from .async_vllm_session import AsyncGenerationRequest
+
+            probe_index = getattr(self, "_async_probe_index", 0)
+            self._async_probe_index = probe_index + 1
+            requests = [
+                AsyncGenerationRequest(
+                    request_id=f"trl-parity-{probe_index}-{index}",
+                    prompt_token_ids=tuple(sequence),
+                    sampling_params=sampling_params,
+                )
+                for index, sequence in enumerate(all_sequences)
+            ]
+            with profiler:
+                all_outputs = self._async_session.generate_suspended_batch_blocking(requests)
+            all_logprobs = extract_actual_prompt_logprobs(all_outputs, all_prompt_lengths)
+            if self.tensor_parallel_size > 1:  # guarded by async-mode construction validation
+                local_rank = torch.distributed.get_rank(group=self.tp_group)
+                local_start = sum(gathered_counts[:local_rank])
+                return all_logprobs[local_start : local_start + local_size]
+            return all_logprobs
+
+        self._wake_weights_for_generation()
         if self.enable_sleep_mode:
             self.llm.wake_up(tags=["kv_cache"])
         prompts = [{"prompt_token_ids": sequence} for sequence in all_sequences]

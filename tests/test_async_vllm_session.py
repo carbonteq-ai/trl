@@ -130,3 +130,23 @@ async def test_close_wakes_a_suspended_engine_before_shutdown():
     assert engine.sleeps == [1]
     assert engine.wakes == [None]
     assert engine.shutdowns == 1
+
+
+@pytest.mark.asyncio
+async def test_suspended_batch_probe_resumes_and_resuspends_engine():
+    engine = FakeAsyncEngine()
+    engine.started = {request_id: asyncio.Event() for request_id in ("probe-1", "probe-2")}
+    engine.release = {request_id: asyncio.Event() for request_id in ("probe-1", "probe-2")}
+    for release in engine.release.values():
+        release.set()
+    session = AsyncVllmSession(engine, lambda _version: None)
+    await session.synchronize_policy("policy-1")
+    await session.open_policy("policy-1")
+    await session.suspend_for_update()
+
+    outputs = await session.generate_suspended_batch([request("probe-1"), request("probe-2")])
+
+    assert outputs == [{"request_id": "probe-1"}, {"request_id": "probe-2"}]
+    assert session.phase is SessionPhase.SUSPENDED
+    assert engine.wakes == [["weights"], ["kv_cache"]]
+    assert engine.sleeps == [1, 1]

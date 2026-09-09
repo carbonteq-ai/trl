@@ -664,6 +664,44 @@ def test_colocated_policy_parity_probe_teacher_forces_observed_tokens(monkeypatc
     assert calls == ["wake", "sleep"]
 
 
+def test_async_colocated_policy_parity_probe_uses_serving_session(monkeypatch):
+    captured = {}
+    generation = object.__new__(VLLMGeneration)
+    generation.mode = "colocate"
+    generation.request_mode = "async"
+    generation.tensor_parallel_size = 1
+    generation.enable_sleep_mode = True
+    generation.accelerator = SimpleNamespace()
+    generation._async_probe_index = 0
+
+    class FakeSession:
+        def generate_suspended_batch_blocking(self, requests):
+            captured["requests"] = requests
+            return [
+                SimpleNamespace(
+                    prompt_token_ids=[1, 2, 10, 11],
+                    prompt_logprobs=[
+                        None,
+                        {2: SimpleNamespace(logprob=-0.1)},
+                        {10: SimpleNamespace(logprob=-0.2)},
+                        {11: SimpleNamespace(logprob=-0.3)},
+                    ],
+                )
+            ]
+
+    generation._async_session = FakeSession()
+    monkeypatch.setattr(vllm_generation, "SamplingParams", lambda **kwargs: kwargs, raising=False)
+
+    result = generation.score_completion_logprobs([[1, 2]], [[10, 11]])
+
+    assert result == [[-0.2, -0.3]]
+    assert len(captured["requests"]) == 1
+    request = captured["requests"][0]
+    assert request.request_id == "trl-parity-0-0"
+    assert request.prompt_token_ids == (1, 2, 10, 11)
+    assert request.sampling_params["prompt_logprobs"] == 1
+
+
 def test_lora_sync_rejects_unsupported_execution_shapes(monkeypatch):
     class FakeModel:
         name_or_path = "model"
