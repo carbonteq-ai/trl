@@ -9,7 +9,7 @@ Fork status: `candidate`, version `1.12.0.post7`.
 Post7 adds padding-free parity scoring for heterogeneous hybrid-model rows and
 documents the native LFM LoRA namespace. The functional implementation is
 `e3f49dc796d1013ff735bc383103ca552be51a34`; immutable release commit
-`69012155a55923fd759eb43ac07d39df0777c53d` is tagged
+`69012155b4a3fb2d8296692d0962a821273e650a` is tagged
 `carbonteq-v1.12.0.post7`. Wheel SHA-256:
 `6ba30192638c3d30cdd933558aa1684f5946684d1f5d843e88ead39fbf9a1efd`;
 sdist SHA-256:
