@@ -26,7 +26,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from multiprocessing.queues import Queue as MPQueue
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 import torch
 from accelerate.logging import get_logger
@@ -787,9 +787,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
             implementation to disable trainer-side weight sync.
     """
 
-    _tag_names = ["trl", "async-grpo"]
+    _tag_names: ClassVar[list[str]] = ["trl", "async-grpo"]
     _name = "AsyncGRPO"
-    _paper = {
+    _paper: ClassVar[dict[str, str]] = {
         "title": "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models",
         "id": "2402.03300",
         # docstyle-ignore

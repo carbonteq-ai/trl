@@ -5,8 +5,17 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
-Fork status: `candidate`, version `1.12.0.post5`, complete-group admission.
-Published development candidate source: `b9f3a09369d9cfa21950feef3e110e1fdf779c54`,
+Fork status: `candidate`, version `1.12.0.post6`.
+Post6 consolidates the asynchronous rollout-session lifecycle, changed-weight
+transfer fencing, checkpointed custom rollout scheduling, bounded agent
+collection, and complete-group acknowledgement described below. Its immutable
+release commit, tag, artifact hashes, and development-channel readback are
+recorded only after the build-once publication gates pass. The test extras now
+declare `pytest-asyncio`, so a clean contributor environment can execute the
+async session regressions without an undeclared local dependency.
+
+The last published development candidate is post5, source
+`b9f3a09369d9cfa21950feef3e110e1fdf779c54`,
 tag `carbonteq-v1.12.0.post5`. Retained-asset publisher `34224729623` passed
 clean installation and exact-byte readback. Wheel SHA-256:
 `1f42571c28e178bb292eb7b904940f0d0e4b0ccdf936b23b8bec9704190b6ecb`;

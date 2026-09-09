@@ -495,10 +495,10 @@ class _AsyncRolloutLoop:
             info = (type(e).__name__, str(e), traceback.format_exc())
             try:
                 self._exception_info_queue.put_nowait(info)
-            except Exception:
+            except queue.Full:
                 pass  # queue full (parent hasn't drained a prior failure), best-effort put
             self._failed_event.set()
-            logger.exception(f"Worker process failed: {e}")
+            logger.exception("Worker process failed")
             raise
         finally:
             self._loop.close()
@@ -952,7 +952,7 @@ class _AsyncRolloutLoop:
             try:
                 arguments = function.get("arguments", {})
                 result = tool(**arguments)
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001 - tool failures are trajectory observations
                 n_failures += 1
                 self._counters[f"tools/{name}_failure_total"] += 1
                 result = {"error": str(error)}

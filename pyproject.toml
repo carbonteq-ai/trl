@@ -76,6 +76,7 @@ scikit = [
     "scikit-learn"
 ]
 test = [
+    "pytest-asyncio",
     "pytest-cov",
     "pytest-datadir>=1.7.0",  # lazy datadirs
     "pytest-reportlog",  # test report consumed by scripts/log_reports.py
@@ -125,6 +126,7 @@ dev = [
     "bitsandbytes",
     # scikit: included in bco
     # test
+    "pytest-asyncio",
     "pytest-cov",
     "pytest-datadir>=1.7.0",  # lazy datadirs
     "pytest-reportlog",  # test report consumed by scripts/log_reports.py

@@ -3134,7 +3134,7 @@ class TestGRPOTrainer(TrlTestCase):
             trainer.train()
             # 3 epochs * 2 iterations * 2 generation batches to cover the dataset * 4 steps_per_generation
             assert mock_prepare.call_count == 48
-            for i in range(0, 8):  # Generation batch repeated 8 times (steps_per_generation*num_iterations)
+            for i in range(8):  # Generation batch repeated 8 times (steps_per_generation*num_iterations)
                 assert mock_prepare.call_args_list[i].args[1] == expected_first_generation_batch
             for i in range(8, 16):
                 assert mock_prepare.call_args_list[i].args[1] == expected_second_generation_batch
