@@ -9,8 +9,13 @@ Fork status: `candidate`, version `1.12.0.post6`.
 Post6 consolidates the asynchronous rollout-session lifecycle, changed-weight
 transfer fencing, checkpointed custom rollout scheduling, bounded agent
 collection, and complete-group acknowledgement described below. Its immutable
-release commit, tag, artifact hashes, and development-channel readback are
-recorded only after the build-once publication gates pass. The test extras now
+release commit is `526e284922a0e4d92d7920916398d8be8d36aa85`, tagged
+`carbonteq-v1.12.0.post6`. Wheel SHA-256:
+`57aef51b31fa6e0bfbcd942bddd62bf995f5c2f82e3107bb91cdba7436a1366c`;
+sdist SHA-256:
+`68365d87107b1df3b2fe8227ab64afaceb37a9ce5fd3a8b3c5b6894d5e49d13e`.
+Posttrain retained-asset publisher `34334889582` passed exact-byte
+development-channel readback and clean installation. The test extras now
 declare `pytest-asyncio`, so a clean contributor environment can execute the
 async session regressions without an undeclared local dependency.
 
