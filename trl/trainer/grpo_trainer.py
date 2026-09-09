@@ -1136,6 +1136,7 @@ class GRPOTrainer(_BaseTrainer):
                 group_port=args.vllm_group_port,
                 server_timeout=args.vllm_server_timeout,
                 # Colocate mode configuration
+                request_mode=args.vllm_request_mode,
                 tensor_parallel_size=args.vllm_tensor_parallel_size,
                 gpu_memory_utilization=args.vllm_gpu_memory_utilization,
                 max_model_length=args.vllm_max_model_length,

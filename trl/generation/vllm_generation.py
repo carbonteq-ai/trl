@@ -43,9 +43,10 @@ from .vllm_client import VLLMClient
 
 
 if is_vllm_available():
-    from vllm import LLM, RequestOutput, SamplingParams
+    from vllm import LLM, AsyncEngineArgs, RequestOutput, SamplingParams
     from vllm.lora.request import LoRARequest
     from vllm.sampling_params import StructuredOutputsParams
+    from vllm.v1.engine.async_llm import AsyncLLM
 
 
 logger = logging.getLogger(__name__)
@@ -423,6 +424,7 @@ class VLLMGeneration:
         server_timeout: float = 240.0,
         group_port: int = 51216,
         # Colocate mode configuration
+        request_mode: str = "batch",
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
         max_model_length: int | None = None,
@@ -462,6 +464,15 @@ class VLLMGeneration:
 
         # Colocate mode configuration
         self.tensor_parallel_size = tensor_parallel_size
+        if request_mode not in {"batch", "async"}:
+            raise ValueError("vLLM request_mode must be either 'batch' or 'async'")
+        if request_mode == "async" and mode != "colocate":
+            raise ValueError("asynchronous vLLM request admission currently requires colocated mode")
+        if request_mode == "async" and weight_sync_mode != "lora":
+            raise ValueError("asynchronous colocated vLLM request admission currently requires LoRA synchronization")
+        if request_mode == "async" and accelerator.num_processes != 1:
+            raise ValueError("asynchronous colocated vLLM request admission currently requires one trainer process")
+        self.request_mode = request_mode
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_length = max_model_length
         self.max_num_seqs = max_num_seqs
@@ -503,6 +514,8 @@ class VLLMGeneration:
         self.weight_sync_mode = weight_sync_mode
         self._lora_directory = None
         self._lora_request = None
+        self._async_engine_args = None
+        self._async_session = None
         self.model_impl = model_impl
         self.trust_remote_code = trust_remote_code
 
@@ -628,8 +641,16 @@ class VLLMGeneration:
             if str(self.engine_kwargs.get("kv_cache_dtype", "")).startswith("turboquant_"):
                 _apply_turboquant_compatibility_patch()
             llm_kwargs.update(self.engine_kwargs)
-            self.llm = LLM(**llm_kwargs)
-            if observe_runtime_metrics:
+            if self.request_mode == "async":
+                # AsyncLLM is constructed lazily on the collection runtime's
+                # persistent event loop. Constructing it here would bind its
+                # output handler to the trainer thread, while native agent
+                # requests are served on a different loop.
+                self.llm = None
+                self._async_engine_args = AsyncEngineArgs(**llm_kwargs)
+            else:
+                self.llm = LLM(**llm_kwargs)
+            if observe_runtime_metrics and self.request_mode == "batch":
                 cache_config = self.llm.llm_engine.vllm_config.cache_config
                 capacity = getattr(cache_config, "kv_cache_size_tokens", None)
                 if isinstance(capacity, int) and capacity > 0:
@@ -646,7 +667,8 @@ class VLLMGeneration:
                     self._lora_directory.name,
                     load_inplace=True,
                 )
-            self._sleep_colocated_engine()
+            if self.request_mode == "batch":
+                self._sleep_colocated_engine()
         else:
             raise ValueError(f"vllm_mode must be either 'server' or 'colocate', got '{self.mode}'.")
 
@@ -804,6 +826,35 @@ class VLLMGeneration:
         elif self.mode == "colocate":
             self.llm.reset_prefix_cache()
 
+    async def create_async_session(self) -> Any:
+        """Create the single continuous-batching owner on its serving loop.
+
+        The synchronous trainer still decides when collection starts and when
+        optimization may run. Only request admission within that fixed-policy
+        collection is asynchronous.
+        """
+        if self.request_mode != "async" or self.mode != "colocate":
+            raise RuntimeError("this vLLM generation backend does not select asynchronous request admission")
+        if self._async_session is not None:
+            return self._async_session
+        if self._async_engine_args is None or self._lora_request is None:
+            raise RuntimeError("asynchronous vLLM engine configuration is incomplete")
+
+        from .async_vllm_session import AsyncVllmSession
+
+        engine = AsyncLLM.from_engine_args(self._async_engine_args)
+
+        async def synchronize_lora(_version: str) -> None:
+            loaded = await engine.list_loras()
+            if self._lora_request.lora_int_id in loaded:
+                await engine.remove_lora(self._lora_request.lora_int_id)
+            if not await engine.add_lora(self._lora_request):
+                raise RuntimeError("vLLM did not acknowledge the refreshed training LoRA adapter")
+            await engine.reset_prefix_cache()
+
+        self._async_session = AsyncVllmSession(engine, synchronize_lora, sleep_level=1)
+        return self._async_session
+
     def _place_features(self, features: dict | None, prompt_ids: list[int]) -> dict | None:
         """Point the image features at the image tokens of `prompt_ids`.
 
@@ -938,6 +989,11 @@ class VLLMGeneration:
             `num_logprobs` is 1 when `logprobs=0`, or up to N+1 when `logprobs=N` (the sampled token is always included
             and may fall outside the top-N).
         """
+        if self.request_mode == "async":
+            raise RuntimeError(
+                "asynchronous vLLM request mode must be consumed through create_async_session(); "
+                "the synchronous batch generate API is unavailable"
+            )
         profiler = profiler or nullcontext()
         accelerator = self.accelerator
         temperature = self.temperature

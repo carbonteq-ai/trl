@@ -1,3 +1,4 @@
+import asyncio
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -231,6 +232,109 @@ def test_colocated_engine_allows_bounded_sequence_waves(monkeypatch):
 
     assert captured["max_num_seqs"] == 32
     assert captured["max_num_batched_tokens"] == 32768
+
+
+def test_async_colocated_engine_is_lazy_and_refreshes_lora_on_its_serving_loop(monkeypatch):
+    captured = {}
+
+    class FakePeftModel:
+        name_or_path = "model"
+        peft_config = {"default": SimpleNamespace(r=8)}
+
+        def named_modules(self):
+            return []
+
+        def save_pretrained(self, path, safe_serialization):
+            captured["saved"] = (path, safe_serialization)
+
+    class FakeEngine:
+        def __init__(self):
+            self.loaded = {1}
+
+        async def list_loras(self):
+            return set(self.loaded)
+
+        async def remove_lora(self, identifier):
+            self.loaded.remove(identifier)
+
+        async def add_lora(self, request):
+            self.loaded.add(request.lora_int_id)
+            return True
+
+        async def reset_prefix_cache(self):
+            captured["reset"] = True
+
+        async def sleep(self, level=1):
+            captured["sleep"] = level
+
+        def shutdown(self):
+            captured["shutdown"] = True
+
+    engine = FakeEngine()
+
+    class FakeAsyncLLM:
+        @classmethod
+        def from_engine_args(cls, args):
+            captured["engine_args"] = args
+            return engine
+
+    accelerator = SimpleNamespace(
+        state=SimpleNamespace(deepspeed_plugin=None, fsdp_plugin=None),
+        num_processes=1,
+        process_index=0,
+        local_process_index=0,
+        wait_for_everyone=lambda: None,
+    )
+    model = FakePeftModel()
+    monkeypatch.setattr(vllm_generation, "is_vllm_available", lambda: True)
+    monkeypatch.setattr(vllm_generation, "is_peft_model", lambda value: value is model)
+    monkeypatch.setattr(vllm_generation, "AsyncEngineArgs", lambda **kwargs: SimpleNamespace(**kwargs), raising=False)
+    monkeypatch.setattr(vllm_generation, "AsyncLLM", FakeAsyncLLM, raising=False)
+    monkeypatch.setattr(
+        vllm_generation,
+        "LoRARequest",
+        lambda name, identifier, path, *, load_inplace: SimpleNamespace(
+            lora_name=name,
+            lora_int_id=identifier,
+            lora_path=path,
+            load_inplace=load_inplace,
+        ),
+        raising=False,
+    )
+
+    generation = VLLMGeneration(
+        model=model,
+        accelerator=accelerator,
+        processing_class=object(),
+        request_mode="async",
+        weight_sync_mode="lora",
+        enable_sleep_mode=True,
+    )
+    assert "engine_args" not in captured
+    generation.sync_weights()
+
+    async def exercise():
+        session = await generation.create_async_session()
+        assert await generation.create_async_session() is session
+        await session.synchronize_policy("optimizer-step-0")
+        await session.open_policy("optimizer-step-0")
+        await session.stop_admission()
+        await session.suspend_for_update()
+
+    asyncio.run(exercise())
+
+    assert captured["saved"] == (generation._lora_directory.name, True)
+    assert captured["reset"] is True
+    assert captured["sleep"] == 1
+    assert engine.loaded == {1}
+
+
+def test_async_request_mode_rejects_synchronous_batch_generation():
+    generation = object.__new__(VLLMGeneration)
+    generation.request_mode = "async"
+
+    with pytest.raises(RuntimeError, match="create_async_session"):
+        generation.generate([[1]], None, 1)
 
 
 def test_colocated_generation_sends_bounded_request_waves_in_order():

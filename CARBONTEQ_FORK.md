@@ -99,6 +99,30 @@ immutable release tag, package hashes, and clean-install verification exist.
 
 ## Maintained delta
 
+### Continuous-batched colocated request mode (unpublished candidate, 2026-09-09)
+
+`GRPOConfig.vllm_request_mode="async"` now selects a lazily constructed
+`AsyncLLM` for colocated LoRA rollouts. The engine is created on the owning
+serving event loop and exposes the existing `AsyncVllmSession`; independently
+arriving agent turns therefore enter vLLM's continuous scheduler instead of
+waiting for a complete synchronous `LLM.generate()` wave. The ordinary
+`"batch"` mode remains the compatibility default, and its synchronous API
+fails clearly if a consumer selects async mode but does not use the session.
+
+This mode deliberately supports only one trainer process, colocated inference,
+and native LoRA synchronization. The trainer still saves the current adapter
+before each collection. The session removes and reloads that adapter, resets
+the prefix cache, fences the policy version, drains every admitted request, and
+sleeps the engine before the optimizer can mutate actor state. It does not
+define environment concurrency, rewards, group admission, or asynchronous
+optimizer semantics; those remain consumer concerns.
+
+Focused tests in `tests/test_vllm_generation.py` and
+`tests/test_async_vllm_session.py` prove lazy loop ownership, LoRA refresh,
+session reuse, admission/drain/sleep ordering, and rejection of the batch API.
+This candidate is not yet published or pinned by Posttrain. A changed-weight
+GRPO GPU update through the consumer path remains the promotion gate.
+
 ### Asynchronous rollout session foundation (2026-09-08)
 
 `trl/generation/async_vllm_session.py` introduces a narrow, trainer-owned
@@ -106,8 +130,8 @@ per-request vLLM session. It fences one synchronized policy version, admits
 independent asynchronous requests, explicitly aborts and drains them, and only
 then allows inference residency to sleep for an optimizer update. The session
 does not own environments, rewards, worker processes, or actor computation.
-It is an additive foundation for the Posttrain rollout-execution workstream;
-it is not yet connected to a trainer's vLLM construction path.
+It is the lifecycle foundation now selected by the unpublished continuous-
+batched colocated request mode above.
 `tests/test_async_vllm_session.py` proves independent completion,
 policy-version fencing, abort, drain, sleep/wake ordering, and idempotent
 shutdown with a deterministic async engine double. The selected vLLM 0.25.1

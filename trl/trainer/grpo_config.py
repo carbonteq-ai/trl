@@ -635,6 +635,14 @@ class GRPOConfig(_BaseConfig):
             "contention with training."
         },
     )
+    vllm_request_mode: str = field(
+        default="batch",
+        metadata={
+            "help": "How requests are submitted to a colocated vLLM engine. 'batch' uses the synchronous offline "
+            "LLM API. 'async' exposes one long-lived AsyncLLM session for independently arriving agent turns while "
+            "the trainer retains synchronous collection/update barriers."
+        },
+    )
     vllm_model_impl: str = field(
         default="vllm",
         metadata={
