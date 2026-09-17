@@ -1,5 +1,6 @@
 import asyncio
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from trl.generation import vllm_generation
 from trl.generation.vllm_generation import (
     VLLMGeneration,
     _accumulate_spec_decode_metrics,
+    _compose_lora_adapters,
     _compute_spec_decode_counter_delta,
 )
 
@@ -329,6 +331,107 @@ def test_async_colocated_engine_is_lazy_and_refreshes_lora_on_its_serving_loop(m
     assert engine.loaded == {1}
 
 
+def test_async_colocated_engine_streams_full_weights_and_commits_policy_version(monkeypatch):
+    captured = {"rpc": []}
+
+    class FakeModel:
+        name_or_path = "model"
+
+        def named_modules(self):
+            return []
+
+    class FakeEngine:
+        def __init__(self):
+            self.weight_version = "default"
+
+        async def collective_rpc(self, method, *, kwargs=None):
+            captured["rpc"].append((method, kwargs))
+
+        async def update_weight_version(self, version):
+            self.weight_version = version
+
+        async def get_weight_version(self):
+            return self.weight_version
+
+        async def reset_prefix_cache(self):
+            captured["reset"] = True
+
+        async def wake_up(self, tags=None):
+            captured.setdefault("wakes", []).append(tags)
+
+        async def sleep(self, level=1):
+            captured["sleep"] = level
+
+        def shutdown(self):
+            captured["shutdown"] = True
+
+    engine = FakeEngine()
+
+    class FakeAsyncLLM:
+        @classmethod
+        def from_engine_args(cls, args):
+            captured["engine_args"] = args
+            return engine
+
+    class FakeTransfer:
+        def __init__(self, client):
+            self.client = client
+
+        def send_weights(self):
+            self.client.start_weight_update()
+            self.client.update_weights({"tensor": "updated"})
+            self.client.finish_weight_update()
+
+    def create_transfer(owner, client):
+        captured["transfer_owner"] = owner
+        client.init_weight_transfer_engine({"packed": True})
+        return FakeTransfer(client)
+
+    accelerator = SimpleNamespace(
+        state=SimpleNamespace(deepspeed_plugin=None, fsdp_plugin=None),
+        num_processes=1,
+        process_index=0,
+        local_process_index=0,
+        wait_for_everyone=lambda: None,
+    )
+    model = FakeModel()
+    monkeypatch.setattr(vllm_generation, "is_vllm_available", lambda: True)
+    monkeypatch.setattr(vllm_generation, "is_peft_model", lambda _value: False)
+    monkeypatch.setattr(vllm_generation, "AsyncEngineArgs", lambda **kwargs: SimpleNamespace(**kwargs), raising=False)
+    monkeypatch.setattr(vllm_generation, "AsyncLLM", FakeAsyncLLM, raising=False)
+    monkeypatch.setattr(vllm_generation, "_create_ipc_trainer_engine", create_transfer)
+
+    generation = VLLMGeneration(
+        model=model,
+        accelerator=accelerator,
+        processing_class=object(),
+        request_mode="async",
+        weight_sync_mode="full",
+        enable_sleep_mode=True,
+    )
+
+    async def exercise():
+        session = await generation.create_async_session()
+        await session.synchronize_policy("optimizer-step-1")
+        await session.open_policy("optimizer-step-1")
+        await session.stop_admission()
+        await session.suspend_for_update()
+
+    asyncio.run(exercise())
+
+    assert captured["engine_args"].weight_transfer_config == {"backend": "ipc"}
+    assert captured["transfer_owner"] is generation
+    assert captured["rpc"] == [
+        ("init_weight_transfer_engine", {"init_info": {"packed": True}}),
+        ("start_weight_update", None),
+        ("update_weights", {"update_info": {"tensor": "updated"}}),
+        ("finish_weight_update", None),
+    ]
+    assert engine.weight_version == "optimizer-step-1"
+    assert captured["reset"] is True
+    assert captured["sleep"] == 2
+
+
 def test_async_request_mode_rejects_synchronous_batch_generation():
     generation = object.__new__(VLLMGeneration)
     generation.request_mode = "async"
@@ -429,16 +532,87 @@ def test_weight_name_prefix_is_applied_at_the_vllm_boundary():
     generation.enable_sleep_mode = False
     generation.accelerator = SimpleNamespace(is_main_process=True)
     generation.llm.reset_prefix_cache = lambda: None
-    generation._iter_named_params = lambda: iter([
-        (generation._fix_param_name_to_vllm("model.layers.0.weight"), "tensor"),
-        (generation._fix_param_name_to_vllm("language_model.model.norm.weight"), "tensor-2"),
-    ])
+    generation._iter_named_params = lambda: iter(
+        [
+            (generation._fix_param_name_to_vllm("model.layers.0.weight"), "tensor"),
+            (generation._fix_param_name_to_vllm("language_model.model.norm.weight"), "tensor-2"),
+        ]
+    )
     generation.sync_weights()
 
     assert captured == [
         ("language_model.model.layers.0.weight", "tensor"),
         ("language_model.model.norm.weight", "tensor-2"),
     ]
+
+
+def test_composite_uno_adapter_preserves_policy_and_draft_deltas(tmp_path):
+    policy = tmp_path / "policy"
+    uno = tmp_path / "uno"
+    composite = tmp_path / "composite"
+    policy.mkdir()
+    uno.mkdir()
+    (policy / "adapter_config.json").write_text('{"r": 2, "lora_alpha": 4}')
+    (uno / "adapter_config.json").write_text('{"r": 3, "lora_alpha": 6, "target_modules": ["q_proj"]}')
+    save_file(
+        {
+            "base_model.model.model.layers.0.q_proj.lora_A.weight": torch.ones(2, 4),
+            "base_model.model.model.layers.0.q_proj.lora_B.weight": torch.ones(5, 2),
+        },
+        policy / "adapter_model.safetensors",
+    )
+    save_file(
+        {
+            "model.layers.0.q_proj.lora_A.weight": torch.full((3, 4), 2.0),
+            "model.layers.0.q_proj.lora_B.weight": torch.full((5, 3), 3.0),
+        },
+        uno / "adapter_model.safetensors",
+    )
+
+    assert _compose_lora_adapters(policy, uno, composite) == 5
+
+    with safe_open(composite / "adapter_model.safetensors", framework="pt", device="cpu") as handle:
+        a = handle.get_tensor("model.layers.0.q_proj.lora_A.weight")
+        b = handle.get_tensor("model.layers.0.q_proj.lora_B.weight")
+    assert torch.equal(a[:2], torch.ones(2, 4))
+    assert torch.equal(a[2:], torch.full((3, 4), 2.0))
+    assert torch.equal(b[:, :2], torch.full((5, 2), 2.0))
+    assert torch.equal(b[:, 2:], torch.full((5, 3), 6.0))
+
+
+def test_merged_lora_iterator_always_restores_trainable_adapter(monkeypatch):
+    events = []
+
+    class FakePeftModel:
+        prefix = "lora_"
+
+        def parameters(self):
+            return [torch.nn.Parameter(torch.ones(1))]
+
+        def named_parameters(self):
+            yield "base_model.model.layer.base_layer.weight", torch.nn.Parameter(torch.ones(1))
+
+        def merge_adapter(self):
+            events.append("merge")
+
+        def unmerge_adapter(self):
+            events.append("unmerge")
+
+    model = FakePeftModel()
+    generation = object.__new__(VLLMGeneration)
+    generation.model = model
+    generation.weight_name_prefix = None
+    generation._dist = SimpleNamespace(
+        is_fsdp=False,
+        gather_params=lambda _parameters: nullcontext(),
+    )
+    monkeypatch.setattr(vllm_generation, "is_peft_model", lambda value: value is model)
+
+    weights = generation._iter_named_params()
+    assert next(weights)[0] == "layer.weight"
+    weights.close()
+
+    assert events == ["merge", "unmerge"]
 
 
 def test_colocated_lora_sync_exports_adapter_without_merging_base_weights(monkeypatch):

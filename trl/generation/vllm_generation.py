@@ -14,6 +14,7 @@
 
 """vLLM-based generation backend for TRL trainers."""
 
+import asyncio
 import logging
 import math
 import os
@@ -39,7 +40,6 @@ from ..distributed import DistributedBackend
 from ..extras.profiling import ProfilingContext
 from ..import_utils import is_vllm_available
 from ..trainer.utils import ensure_master_addr_port
-from .vllm_client import VLLMClient
 
 
 if is_vllm_available():
@@ -59,6 +59,98 @@ _SPEC_DECODE_COUNTERS = {
 
 _KV_CACHE_CAPACITY_METRIC = "rollout/kv_cache_capacity_tokens"
 _KV_CACHE_PEAK_USAGE_METRIC = "rollout/kv_cache_peak_usage_ratio"
+
+
+class _AsyncLLMWeightSyncClient:
+    """Drive an ``AsyncLLM`` weight update from a trainer worker thread.
+
+    The async engine is owned by the persistent serving loop. The IPC trainer
+    engine is synchronous, so its control-plane calls are submitted back to
+    that loop and blocked only on the worker thread running ``send_weights``.
+    """
+
+    def __init__(self, engine: Any, owner_loop: asyncio.AbstractEventLoop) -> None:
+        self._engine = engine
+        self._owner_loop = owner_loop
+        self._next_weight_version: str | None = None
+
+    def set_next_weight_version(self, version: str) -> None:
+        if not version.strip():
+            raise ValueError("weight version cannot be empty")
+        self._next_weight_version = version
+
+    def _run(self, awaitable: Any) -> Any:
+        return asyncio.run_coroutine_threadsafe(awaitable, self._owner_loop).result()
+
+    def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None:
+        self._run(
+            self._engine.collective_rpc(
+                "init_weight_transfer_engine",
+                kwargs={"init_info": init_info},
+            )
+        )
+
+    def start_weight_update(self) -> None:
+        self._run(self._engine.collective_rpc("start_weight_update"))
+
+    def update_weights(self, update_info: Any) -> None:
+        self._run(
+            self._engine.collective_rpc(
+                "update_weights",
+                kwargs={"update_info": update_info},
+            )
+        )
+
+    def finish_weight_update(self, weight_version: str | None = None) -> None:
+        version = weight_version or self._next_weight_version
+        self._run(self._engine.collective_rpc("finish_weight_update"))
+        if version is not None:
+            self._run(self._engine.update_weight_version(version))
+        self._next_weight_version = None
+
+
+def _create_ipc_trainer_engine(generation: Any, client: Any) -> Any:
+    """Construct the IPC producer over TRL's merged-policy weight iterator."""
+
+    from vllm.distributed.weight_transfer import (
+        WeightTransferTrainerFactory,
+    )
+    from vllm.distributed.weight_transfer.base import ParamMeta, WeightSource
+    from vllm.distributed.weight_transfer.ipc_engine import IPCTrainerInitInfo
+
+    class TrlPolicySource(WeightSource):
+        """Replay full target weights, merging a trainable PEFT delta per sync."""
+
+        def __init__(self) -> None:
+            self._metadata = []
+            self.max_tensor_nbytes = 0
+            for name, tensor in generation._iter_named_params():
+                self._metadata.append(ParamMeta(name, tensor.dtype, tuple(tensor.shape)))
+                self.max_tensor_nbytes = max(
+                    self.max_tensor_nbytes,
+                    tensor.numel() * tensor.element_size(),
+                )
+
+        def metadata(self) -> list[Any]:
+            return self._metadata
+
+        def __iter__(self) -> Any:
+            yield from generation._iter_named_params()
+
+    source = TrlPolicySource()
+    # Packed IPC cannot split one parameter across buffers. Large-vocabulary
+    # embeddings can exceed the default by gigabytes, so size this from the
+    # exact synchronized tensors rather than a model-family guess.
+    packed_buffer_size = max(256 * 1024 * 1024, source.max_tensor_nbytes)
+    return WeightTransferTrainerFactory.trainer_init(
+        init_info=IPCTrainerInitInfo(
+            rank=0,
+            packed=True,
+            packed_buffer_size_bytes=packed_buffer_size,
+        ),
+        client=client,
+        source=source,
+    )
 
 
 class _KvCachePeakTracker:
@@ -172,6 +264,90 @@ def _prefix_lora_adapter_weights(directory: str | Path, prefix: str) -> None:
         temporary = weight_file.with_name(f".{weight_file.name}.tmp")
         save_file(remapped, temporary, metadata=metadata)
         temporary.replace(weight_file)
+
+
+def _compose_lora_adapters(
+    policy_directory: str | Path, uno_directory: str | Path, output_directory: str | Path
+) -> int:
+    """Write an exact policy-plus-Uno adapter by concatenating low-rank factors."""
+    import json
+
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    def read_adapter(directory: Path) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+        config = json.loads((directory / "adapter_config.json").read_text())
+        files = tuple(sorted(directory.glob("adapter_model*.safetensors")))
+        if len(files) != 1:
+            raise ValueError(f"adapter composition requires one safetensors file under {directory}")
+        with safe_open(files[0], framework="pt", device="cpu") as handle:
+            tensors = {name: handle.get_tensor(name).float() for name in handle.keys()}
+        return config, tensors
+
+    def normalized(tensors: dict[str, torch.Tensor]) -> dict[str, tuple[str, torch.Tensor]]:
+        result = {}
+        for name, tensor in tensors.items():
+            key = name.removeprefix("base_model.model.").replace(".default.", ".")
+            result[key] = (name, tensor)
+        return result
+
+    policy_config, policy_tensors = read_adapter(Path(policy_directory))
+    uno_config, uno_tensors = read_adapter(Path(uno_directory))
+    policy = normalized(policy_tensors)
+    uno = normalized(uno_tensors)
+    policy_rank = int(policy_config["r"])
+    uno_rank = int(uno_config["r"])
+    composite_rank = policy_rank + uno_rank
+
+    def scaling(config: dict[str, Any], rank: int) -> float:
+        alpha = float(config["lora_alpha"])
+        return alpha / math.sqrt(rank) if config.get("use_rslora", False) else alpha / rank
+
+    policy_scale = scaling(policy_config, policy_rank)
+    uno_scale = scaling(uno_config, uno_rank)
+    output: dict[str, torch.Tensor] = {}
+    bases = sorted(name.removesuffix(".lora_A.weight") for name in uno if name.endswith(".lora_A.weight"))
+    for base in bases:
+        uno_a_name, uno_a = uno[f"{base}.lora_A.weight"]
+        uno_b_name, uno_b = uno[f"{base}.lora_B.weight"]
+        policy_a_item = policy.get(f"{base}.lora_A.weight")
+        policy_b_item = policy.get(f"{base}.lora_B.weight")
+        if (policy_a_item is None) != (policy_b_item is None):
+            raise ValueError(f"policy adapter has an incomplete LoRA pair for {base}")
+        if policy_a_item is None:
+            policy_a = torch.zeros((policy_rank, uno_a.shape[1]), dtype=uno_a.dtype)
+            policy_b = torch.zeros((uno_b.shape[0], policy_rank), dtype=uno_b.dtype)
+        else:
+            policy_a = policy_a_item[1]
+            policy_b = policy_b_item[1]
+        if policy_a.shape[1] != uno_a.shape[1] or policy_b.shape[0] != uno_b.shape[0]:
+            raise ValueError(f"policy and Uno adapter shapes disagree for {base}")
+        output[uno_a_name] = torch.cat((policy_a, uno_a), dim=0)
+        output[uno_b_name] = torch.cat((policy_b * policy_scale, uno_b * uno_scale), dim=1)
+
+    unmatched = sorted(
+        name
+        for name in policy
+        if name.endswith(".lora_A.weight") and name not in {f"{base}.lora_A.weight" for base in bases}
+    )
+    if unmatched:
+        raise ValueError(f"policy adapter targets modules absent from Uno: {', '.join(unmatched[:3])}")
+    destination = Path(output_directory)
+    destination.mkdir(parents=True, exist_ok=True)
+    composite_config = dict(uno_config)
+    composite_config.update(
+        r=composite_rank,
+        lora_alpha=composite_rank,
+        lora_dropout=0.0,
+        use_rslora=False,
+    )
+    temporary_weights = destination / ".adapter_model.safetensors.tmp"
+    save_file(output, temporary_weights, metadata={"format": "pt"})
+    temporary_weights.replace(destination / "adapter_model.safetensors")
+    temporary_config = destination / ".adapter_config.json.tmp"
+    temporary_config.write_text(json.dumps(composite_config, indent=2, sort_keys=True) + "\n")
+    temporary_config.replace(destination / "adapter_config.json")
+    return composite_rank
 
 
 def _apply_turboquant_compatibility_patch() -> tuple[str, ...]:
@@ -468,8 +644,6 @@ class VLLMGeneration:
             raise ValueError("vLLM request_mode must be either 'batch' or 'async'")
         if request_mode == "async" and mode != "colocate":
             raise ValueError("asynchronous vLLM request admission currently requires colocated mode")
-        if request_mode == "async" and weight_sync_mode != "lora":
-            raise ValueError("asynchronous colocated vLLM request admission currently requires LoRA synchronization")
         if request_mode == "async" and accelerator.num_processes != 1:
             raise ValueError("asynchronous colocated vLLM request admission currently requires one trainer process")
         self.request_mode = request_mode
@@ -514,6 +688,9 @@ class VLLMGeneration:
         self.weight_sync_mode = weight_sync_mode
         self._lora_directory = None
         self._lora_request = None
+        self._uno_composite_directory = None
+        self._uno_adapter_source = None
+        self._uno_composite_rank = None
         self._async_engine_args = None
         self._async_session = None
         self.model_impl = model_impl
@@ -552,6 +729,11 @@ class VLLMGeneration:
 
         if self.mode == "server":
             if accelerator.is_main_process:
+                # Server-mode transfer dependencies follow the released vLLM
+                # HTTP/NCCL API. Keep them out of colocated imports so a newer
+                # vLLM IPC runtime can qualify independently.
+                from .vllm_client import VLLMClient
+
                 if self.server_base_url is not None:
                     base_url = self.server_base_url
                 else:
@@ -596,6 +778,32 @@ class VLLMGeneration:
                     elif isinstance(module, bnb.nn.Linear8bitLt):
                         raise ValueError("vLLM does not support in-flight 8-bit quantization.")
 
+            if self.weight_sync_mode == "lora":
+                self._lora_directory = tempfile.TemporaryDirectory(prefix="trl-vllm-lora-")
+                self._lora_request = LoRARequest(
+                    "trl-training-policy",
+                    1,
+                    self._lora_directory.name,
+                    load_inplace=True,
+                )
+                if isinstance(self.speculative_config, dict) and self.speculative_config.get("method") == "uno":
+                    uno_adapter = self.speculative_config.get("uno_adapter")
+                    if not isinstance(uno_adapter, str) or not uno_adapter:
+                        raise ValueError("Uno LoRA composition requires a local Uno adapter path")
+                    self._uno_adapter_source = uno_adapter
+                    self._uno_composite_directory = tempfile.TemporaryDirectory(prefix="trl-vllm-uno-composite-")
+                    self.model.save_pretrained(self._lora_directory.name, safe_serialization=True)
+                    self._uno_composite_rank = _compose_lora_adapters(
+                        self._lora_directory.name,
+                        self._uno_adapter_source,
+                        self._uno_composite_directory.name,
+                    )
+                    speculative_config = dict(self.speculative_config)
+                    speculative_config["uno_adapter"] = self._uno_composite_directory.name
+                    speculative_config["uno_adapter_revision"] = None
+                    speculative_config["uno_composes_request_lora"] = True
+                    self.speculative_config = speculative_config
+
             # Build LLM initialization kwargs
             llm_kwargs = {
                 "model": model.name_or_path,
@@ -627,12 +835,25 @@ class VLLMGeneration:
                     llm_kwargs["disable_log_stats"] = False
             if self.weight_sync_mode == "lora":
                 max_rank = max(config.r for config in model.peft_config.values())
+                if self._uno_composite_rank is not None:
+                    max_rank = max(max_rank, self._uno_composite_rank)
                 supported_ranks = (1, 8, 16, 32, 64, 128, 256, 320, 512)
                 try:
                     max_lora_rank = next(rank for rank in supported_ranks if rank >= max_rank)
                 except StopIteration as error:
                     raise ValueError(f"vLLM does not support LoRA rank {max_rank}") from error
-                llm_kwargs.update({"enable_lora": True, "max_lora_rank": max_lora_rank})
+                llm_kwargs.update(
+                    {
+                        "enable_lora": True,
+                        "max_loras": 3 if self._uno_composite_rank is not None else 1,
+                        "max_lora_rank": max_lora_rank,
+                    }
+                )
+            elif self.request_mode == "async":
+                # The async engine lives in its own process. Full-policy updates
+                # therefore use vLLM's same-GPU CUDA IPC transfer path rather
+                # than the in-process load_weights seam used by batch mode.
+                llm_kwargs["weight_transfer_config"] = {"backend": "ipc"}
             conflicts = sorted(set(llm_kwargs).intersection(self.engine_kwargs))
             if conflicts:
                 raise ValueError(
@@ -659,14 +880,6 @@ class VLLMGeneration:
                 if logger_manager is not None:
                     self._kv_cache_peak_tracker = _KvCachePeakTracker()
                     logger_manager.stat_loggers.append(self._kv_cache_peak_tracker)
-            if self.weight_sync_mode == "lora":
-                self._lora_directory = tempfile.TemporaryDirectory(prefix="trl-vllm-lora-")
-                self._lora_request = LoRARequest(
-                    "trl-training-policy",
-                    1,
-                    self._lora_directory.name,
-                    load_inplace=True,
-                )
             if self.request_mode == "batch":
                 self._sleep_colocated_engine()
         else:
@@ -751,27 +964,29 @@ class VLLMGeneration:
             # TODO: does this work with FSDP?
             with self._dist.gather_params(list(model.parameters())):
                 model.merge_adapter()
+                try:
+                    # Read the vLLM weights while parameters are gathered.
+                    if self._dist.is_fsdp:  # note if using FSDP, gather_params is a no-op
+                        # For PEFT with FSDP we need to use the memory efficient post-order traversal
+                        yield from self._iter_fsdp_params(model)
+                    else:
+                        # DeepSpeed ZeRO-3 with PEFT
+                        for name, param in model.named_parameters():
+                            # When using PEFT, we need to recover the original parameter name
+                            name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+                            # Skip PEFT layers: they don't exist in vLLM, and they are merged already.
+                            if model.prefix in name:
+                                continue
+                            # When module to save, remove its prefix and discard the original module
+                            if "original_module" in name:
+                                continue
+                            name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
 
-                # Read the vLLM weights while parameters are gathered
-                if self._dist.is_fsdp:  # note if using FSDP, gather_params is a no-op
-                    # For PEFT with FSDP we need to use the memory efficient post-order traversal
-                    yield from self._iter_fsdp_params(model)
-                else:
-                    # DeepSpeed ZeRO-3 with PEFT
-                    for name, param in model.named_parameters():
-                        # When using PEFT, we need to recover the original parameter name
-                        name = name.removeprefix("base_model.model.").replace(".base_layer", "")
-                        # Skip PEFT layers: they don't exist in vLLM, and they are merged already.
-                        if model.prefix in name:
-                            continue
-                        # When module to save, remove its prefix and discard the original module
-                        if "original_module" in name:
-                            continue
-                        name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
-
-                        yield name, param.data
-                # Unmerge adapters while parameters are still gathered
-                model.unmerge_adapter()
+                            yield name, param.data
+                finally:
+                    # A failed or cancelled transfer must never leave the
+                    # trainer actor with its adapter merged in place.
+                    model.unmerge_adapter()
                 # Parameters will automatically be repartitioned when exiting the context
         else:
             # For non-PEFT models, simply gather (if needed) and read each parameter individually.
@@ -792,6 +1007,13 @@ class VLLMGeneration:
             self.model.save_pretrained(self._lora_directory.name, safe_serialization=True)
             if self.weight_name_prefix is not None:
                 _prefix_lora_adapter_weights(self._lora_directory.name, self.weight_name_prefix)
+            if self._uno_composite_directory is not None:
+                assert self._uno_adapter_source is not None
+                _compose_lora_adapters(
+                    self._lora_directory.name,
+                    self._uno_adapter_source,
+                    self._uno_composite_directory.name,
+                )
             return
         # Wake up vLLM weights before loading to ensure device memory is mapped. Without this, load_weights() writes to
         # freed/unmapped memory when sleep mode is active, which crashes on backends with strict physical memory
@@ -837,26 +1059,54 @@ class VLLMGeneration:
             raise RuntimeError("this vLLM generation backend does not select asynchronous request admission")
         if self._async_session is not None:
             return self._async_session
-        if self._async_engine_args is None or self._lora_request is None:
+        if self._async_engine_args is None:
             raise RuntimeError("asynchronous vLLM engine configuration is incomplete")
 
         from .async_vllm_session import AsyncVllmSession
 
         engine = AsyncLLM.from_engine_args(self._async_engine_args)
 
-        async def synchronize_lora(_version: str) -> None:
-            loaded = await engine.list_loras()
-            if self._lora_request.lora_int_id in loaded:
-                await engine.remove_lora(self._lora_request.lora_int_id)
-            if not await engine.add_lora(self._lora_request):
-                raise RuntimeError("vLLM did not acknowledge the refreshed training LoRA adapter")
-            await engine.reset_prefix_cache()
+        if self.weight_sync_mode == "lora":
+            if self._lora_request is None:
+                raise RuntimeError("asynchronous LoRA synchronization is incomplete")
+
+            async def synchronize_policy(_version: str) -> None:
+                await asyncio.to_thread(self.sync_weights)
+                loaded = await engine.list_loras()
+                if self._lora_request.lora_int_id in loaded:
+                    await engine.remove_lora(self._lora_request.lora_int_id)
+                if self._uno_composite_directory is not None:
+                    from vllm.v1.spec_decode.uno import UNO_DRAFT_ADAPTER_ID
+
+                    if UNO_DRAFT_ADAPTER_ID in loaded:
+                        await engine.remove_lora(UNO_DRAFT_ADAPTER_ID)
+                if not await engine.add_lora(self._lora_request):
+                    raise RuntimeError("vLLM did not acknowledge the refreshed training LoRA adapter")
+                await engine.reset_prefix_cache()
+
+            sleep_level = 1
+            default_lora_request = self._lora_request
+        else:
+            owner_loop = asyncio.get_running_loop()
+            client = _AsyncLLMWeightSyncClient(engine, owner_loop)
+            transfer = await asyncio.to_thread(_create_ipc_trainer_engine, self, client)
+
+            async def synchronize_policy(version: str) -> None:
+                client.set_next_weight_version(version)
+                await asyncio.to_thread(transfer.send_weights)
+                observed = await engine.get_weight_version()
+                if observed != version:
+                    raise RuntimeError(f"vLLM committed weight version {observed!r}, expected {version!r}")
+                await engine.reset_prefix_cache()
+
+            sleep_level = 2
+            default_lora_request = None
 
         self._async_session = AsyncVllmSession(
             engine,
-            synchronize_lora,
-            sleep_level=1,
-            default_lora_request=self._lora_request,
+            synchronize_policy,
+            sleep_level=sleep_level,
+            default_lora_request=default_lora_request,
         )
         return self._async_session
 

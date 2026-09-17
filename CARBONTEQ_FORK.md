@@ -103,6 +103,21 @@ immutable release tag, package hashes, and clean-install verification exist.
 
 ## Maintained delta
 
+### Async full-policy and native Uno policy-LoRA refresh (2026-09-18, unpublished)
+
+The candidate continuous-batched session supports full-policy CUDA-IPC refresh
+and native policy-LoRA reload. When Uno is selected with policy LoRA, TRL
+atomically rebuilds a rank-concatenated adapter whose low-rank delta equals the
+current policy delta plus the fixed Uno delta. vLLM applies policy LoRA on
+target and seed rows and the composite only on draft-noise rows.
+
+The live K2 LoRA gate passed on RTX PRO across one real optimizer update:
+policy version `0` to `1`, finite loss, nonzero trainable delta, 32/32 finite
+sampled logprobs, stable tokens, and maximum logprob movement `0.0655067`.
+Merged-bfloat16 LoRA materialization was rejected because realistic updates
+quantized away. Full-policy changed-weight qualification remains open. This
+capability is not in the published post8 package.
+
 ### Continuous-batched colocated request mode (2026-09-09)
 
 `GRPOConfig.vllm_request_mode="async"` now selects a lazily constructed
