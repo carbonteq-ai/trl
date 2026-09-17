@@ -2449,6 +2449,38 @@ class TestGRPOTrainer(TrlTestCase):
         torch.testing.assert_close(chunked_logps, full_logps)
         torch.testing.assert_close(chunked_entropies, full_entropies)
 
+    def test_logits_chunking_preserves_router_aux_loss(self):
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+        trainer = GRPOTrainer(
+            model="trl-internal-testing/tiny-Qwen3MoeForCausalLM",
+            reward_funcs="trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5",
+            args=GRPOConfig(output_dir=self.tmp_dir, report_to="none", logits_chunk_size=2),
+            train_dataset=dataset,
+        )
+        model = trainer.model
+        input_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7]], device=model.device)
+        attention_mask = torch.ones_like(input_ids)
+
+        with torch.no_grad():
+            chunked_logps, _, chunked_aux_loss = trainer._get_per_token_logps_and_entropies(
+                model,
+                input_ids,
+                attention_mask,
+                logits_to_keep=4,
+                compute_aux_loss=True,
+            )
+            trainer.logits_chunk_size = None
+            full_logps, _, full_aux_loss = trainer._get_per_token_logps_and_entropies(
+                model,
+                input_ids,
+                attention_mask,
+                logits_to_keep=4,
+                compute_aux_loss=True,
+            )
+
+        torch.testing.assert_close(chunked_logps, full_logps)
+        torch.testing.assert_close(chunked_aux_loss, full_aux_loss)
+
     def test_train_with_entropy_filter(self):
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
         training_args = GRPOConfig(

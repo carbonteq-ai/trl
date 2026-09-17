@@ -817,7 +817,7 @@ class GRPOTrainer(_BaseTrainer):
 
         # MoE load-balancing auxiliary loss, applied to Mixture-of-Experts models (no effect otherwise)
         text_config = model.config.get_text_config()
-        is_moe = getattr(text_config, "output_router_logits", None) is not None
+        is_moe = getattr(text_config, "num_experts_per_tok", 0) > 0
         self.aux_loss_enabled = is_moe and args.router_aux_loss_coef != 0.0
         self.router_aux_loss_coef = args.router_aux_loss_coef
         self.scale_rewards = args.scale_rewards
@@ -1397,6 +1397,7 @@ class GRPOTrainer(_BaseTrainer):
         input_ids,
         attention_mask,
         logits_to_keep,
+        output_router_logits=False,
         pixel_values=None,
         image_grid_thw=None,
         pixel_attention_mask=None,
@@ -1444,12 +1445,29 @@ class GRPOTrainer(_BaseTrainer):
             backbone = unwrapped_model.model
         else:
             backbone = unwrapped_model.base_model
-        last_hidden_state = backbone(**model_inputs).last_hidden_state
+        if output_router_logits:
+            model_inputs["output_router_logits"] = True
+        outputs = backbone(**model_inputs)
+        last_hidden_state = outputs.last_hidden_state
         # Exclude the last value: it corresponds to the next token pred
         last_hidden_state = last_hidden_state[:, :-1, :]  # (B, L-1, H)
         # Only keep the last logits_to_keep. For model that support logits_to_keep, this is a no-op.
         last_hidden_state = last_hidden_state[:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
-        return last_hidden_state
+        if not output_router_logits:
+            return last_hidden_state
+
+        from transformers.models.mixtral.modeling_mixtral import load_balancing_loss_func
+
+        text_config = unwrapped_model.config.get_text_config()
+        aux_loss = load_balancing_loss_func(
+            outputs.router_logits,
+            text_config.num_experts,
+            text_config.num_experts_per_tok,
+            attention_mask,
+        )
+        if not isinstance(aux_loss, torch.Tensor):
+            raise RuntimeError("the MoE backbone did not return router logits for auxiliary loss")
+        return last_hidden_state, aux_loss
 
     def get_high_entropy_mask(self, entropies: torch.Tensor, mask: torch.Tensor, threshold: float) -> torch.Tensor:
         """
@@ -1577,15 +1595,19 @@ class GRPOTrainer(_BaseTrainer):
 
             completion_ids = input_ids_batch[:, -logits_to_keep:]
             if self.logits_chunk_size is not None:
-                if compute_aux_loss:
-                    raise ValueError("logits_chunk_size is not supported with router auxiliary loss")
                 unwrapped_model = self.accelerator.unwrap_model(model)
-                last_hidden_state = self._get_last_hidden_state(
+                hidden_state_output = self._get_last_hidden_state(
                     unwrapped_model,
                     input_ids_batch,
                     attention_mask_batch,
                     logits_to_keep,
+                    output_router_logits=compute_aux_loss,
                 )
+                if compute_aux_loss:
+                    last_hidden_state, aux_loss = hidden_state_output
+                    all_aux_losses.append(aux_loss)
+                else:
+                    last_hidden_state = hidden_state_output
                 lm_head = unwrapped_model.get_output_embeddings()
                 chunk_logps = []
                 chunk_entropies = []

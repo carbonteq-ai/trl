@@ -484,6 +484,17 @@ advantages, and projection:
     uv run pytest -q tests/test_grpo_trainer.py \
       -k 'policy_parity or importance_sampling or truncated or advantage or logits_chunking'
 
+The Uno/K2 candidate also carries MoE router auxiliary loss through the
+chunked-logit path. The backbone returns hidden states and router logits once;
+the LM head is still evaluated in bounded chunks, while the standard
+Transformers load-balancing function derives the auxiliary loss. The focused
+`test_logits_chunking_preserves_router_aux_loss` regression compares chunked
+and unchunked policy log-probabilities and auxiliary loss. MoE detection uses a
+positive `num_experts_per_tok`, not the mere presence of an
+`output_router_logits` config field. This matters for K2-Horizon: the pinned 7B
+checkpoint declares zero experts but exposes that generic field, and therefore
+must not receive a nonexistent router objective.
+
 The raw-parity candidate specifically changes
 `trl/generation/vllm_generation.py`, `trl/trainer/grpo_config.py`, and
 `trl/trainer/grpo_trainer.py`; its regression coverage is in
