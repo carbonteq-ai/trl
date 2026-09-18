@@ -817,8 +817,11 @@ class GRPOTrainer(_BaseTrainer):
 
         # MoE load-balancing auxiliary loss, applied to Mixture-of-Experts models (no effect otherwise)
         text_config = model.config.get_text_config()
-        is_moe = getattr(text_config, "num_experts_per_tok", 0) > 0
-        self.aux_loss_enabled = is_moe and args.router_aux_loss_coef != 0.0
+        supports_router_aux_loss = (
+            getattr(text_config, "num_experts_per_tok", 0) > 0
+            and getattr(text_config, "output_router_logits", None) is not None
+        )
+        self.aux_loss_enabled = supports_router_aux_loss and args.router_aux_loss_coef != 0.0
         self.router_aux_loss_coef = args.router_aux_loss_coef
         self.scale_rewards = args.scale_rewards
         self.importance_sampling_level = args.importance_sampling_level
@@ -1588,13 +1591,12 @@ class GRPOTrainer(_BaseTrainer):
 
             model_inputs["use_cache"] = False  # only used in generation; set False to suppress warnings
 
-            # MoE models: request router logits so the model returns `outputs.aux_loss`. VLM wrappers honor this only
-            # as a forward kwarg (not from the model config), so it must be passed here.
-            if compute_aux_loss:
-                model_inputs["output_router_logits"] = True
-
             completion_ids = input_ids_batch[:, -logits_to_keep:]
-            if self.logits_chunk_size is not None:
+            # Some causal-LM wrappers accept ``output_router_logits`` but drop the
+            # router fields from their public output. Use the backbone path for
+            # every auxiliary-loss request so the router logits remain available;
+            # a full-width chunk preserves the ordinary unchunked scoring path.
+            if self.logits_chunk_size is not None or compute_aux_loss:
                 unwrapped_model = self.accelerator.unwrap_model(model)
                 hidden_state_output = self._get_last_hidden_state(
                     unwrapped_model,
@@ -1611,8 +1613,9 @@ class GRPOTrainer(_BaseTrainer):
                 lm_head = unwrapped_model.get_output_embeddings()
                 chunk_logps = []
                 chunk_entropies = []
-                for chunk_start in range(0, logits_to_keep, self.logits_chunk_size):
-                    chunk_end = min(chunk_start + self.logits_chunk_size, logits_to_keep)
+                logits_chunk_size = self.logits_chunk_size or logits_to_keep
+                for chunk_start in range(0, logits_to_keep, logits_chunk_size):
+                    chunk_end = min(chunk_start + logits_chunk_size, logits_to_keep)
                     logits = lm_head(last_hidden_state[:, chunk_start:chunk_end, :])
                     logits = logits / temperature
                     chunk_ids = completion_ids[:, chunk_start:chunk_end]
@@ -1648,9 +1651,6 @@ class GRPOTrainer(_BaseTrainer):
                         with torch.no_grad():
                             entropies = entropy_from_logits(logits)
                     all_entropies.append(entropies)
-
-                if compute_aux_loss:
-                    all_aux_losses.append(outputs.aux_loss)
 
         logps = torch.cat(all_logps, dim=0)
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
