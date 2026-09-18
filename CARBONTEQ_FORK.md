@@ -5,7 +5,13 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
-Fork status: `candidate`, version `1.12.0.post8`.
+Fork status: `candidate`, version `1.12.0.post9`.
+Post9 packages native Uno policy-LoRA refresh, MoE-safe chunked GRPO scoring,
+and rollout cache/speculation observability. Its `vllm` extra pins the exact
+CarbonTeq Uno source-overlay commit
+`37706e7d920abc97c705ffecee0919d64ef31485`, released as
+`carbonteq-v0.26.1.dev1`; a generic upstream vLLM installation is not an
+equivalent runtime dependency.
 Post8 publishes the continuous-batched colocated request mode, session-owned
 LoRA refresh, and async parity-probe routing described below. Its functional
 implementation is `3cb133fd8ed685d2ddad5d729cbc4f894b9e1209`; the immutable
@@ -103,7 +109,7 @@ immutable release tag, package hashes, and clean-install verification exist.
 
 ## Maintained delta
 
-### Async full-policy and native Uno policy-LoRA refresh (2026-09-18, unpublished)
+### Async full-policy and native Uno policy-LoRA refresh (2026-09-18, post9)
 
 The candidate continuous-batched session supports full-policy CUDA-IPC refresh
 and native policy-LoRA reload. When Uno is selected with policy LoRA, TRL
@@ -116,7 +122,15 @@ policy version `0` to `1`, finite loss, nonzero trainable delta, 32/32 finite
 sampled logprobs, stable tokens, and maximum logprob movement `0.0655067`.
 Merged-bfloat16 LoRA materialization was rejected because realistic updates
 quantized away. Full-policy changed-weight qualification remains open. This
-capability is not in the published post8 package.
+capability is included in the post9 candidate and was not in post8.
+
+### Rollout runtime metrics (2026-09-18, post9)
+
+Both synchronous and continuous-batched colocated rollout paths retain
+per-collection KV-cache peak usage, prefix-cache query/hit token counts and
+their weighted hit rate, plus speculative draft and acceptance counters. The
+async session resets metrics when admission opens and collects them after drain
+but before sleep, so optimizer/update time cannot leak into rollout evidence.
 
 ### Continuous-batched colocated request mode (2026-09-09)
 
