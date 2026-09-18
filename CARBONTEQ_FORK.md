@@ -12,6 +12,14 @@ CarbonTeq Uno source-overlay commit
 `37706e7d920abc97c705ffecee0919d64ef31485`, released as
 `carbonteq-v0.26.1.dev1`; a generic upstream vLLM installation is not an
 equivalent runtime dependency.
+Its immutable release commit is
+`3b7a582e011a32de74d1f2b6e572b794360fbfd7`, tagged
+`carbonteq-v1.12.0.post9`. Wheel SHA-256:
+`c5d204da587a9a45dd279f1407d0e20816344075d001da9fe03f6dd4879fa710`;
+sdist SHA-256:
+`146e46b37f6795a206d684e286e137edb1eec673b658d0168d45c603870156fa`.
+Posttrain retained-asset publisher `35292803386` passed exact-byte development
+readback and clean installation.
 Post8 publishes the continuous-batched colocated request mode, session-owned
 LoRA refresh, and async parity-probe routing described below. Its functional
 implementation is `3cb133fd8ed685d2ddad5d729cbc4f894b9e1209`; the immutable
