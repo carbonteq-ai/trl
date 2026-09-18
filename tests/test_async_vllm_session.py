@@ -52,9 +52,7 @@ async def test_session_applies_default_lora_to_endpoint_shaped_requests():
     await session.synchronize_policy("policy-1")
     await session.open_policy("policy-1")
 
-    await session.generate(
-        SimpleNamespace(request_id="endpoint", prompt_token_ids=(1,), sampling_params={})
-    )
+    await session.generate(SimpleNamespace(request_id="endpoint", prompt_token_ids=(1,), sampling_params={}))
 
     assert engine.lora_requests == [adapter]
 
@@ -93,6 +91,24 @@ async def test_requests_complete_independently_and_policy_cannot_change_while_co
     await session.open_policy("policy-2")
     assert synchronized == ["policy-1", "policy-2"]
     assert engine.wakes == [["weights"], ["kv_cache"]]
+
+
+@pytest.mark.asyncio
+async def test_runtime_metrics_are_reset_on_open_and_collected_before_sleep():
+    engine = FakeAsyncEngine()
+    events = []
+    session = AsyncVllmSession(
+        engine,
+        lambda _version: None,
+        reset_runtime_metrics=lambda: events.append("reset"),
+        collect_runtime_metrics=lambda: events.append("collect"),
+    )
+    await session.synchronize_policy("policy-1")
+    await session.open_policy("policy-1")
+    await session.suspend_for_update()
+
+    assert events == ["reset", "collect"]
+    assert engine.sleeps == [1]
 
 
 @pytest.mark.asyncio

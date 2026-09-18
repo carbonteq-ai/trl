@@ -59,6 +59,9 @@ _SPEC_DECODE_COUNTERS = {
 
 _KV_CACHE_CAPACITY_METRIC = "rollout/kv_cache_capacity_tokens"
 _KV_CACHE_PEAK_USAGE_METRIC = "rollout/kv_cache_peak_usage_ratio"
+_PREFIX_CACHE_QUERY_TOKENS_METRIC = "rollout/prefix_cache_query_tokens"
+_PREFIX_CACHE_HIT_TOKENS_METRIC = "rollout/prefix_cache_hit_tokens"
+_PREFIX_CACHE_HIT_RATE_METRIC = "rollout/prefix_cache_hit_rate"
 
 
 class _AsyncLLMWeightSyncClient:
@@ -153,19 +156,59 @@ def _create_ipc_trainer_engine(generation: Any, client: Any) -> Any:
     )
 
 
-class _KvCachePeakTracker:
-    """Retain the exact peak scheduler-reported KV-cache usage for one generation call."""
+class _VllmRuntimeMetricsTracker:
+    """Retain scheduler deltas for exactly one rollout collection."""
 
     def __init__(self) -> None:
-        self.peak_usage_ratio = 0.0
+        self.reset()
 
     def record(self, scheduler_stats, iteration_stats, mm_cache_stats=None, engine_idx=0) -> None:
         del iteration_stats, mm_cache_stats, engine_idx
-        if scheduler_stats is not None:
-            self.peak_usage_ratio = max(self.peak_usage_ratio, float(scheduler_stats.kv_cache_usage))
+        if scheduler_stats is None:
+            return
+        self.peak_usage_ratio = max(self.peak_usage_ratio, float(scheduler_stats.kv_cache_usage))
+        prefix_stats = getattr(scheduler_stats, "prefix_cache_stats", None)
+        if prefix_stats is not None:
+            self.prefix_query_tokens += float(getattr(prefix_stats, "queries", 0))
+            self.prefix_hit_tokens += float(getattr(prefix_stats, "hits", 0))
+        spec_stats = getattr(scheduler_stats, "spec_decoding_stats", None)
+        if spec_stats is not None:
+            self.spec_drafts += float(getattr(spec_stats, "num_drafts", 0))
+            self.spec_draft_tokens += float(getattr(spec_stats, "num_draft_tokens", 0))
+            self.spec_accepted_tokens += float(getattr(spec_stats, "num_accepted_tokens", 0))
 
     def reset(self) -> None:
         self.peak_usage_ratio = 0.0
+        self.prefix_query_tokens = 0.0
+        self.prefix_hit_tokens = 0.0
+        self.spec_drafts = 0.0
+        self.spec_draft_tokens = 0.0
+        self.spec_accepted_tokens = 0.0
+
+    def metrics(self) -> dict[str, float]:
+        metrics = {
+            _KV_CACHE_PEAK_USAGE_METRIC: self.peak_usage_ratio,
+            _PREFIX_CACHE_QUERY_TOKENS_METRIC: self.prefix_query_tokens,
+            _PREFIX_CACHE_HIT_TOKENS_METRIC: self.prefix_hit_tokens,
+            _PREFIX_CACHE_HIT_RATE_METRIC: (
+                self.prefix_hit_tokens / self.prefix_query_tokens if self.prefix_query_tokens > 0 else 0.0
+            ),
+        }
+        if self.spec_drafts or self.spec_draft_tokens or self.spec_accepted_tokens:
+            metrics.update(
+                {
+                    "rollout/spec_num_drafts": self.spec_drafts,
+                    "rollout/spec_num_draft_tokens": self.spec_draft_tokens,
+                    "rollout/spec_num_accepted_tokens": self.spec_accepted_tokens,
+                    "rollout/spec_accept_rate": (
+                        self.spec_accepted_tokens / self.spec_draft_tokens if self.spec_draft_tokens > 0 else 0.0
+                    ),
+                    "rollout/spec_accept_length": (
+                        1.0 + self.spec_accepted_tokens / self.spec_drafts if self.spec_drafts > 0 else 0.0
+                    ),
+                }
+            )
+        return metrics
 
     def log(self) -> None:
         pass
@@ -202,6 +245,34 @@ def _compute_spec_decode_counter_delta(
     )
 
 
+def _merge_runtime_metrics(target: dict[str, float], metrics: dict[str, float]) -> None:
+    """Merge independent engine trackers before deriving weighted rates."""
+    additive = (
+        "rollout/spec_num_drafts",
+        "rollout/spec_num_draft_tokens",
+        "rollout/spec_num_accepted_tokens",
+        _PREFIX_CACHE_QUERY_TOKENS_METRIC,
+        _PREFIX_CACHE_HIT_TOKENS_METRIC,
+    )
+    for name in additive:
+        if name in metrics:
+            target[name] = target.get(name, 0.0) + metrics[name]
+    if _KV_CACHE_PEAK_USAGE_METRIC in metrics:
+        target[_KV_CACHE_PEAK_USAGE_METRIC] = max(
+            target.get(_KV_CACHE_PEAK_USAGE_METRIC, 0.0), metrics[_KV_CACHE_PEAK_USAGE_METRIC]
+        )
+    drafts = target.get("rollout/spec_num_drafts", 0.0)
+    draft_tokens = target.get("rollout/spec_num_draft_tokens", 0.0)
+    accepted_tokens = target.get("rollout/spec_num_accepted_tokens", 0.0)
+    if drafts or draft_tokens or accepted_tokens:
+        target["rollout/spec_accept_rate"] = accepted_tokens / draft_tokens if draft_tokens > 0 else 0.0
+        target["rollout/spec_accept_length"] = 1.0 + accepted_tokens / drafts if drafts > 0 else 0.0
+    prefix_queries = target.get(_PREFIX_CACHE_QUERY_TOKENS_METRIC, 0.0)
+    prefix_hits = target.get(_PREFIX_CACHE_HIT_TOKENS_METRIC, 0.0)
+    if _PREFIX_CACHE_QUERY_TOKENS_METRIC in target or _PREFIX_CACHE_HIT_TOKENS_METRIC in target:
+        target[_PREFIX_CACHE_HIT_RATE_METRIC] = prefix_hits / prefix_queries if prefix_queries > 0 else 0.0
+
+
 def _accumulate_spec_decode_metrics(buffer: MutableMapping[str, list[float]], metrics: dict[str, float]) -> None:
     """Accumulate turn-local counters into one step total with weighted rates."""
     if not metrics:
@@ -229,6 +300,14 @@ def _accumulate_spec_decode_metrics(buffer: MutableMapping[str, list[float]], me
     if _KV_CACHE_PEAK_USAGE_METRIC in metrics:
         prior_peak = buffer.get(_KV_CACHE_PEAK_USAGE_METRIC, [0.0])[-1]
         buffer[_KV_CACHE_PEAK_USAGE_METRIC] = [max(prior_peak, metrics[_KV_CACHE_PEAK_USAGE_METRIC])]
+    prefix_queries = metrics.get(_PREFIX_CACHE_QUERY_TOKENS_METRIC)
+    prefix_hits = metrics.get(_PREFIX_CACHE_HIT_TOKENS_METRIC)
+    if prefix_queries is not None or prefix_hits is not None:
+        total_queries = buffer.get(_PREFIX_CACHE_QUERY_TOKENS_METRIC, [0.0])[-1] + (prefix_queries or 0.0)
+        total_hits = buffer.get(_PREFIX_CACHE_HIT_TOKENS_METRIC, [0.0])[-1] + (prefix_hits or 0.0)
+        buffer[_PREFIX_CACHE_QUERY_TOKENS_METRIC] = [total_queries]
+        buffer[_PREFIX_CACHE_HIT_TOKENS_METRIC] = [total_hits]
+        buffer[_PREFIX_CACHE_HIT_RATE_METRIC] = [total_hits / total_queries if total_queries > 0 else 0.0]
 
 
 def _prefix_lora_adapter_weights(directory: str | Path, prefix: str) -> None:
@@ -708,7 +787,7 @@ class VLLMGeneration:
         self.last_generation_metrics: dict[str, float] = {}
         self._spec_decode_counter_snapshot: dict[str, float] = {}
         self._kv_cache_capacity_tokens: float | None = None
-        self._kv_cache_peak_tracker: _KvCachePeakTracker | None = None
+        self._kv_cache_peak_tracker: _VllmRuntimeMetricsTracker | None = None
 
         # Tensor names, dtypes and shapes streamed to the server on each weight sync. Collected on the first sync, as
         # it requires gathering the parameters, and constant afterwards.
@@ -824,9 +903,10 @@ class VLLMGeneration:
                 "quantization": quantization,
                 "trust_remote_code": self.trust_remote_code,
             }
-            observe_runtime_metrics = self.speculative_config is not None or str(
-                self.engine_kwargs.get("kv_cache_dtype", "")
-            ).startswith("turboquant_")
+            # Prefix-cache evidence is useful for every colocated rollout, not
+            # only speculative decoding or quantized KV-cache configurations.
+            observe_runtime_metrics = True
+            self._observe_runtime_metrics = observe_runtime_metrics
             if observe_runtime_metrics:
                 requested_log_stats = self.engine_kwargs.get("disable_log_stats")
                 if requested_log_stats is True:
@@ -872,14 +952,16 @@ class VLLMGeneration:
             else:
                 self.llm = LLM(**llm_kwargs)
             if observe_runtime_metrics and self.request_mode == "batch":
-                cache_config = self.llm.llm_engine.vllm_config.cache_config
-                capacity = getattr(cache_config, "kv_cache_size_tokens", None)
-                if isinstance(capacity, int) and capacity > 0:
-                    self._kv_cache_capacity_tokens = float(capacity)
-                logger_manager = self.llm.llm_engine.logger_manager
-                if logger_manager is not None:
-                    self._kv_cache_peak_tracker = _KvCachePeakTracker()
-                    logger_manager.stat_loggers.append(self._kv_cache_peak_tracker)
+                llm_engine = getattr(self.llm, "llm_engine", None)
+                if llm_engine is not None:
+                    cache_config = llm_engine.vllm_config.cache_config
+                    capacity = getattr(cache_config, "kv_cache_size_tokens", None)
+                    if isinstance(capacity, int) and capacity > 0:
+                        self._kv_cache_capacity_tokens = float(capacity)
+                    logger_manager = llm_engine.logger_manager
+                    if logger_manager is not None:
+                        self._kv_cache_peak_tracker = _VllmRuntimeMetricsTracker()
+                        logger_manager.stat_loggers.append(self._kv_cache_peak_tracker)
             if self.request_mode == "batch":
                 self._sleep_colocated_engine()
         else:
@@ -1064,7 +1146,33 @@ class VLLMGeneration:
 
         from .async_vllm_session import AsyncVllmSession
 
-        engine = AsyncLLM.from_engine_args(self._async_engine_args)
+        runtime_trackers: list[_VllmRuntimeMetricsTracker] = []
+
+        def runtime_tracker_factory(_vllm_config: Any, _engine_idx: int) -> _VllmRuntimeMetricsTracker:
+            tracker = _VllmRuntimeMetricsTracker()
+            runtime_trackers.append(tracker)
+            return tracker
+
+        engine = AsyncLLM.from_engine_args(
+            self._async_engine_args,
+            stat_loggers=[runtime_tracker_factory] if self._observe_runtime_metrics else None,
+        )
+        if self._observe_runtime_metrics:
+            vllm_config = getattr(engine, "vllm_config", None)
+            capacity = getattr(getattr(vllm_config, "cache_config", None), "kv_cache_size_tokens", None)
+            if isinstance(capacity, int) and capacity > 0:
+                self._kv_cache_capacity_tokens = float(capacity)
+
+        def reset_runtime_metrics() -> None:
+            for tracker in runtime_trackers:
+                tracker.reset()
+
+        def collect_runtime_metrics() -> None:
+            self.last_generation_metrics = {}
+            if self._kv_cache_capacity_tokens is not None:
+                self.last_generation_metrics[_KV_CACHE_CAPACITY_METRIC] = self._kv_cache_capacity_tokens
+            for tracker in runtime_trackers:
+                _merge_runtime_metrics(self.last_generation_metrics, tracker.metrics())
 
         if self.weight_sync_mode == "lora":
             if self._lora_request is None:
@@ -1107,6 +1215,8 @@ class VLLMGeneration:
             synchronize_policy,
             sleep_level=sleep_level,
             default_lora_request=default_lora_request,
+            reset_runtime_metrics=reset_runtime_metrics,
+            collect_runtime_metrics=collect_runtime_metrics,
         )
         return self._async_session
 
@@ -1189,7 +1299,7 @@ class VLLMGeneration:
         if self._kv_cache_capacity_tokens is not None:
             self.last_generation_metrics[_KV_CACHE_CAPACITY_METRIC] = self._kv_cache_capacity_tokens
         if self._kv_cache_peak_tracker is not None:
-            self.last_generation_metrics[_KV_CACHE_PEAK_USAGE_METRIC] = self._kv_cache_peak_tracker.peak_usage_ratio
+            self.last_generation_metrics.update(self._kv_cache_peak_tracker.metrics())
 
     def _generate_colocated_waves(self, prompts: list[dict], sampling_params: Any) -> list:
         """Generate a colocated batch in bounded request waves.

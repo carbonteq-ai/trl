@@ -39,6 +39,7 @@ class AsyncVllmEngine(Protocol):
 
 
 PolicySynchronizer = Callable[[str], Awaitable[None] | None]
+MetricsCallback = Callable[[], Awaitable[None] | None]
 
 
 class SessionPhase(StrEnum):
@@ -80,6 +81,8 @@ class AsyncVllmSession:
         *,
         sleep_level: int = 1,
         default_lora_request: Any | None = None,
+        reset_runtime_metrics: MetricsCallback | None = None,
+        collect_runtime_metrics: MetricsCallback | None = None,
     ) -> None:
         if sleep_level < 1:
             raise ValueError("async vLLM sleep level must be positive")
@@ -88,6 +91,8 @@ class AsyncVllmSession:
         self._synchronize = synchronize
         self._sleep_level = sleep_level
         self._default_lora_request = default_lora_request
+        self._reset_runtime_metrics = reset_runtime_metrics
+        self._collect_runtime_metrics = collect_runtime_metrics
         self._phase = SessionPhase.READY
         self._policy_version: str | None = None
         # AsyncLLM starts resident. vLLM supports a staged wake: weights can be
@@ -129,6 +134,10 @@ class AsyncVllmSession:
             if not self._generation_ready:
                 await self._engine.wake_up(tags=["kv_cache"])
                 self._generation_ready = True
+            if self._reset_runtime_metrics is not None:
+                result = self._reset_runtime_metrics()
+                if inspect.isawaitable(result):
+                    await result
             self._phase = SessionPhase.COLLECTING
 
         tasks = [asyncio.create_task(self.generate(request)) for request in requests]
@@ -179,14 +188,16 @@ class AsyncVllmSession:
         async with self._lock:
             self._require_phase(SessionPhase.READY)
             if self._policy_version != version:
-                raise RuntimeError(
-                    f"cannot open policy {version!r}; synchronized policy is {self._policy_version!r}"
-                )
+                raise RuntimeError(f"cannot open policy {version!r}; synchronized policy is {self._policy_version!r}")
             if not self._generation_ready:
                 # A weights-only wake intentionally leaves vLLM's scheduler
                 # paused until the KV cache is resident again.
                 await self._engine.wake_up(tags=["kv_cache"])
                 self._generation_ready = True
+            if self._reset_runtime_metrics is not None:
+                result = self._reset_runtime_metrics()
+                if inspect.isawaitable(result):
+                    await result
             self._phase = SessionPhase.COLLECTING
 
     async def generate(self, request: AsyncGenerationRequest) -> Any:
@@ -260,6 +271,10 @@ class AsyncVllmSession:
             self._require_phase(SessionPhase.DRAINING)
             if self._requests:
                 raise RuntimeError("cannot suspend vLLM while generation requests are active")
+            if self._collect_runtime_metrics is not None:
+                result = self._collect_runtime_metrics()
+                if inspect.isawaitable(result):
+                    await result
             await self._engine.sleep(level=self._sleep_level)
             self._weights_resident = False
             self._generation_ready = False

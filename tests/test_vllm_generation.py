@@ -70,8 +70,10 @@ def test_colocated_generation_collects_vllm_runtime_metrics():
     generation.last_generation_metrics = {}
     generation._spec_decode_counter_snapshot = {}
     generation._kv_cache_capacity_tokens = 4096.0
-    generation._kv_cache_peak_tracker = vllm_generation._KvCachePeakTracker()
+    generation._kv_cache_peak_tracker = vllm_generation._VllmRuntimeMetricsTracker()
     generation._kv_cache_peak_tracker.peak_usage_ratio = 0.625
+    generation._kv_cache_peak_tracker.prefix_query_tokens = 160.0
+    generation._kv_cache_peak_tracker.prefix_hit_tokens = 120.0
     generation.llm = SimpleNamespace(
         get_metrics=lambda: [
             SimpleNamespace(name="vllm:spec_decode_num_drafts", value=4),
@@ -91,19 +93,34 @@ def test_colocated_generation_collects_vllm_runtime_metrics():
         "rollout/spec_accept_length": 2.5,
         "rollout/kv_cache_capacity_tokens": 4096.0,
         "rollout/kv_cache_peak_usage_ratio": 0.625,
+        "rollout/prefix_cache_query_tokens": 160.0,
+        "rollout/prefix_cache_hit_tokens": 120.0,
+        "rollout/prefix_cache_hit_rate": 0.75,
     }
 
 
-def test_kv_cache_peak_tracker_retains_maximum_scheduler_sample():
-    tracker = vllm_generation._KvCachePeakTracker()
+def test_runtime_tracker_accumulates_prefix_cache_tokens_and_retains_kv_peak():
+    tracker = vllm_generation._VllmRuntimeMetricsTracker()
 
-    tracker.record(SimpleNamespace(kv_cache_usage=0.25), None)
-    tracker.record(SimpleNamespace(kv_cache_usage=0.75), None)
-    tracker.record(SimpleNamespace(kv_cache_usage=0.5), None)
+    tracker.record(
+        SimpleNamespace(kv_cache_usage=0.25, prefix_cache_stats=SimpleNamespace(queries=100, hits=64)), None
+    )
+    tracker.record(SimpleNamespace(kv_cache_usage=0.75, prefix_cache_stats=SimpleNamespace(queries=60, hits=56)), None)
 
     assert tracker.peak_usage_ratio == 0.75
+    assert tracker.metrics() == {
+        "rollout/kv_cache_peak_usage_ratio": 0.75,
+        "rollout/prefix_cache_query_tokens": 160.0,
+        "rollout/prefix_cache_hit_tokens": 120.0,
+        "rollout/prefix_cache_hit_rate": 0.75,
+    }
     tracker.reset()
-    assert tracker.peak_usage_ratio == 0.0
+    assert tracker.metrics() == {
+        "rollout/kv_cache_peak_usage_ratio": 0.0,
+        "rollout/prefix_cache_query_tokens": 0.0,
+        "rollout/prefix_cache_hit_tokens": 0.0,
+        "rollout/prefix_cache_hit_rate": 0.0,
+    }
 
 
 def test_speculative_turn_metrics_accumulate_as_step_totals():
@@ -153,6 +170,33 @@ def test_kv_cache_runtime_metrics_keep_capacity_and_step_peak():
     assert buffer == {
         "rollout/kv_cache_capacity_tokens": [4096.0],
         "rollout/kv_cache_peak_usage_ratio": [0.7],
+    }
+
+
+def test_prefix_cache_metrics_accumulate_counts_before_deriving_rate():
+    buffer = {}
+
+    _accumulate_spec_decode_metrics(
+        buffer,
+        {
+            "rollout/prefix_cache_query_tokens": 100.0,
+            "rollout/prefix_cache_hit_tokens": 80.0,
+            "rollout/prefix_cache_hit_rate": 0.8,
+        },
+    )
+    _accumulate_spec_decode_metrics(
+        buffer,
+        {
+            "rollout/prefix_cache_query_tokens": 300.0,
+            "rollout/prefix_cache_hit_tokens": 120.0,
+            "rollout/prefix_cache_hit_rate": 0.4,
+        },
+    )
+
+    assert buffer == {
+        "rollout/prefix_cache_query_tokens": [400.0],
+        "rollout/prefix_cache_hit_tokens": [200.0],
+        "rollout/prefix_cache_hit_rate": [0.5],
     }
 
 
@@ -252,6 +296,7 @@ def test_async_colocated_engine_is_lazy_and_refreshes_lora_on_its_serving_loop(m
     class FakeEngine:
         def __init__(self):
             self.loaded = {1}
+            self.vllm_config = SimpleNamespace(cache_config=SimpleNamespace(kv_cache_size_tokens=8192))
 
         async def list_loras(self):
             return set(self.loaded)
@@ -276,8 +321,9 @@ def test_async_colocated_engine_is_lazy_and_refreshes_lora_on_its_serving_loop(m
 
     class FakeAsyncLLM:
         @classmethod
-        def from_engine_args(cls, args):
+        def from_engine_args(cls, args, **kwargs):
             captured["engine_args"] = args
+            captured["engine_kwargs"] = kwargs
             return engine
 
     accelerator = SimpleNamespace(
@@ -320,6 +366,19 @@ def test_async_colocated_engine_is_lazy_and_refreshes_lora_on_its_serving_loop(m
         assert await generation.create_async_session() is session
         await session.synchronize_policy("optimizer-step-0")
         await session.open_policy("optimizer-step-0")
+        tracker = captured["engine_kwargs"]["stat_loggers"][0](None, 0)
+        tracker.record(
+            SimpleNamespace(
+                kv_cache_usage=0.5,
+                prefix_cache_stats=SimpleNamespace(queries=200, hits=150),
+                spec_decoding_stats=SimpleNamespace(
+                    num_drafts=10,
+                    num_draft_tokens=40,
+                    num_accepted_tokens=20,
+                ),
+            ),
+            None,
+        )
         await session.stop_admission()
         await session.suspend_for_update()
 
@@ -329,6 +388,18 @@ def test_async_colocated_engine_is_lazy_and_refreshes_lora_on_its_serving_loop(m
     assert captured["reset"] is True
     assert captured["sleep"] == 1
     assert engine.loaded == {1}
+    assert generation.last_generation_metrics == {
+        "rollout/kv_cache_capacity_tokens": 8192.0,
+        "rollout/kv_cache_peak_usage_ratio": 0.5,
+        "rollout/prefix_cache_query_tokens": 200.0,
+        "rollout/prefix_cache_hit_tokens": 150.0,
+        "rollout/prefix_cache_hit_rate": 0.75,
+        "rollout/spec_num_drafts": 10.0,
+        "rollout/spec_num_draft_tokens": 40.0,
+        "rollout/spec_num_accepted_tokens": 20.0,
+        "rollout/spec_accept_rate": 0.5,
+        "rollout/spec_accept_length": 3.0,
+    }
 
 
 def test_async_colocated_engine_streams_full_weights_and_commits_policy_version(monkeypatch):
@@ -369,8 +440,9 @@ def test_async_colocated_engine_streams_full_weights_and_commits_policy_version(
 
     class FakeAsyncLLM:
         @classmethod
-        def from_engine_args(cls, args):
+        def from_engine_args(cls, args, **kwargs):
             captured["engine_args"] = args
+            captured["engine_kwargs"] = kwargs
             return engine
 
     class FakeTransfer:
