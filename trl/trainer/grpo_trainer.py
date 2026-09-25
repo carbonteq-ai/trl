@@ -162,6 +162,30 @@ class _SupportsReset(Protocol):
 EnvironmentFactory = Callable[[], _SupportsReset]
 
 
+
+def _trim_to_real_tokens(
+    input_ids: torch.Tensor, attention_mask: torch.Tensor, logits_to_keep: int
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Cut a left-padded prompt + right-padded completion batch to its real extent.
+
+    Returns the trimmed inputs and the number of completion positions kept. RoPE is
+    relative, so dropping left padding only moves absolute positions to start where
+    generation started them.
+    """
+    prompt_width = input_ids.size(1) - logits_to_keep
+    real = attention_mask.bool().any(dim=0)
+    prompt_real = real[:prompt_width].nonzero()
+    start = int(prompt_real[0]) if prompt_real.numel() else prompt_width
+    completion_real = real[prompt_width:].nonzero()
+    keep = int(completion_real[-1]) + 1 if completion_real.numel() else 1
+    return input_ids[:, start : prompt_width + keep], attention_mask[:, start : prompt_width + keep], keep
+
+
+def _pad_completion(values: torch.Tensor, width: int) -> torch.Tensor:
+    """Right-pad per-completion-token values back to the padded completion width."""
+    missing = width - values.size(1)
+    return values if missing == 0 else torch.nn.functional.pad(values, (0, missing))
+
 class GRPOTrainer(_BaseTrainer):
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
@@ -1542,6 +1566,14 @@ class GRPOTrainer(_BaseTrainer):
             end = min(start + batch_size, input_ids.size(0))  # the last chunk can be smaller than batch_size
             input_ids_batch = input_ids[start:end]
             attention_mask_batch = attention_mask[start:end]
+            # A micro-batch is padded to the whole generation batch's longest prompt and
+            # completion. For text-only inputs, run the model on the micro-batch's own
+            # extent and pad the results back, so callers see unchanged shapes.
+            batch_keep = logits_to_keep
+            if pixel_values is None and token_type_ids is None and mm_token_type_ids is None:
+                input_ids_batch, attention_mask_batch, batch_keep = _trim_to_real_tokens(
+                    input_ids_batch, attention_mask_batch, logits_to_keep
+                )
 
             # Build model inputs
             model_inputs = {"input_ids": input_ids_batch, "attention_mask": attention_mask_batch}
@@ -1587,11 +1619,11 @@ class GRPOTrainer(_BaseTrainer):
             # Only add logits_to_keep if the model supports it
             if "logits_to_keep" in self.model_kwarg_keys:
                 # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
-                model_inputs["logits_to_keep"] = logits_to_keep + 1
+                model_inputs["logits_to_keep"] = batch_keep + 1
 
             model_inputs["use_cache"] = False  # only used in generation; set False to suppress warnings
 
-            completion_ids = input_ids_batch[:, -logits_to_keep:]
+            completion_ids = input_ids_batch[:, -batch_keep:]
             # Some causal-LM wrappers accept ``output_router_logits`` but drop the
             # router fields from their public output. Use the backbone path for
             # every auxiliary-loss request so the router logits remain available;
@@ -1602,7 +1634,7 @@ class GRPOTrainer(_BaseTrainer):
                     unwrapped_model,
                     input_ids_batch,
                     attention_mask_batch,
-                    logits_to_keep,
+                    batch_keep,
                     output_router_logits=compute_aux_loss,
                 )
                 if compute_aux_loss:
@@ -1613,9 +1645,9 @@ class GRPOTrainer(_BaseTrainer):
                 lm_head = unwrapped_model.get_output_embeddings()
                 chunk_logps = []
                 chunk_entropies = []
-                logits_chunk_size = self.logits_chunk_size or logits_to_keep
-                for chunk_start in range(0, logits_to_keep, logits_chunk_size):
-                    chunk_end = min(chunk_start + logits_chunk_size, logits_to_keep)
+                logits_chunk_size = self.logits_chunk_size or batch_keep
+                for chunk_start in range(0, batch_keep, logits_chunk_size):
+                    chunk_end = min(chunk_start + logits_chunk_size, batch_keep)
                     logits = lm_head(last_hidden_state[:, chunk_start:chunk_end, :])
                     logits = logits / temperature
                     chunk_ids = completion_ids[:, chunk_start:chunk_end]
@@ -1626,20 +1658,20 @@ class GRPOTrainer(_BaseTrainer):
                         else:
                             with torch.no_grad():
                                 chunk_entropies.append(entropy_from_logits(logits))
-                all_logps.append(torch.cat(chunk_logps, dim=1))
+                all_logps.append(_pad_completion(torch.cat(chunk_logps, dim=1), logits_to_keep))
                 if compute_entropy:
-                    all_entropies.append(torch.cat(chunk_entropies, dim=1))
+                    all_entropies.append(_pad_completion(torch.cat(chunk_entropies, dim=1), logits_to_keep))
             else:
                 outputs = model(**model_inputs)
                 logits = outputs.logits
                 # Exclude the last value: it corresponds to the next token pred
                 logits = logits[:, :-1, :]  # (B, L-1, H)
                 # Only keep the last logits_to_keep. For model that support logits_to_keep, this is a no-op.
-                logits = logits[:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
+                logits = logits[:, -batch_keep:, :]  # (B, batch_keep, H)
                 # Divide logits by sampling temperature.
                 # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
                 logits = logits / temperature
-                all_logps.append(selective_log_softmax(logits, completion_ids))
+                all_logps.append(_pad_completion(selective_log_softmax(logits, completion_ids), logits_to_keep))
 
                 if compute_entropy:
                     # The entropy bonus is a differentiable loss term, so entropies must carry grad when it is
@@ -1650,7 +1682,7 @@ class GRPOTrainer(_BaseTrainer):
                     else:
                         with torch.no_grad():
                             entropies = entropy_from_logits(logits)
-                    all_entropies.append(entropies)
+                    all_entropies.append(_pad_completion(entropies, logits_to_keep))
 
         logps = torch.cat(all_logps, dim=0)
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
