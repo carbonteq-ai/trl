@@ -5,7 +5,15 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
-Fork status: `candidate`, version `1.12.0.post9`.
+Fork status: `candidate`, version `1.12.0.post10`.
+Post10 makes the single-process GRPO actor update cheaper for long agentic
+episodes: each micro-batch is scored at its own real extent instead of the
+generation batch's padding, decoder layers can be compiled individually,
+gradient checkpointing can be limited to long micro-batches, and the vLLM
+importance-sampling ratio can come from the training forward instead of a
+separate no-grad pass. Its `vllm` extra pins CarbonTeq vLLM
+`f09e4479123d348cee87d217c695a22f9b2daacc`, released as
+`carbonteq-v0.29.1.dev4`, which carries the Uno integration and LFM2 DSpark.
 Post9 packages native Uno policy-LoRA refresh, MoE-safe chunked GRPO scoring,
 and rollout cache/speculation observability. Its `vllm` extra pins the exact
 CarbonTeq Uno source-overlay commit
@@ -108,6 +116,39 @@ authority. A candidate capability is not published until its fork commit,
 immutable release tag, package hashes, and clean-install verification exist.
 
 ## Maintained delta
+
+### Actor-update cost for long agentic episodes (2026-09-26, post10)
+
+Four independent, default-off-or-equivalent changes to `GRPOTrainer`:
+
+- Real-extent micro-batch scoring. `_get_per_token_logps_and_entropies` trims
+  each micro-batch to the longest real prompt and completion it contains
+  (`_trim_to_real_tokens`) and pads the resulting per-token values back to the
+  batch width (`_pad_completion`). Micro-batches previously inherited the whole
+  generation batch's padding; on LFM2.5-2.6B VORTEX episodes that was a ~25K
+  token row for ~9.7K real tokens. Masked positions are unchanged, so losses
+  and metrics are identical.
+- `GRPOConfig.compile_decoder_layers` compiles each gradient-checkpointing
+  decoder layer with `torch.compile(dynamic=True)` at trainer construction.
+  Measured on LFM2.5-2.6B LoRA at 9.7K tokens: 0.961 to 0.672 seconds per
+  episode with unchanged peak memory.
+- `GRPOConfig.gradient_checkpointing_min_tokens` disables checkpointing for
+  micro-batches shorter than the threshold and re-enables it for longer ones.
+  `None` keeps checkpointing everywhere.
+- `GRPOConfig.vllm_importance_sampling_from_training_logps` defers the vLLM
+  importance-sampling ratio to the training forward when the old policy equals
+  the current one (a single optimizer step per generation batch). The no-grad
+  old-log-prob pass is skipped; the ratio is computed from detached training
+  log-probabilities, and its statistics are flushed once per accumulation
+  boundary. Evaluation still computes the ratio eagerly.
+
+Regression tests: `tests/test_grpo_trim_padding.py`,
+`tests/test_grpo_deferred_importance_sampling.py`, and
+`test_sampling_logps_none_yields_neutral_importance_ratio` in
+`tests/test_grpo_trainer.py`, which now runs through both old-log-prob paths.
+Live evidence: Posttrain VORTEX v5 LFM2.5-2.6B updates went from an 823-second
+average (optimizer 373 seconds) to 278 seconds (optimizer 112 seconds) with
+these options, per-layer compile, and DSpark rollout.
 
 ### Async full-policy and native Uno policy-LoRA refresh (2026-09-18, post9)
 

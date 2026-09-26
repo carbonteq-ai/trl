@@ -86,7 +86,7 @@ test = [
     "tabulate"  # test report rendering in scripts/log_reports.py
 ]
 vllm = [
-    "vllm @ git+https://github.com/carbonteq-ai/vllm.git@37706e7d920abc97c705ffecee0919d64ef31485",
+    "vllm @ git+https://github.com/carbonteq-ai/vllm.git@f09e4479123d348cee87d217c695a22f9b2daacc",
     "aiohttp>=3.13.3",
     "requests",
 ]
