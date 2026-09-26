@@ -1743,7 +1743,8 @@ class TestGRPOTrainer(TrlTestCase):
     @pytest.mark.parametrize(
         "vllm_importance_sampling_mode", ["token_truncate", "token_mask", "sequence_truncate", "sequence_mask"]
     )
-    def test_sampling_logps_none_yields_neutral_importance_ratio(self, vllm_importance_sampling_mode):
+    @pytest.mark.parametrize("from_training_logps", [False, True])
+    def test_sampling_logps_none_yields_neutral_importance_ratio(self, vllm_importance_sampling_mode, from_training_logps):
         # Regression test for #6166: when vLLM cannot score a token it returns a NaN logprob, which
         # `extract_logprobs` replaces with `None`. That `None` reaches `torch.tensor(logps)` in
         # `_generate_and_score_completions` and raises "Could not infer dtype of NoneType". The fix builds the
@@ -1786,17 +1787,21 @@ class TestGRPOTrainer(TrlTestCase):
         trainer.use_vllm = True
         trainer.vllm_importance_sampling_correction = True
         trainer.vllm_importance_sampling_mode = vllm_importance_sampling_mode
+        # The one-time policy parity probe scores through a live vLLM engine, which this test replaces.
+        trainer.vllm_policy_parity_max_mean_logp_delta = None
+        # On-policy, the ratio can come from the training forward instead of a separate no-grad pass.
+        trainer.vllm_importance_sampling_from_training_logps = from_training_logps
 
         # Wrap the real `_generate` and inject an unscorable token into its own output, so the shapes come from the
         # trainer rather than being fixed here.
         original_generate = trainer._generate
 
-        def generate_with_one_unscorable_token(prompts):
+        def generate_with_one_unscorable_token(prompts, **kwargs):
             # Generation itself must take the ordinary path, so drop the flag for the duration of the call and
             # restore it afterwards for the loss, which is where the correction is applied.
             trainer.use_vllm = False
             try:
-                outputs = list(original_generate(prompts))
+                outputs = list(original_generate(prompts, **kwargs))
             finally:
                 trainer.use_vllm = True
             completion_ids = outputs[1]
@@ -1820,6 +1825,16 @@ class TestGRPOTrainer(TrlTestCase):
             return outputs
 
         trainer._generate_and_score_completions = record_metrics
+
+        # From the training forward, the divergence is recorded once per optimizer step instead.
+        original_flush = trainer._flush_deferred_importance_sampling
+
+        def record_flushed_metrics(mode):
+            original_flush(mode)
+            for key in ["sampling/sampling_logp_difference/mean", "sampling/sampling_logp_difference/max"]:
+                recorded_metrics.extend((key, value) for value in trainer._metrics[mode][key])
+
+        trainer._flush_deferred_importance_sampling = record_flushed_metrics
 
         # Capture the off-policy mask, the third consumer of the sampling logprobs.
         original_off_policy_mask = trainer.get_off_policy_mask
