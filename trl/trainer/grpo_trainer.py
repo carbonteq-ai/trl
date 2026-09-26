@@ -54,6 +54,7 @@ from transformers import (
     is_trackio_available,
     is_wandb_available,
 )
+from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.utils import is_peft_available, is_rich_available
 
@@ -831,6 +832,8 @@ class GRPOTrainer(_BaseTrainer):
         self.vllm_importance_sampling_clip_max = args.vllm_importance_sampling_clip_max
         self.vllm_importance_sampling_clip_min = args.vllm_importance_sampling_clip_min
         self.vllm_policy_parity_max_mean_logp_delta = args.vllm_policy_parity_max_mean_logp_delta
+        self.vllm_importance_sampling_from_training_logps = args.vllm_importance_sampling_from_training_logps
+        self._deferred_is_stats: list[torch.Tensor] = []
         self.vllm_policy_parity_max_tokens = args.vllm_policy_parity_max_tokens
         self.vllm_policy_parity_max_sequence_tokens = args.vllm_policy_parity_max_sequence_tokens
         self._vllm_policy_parity_checked = False
@@ -1027,6 +1030,13 @@ class GRPOTrainer(_BaseTrainer):
             # that behavior without rewriting `training_step`.
             compute_loss_func="non-None value to disable scaling",
         )
+
+        # Decoder layers, for per-micro-batch checkpointing and optional regional compilation.
+        self._decoder_layers = [m for m in self.model.modules() if isinstance(m, GradientCheckpointingLayer)]
+        self.gradient_checkpointing_min_tokens = args.gradient_checkpointing_min_tokens
+        if args.compile_decoder_layers:
+            for layer in self._decoder_layers:
+                layer.compile(dynamic=True)
 
         # Reference model
         self.beta = args.beta
@@ -1574,6 +1584,12 @@ class GRPOTrainer(_BaseTrainer):
                 input_ids_batch, attention_mask_batch, batch_keep = _trim_to_real_tokens(
                     input_ids_batch, attention_mask_batch, logits_to_keep
                 )
+            min_tokens = getattr(self, "gradient_checkpointing_min_tokens", None)
+            if min_tokens is not None and self.args.gradient_checkpointing and torch.is_grad_enabled():
+                # Recompute activations only for micro-batches too long to keep them.
+                checkpoint = input_ids_batch.size(1) >= min_tokens
+                for layer in self._decoder_layers:
+                    layer.gradient_checkpointing = checkpoint
 
             # Build model inputs
             model_inputs = {"input_ids": input_ids_batch, "attention_mask": attention_mask_batch}
@@ -1689,6 +1705,87 @@ class GRPOTrainer(_BaseTrainer):
         aux_loss = torch.stack(all_aux_losses).mean() if compute_aux_loss else None
         return logps, entropies, aux_loss
 
+    def _vllm_importance_sampling_ratio(self, actor_logps, sampling_per_token_logps, mask):
+        """Clipped or masked vLLM importance-sampling ratio, its clamp mask, and whether it is per sequence."""
+        per_token_logps_diff = (actor_logps - sampling_per_token_logps) * mask
+        # Tokens whose sampling logprob was NaN (unavailable from vLLM) get a zero difference, so their
+        # importance ratio is exactly 1 (no correction) rather than propagating NaN through the loss.
+        per_token_logps_diff = torch.nan_to_num(per_token_logps_diff, nan=0.0)
+
+        sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
+        if sequence_level_is:
+            logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
+        else:
+            logps_diff = per_token_logps_diff
+        ratio = torch.exp(logps_diff)
+        min_val = self.vllm_importance_sampling_clip_min if self.vllm_importance_sampling_clip_min is not None else -math.inf
+        max_val = self.vllm_importance_sampling_clip_max if self.vllm_importance_sampling_clip_max is not None else math.inf
+        if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
+            clamp_mask = (ratio < min_val) | (ratio > max_val)
+            ratio = torch.clamp(
+                ratio, min=self.vllm_importance_sampling_clip_min, max=self.vllm_importance_sampling_clip_max
+            )
+        elif self.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
+            clamp_mask = (ratio < min_val) | (ratio > max_val)
+            ratio = ratio.masked_fill(clamp_mask, value=0.0)
+        else:
+            raise ValueError(
+                f"Unknown vLLM importance sampling level: {self.vllm_importance_sampling_mode}. Possible values are "
+                "'token_truncate', 'token_mask', 'sequence_truncate', and 'sequence_mask'."
+            )
+        return ratio, clamp_mask, sequence_level_is
+
+    def _defer_importance_sampling(self, inputs, per_token_logps, mask):
+        """Fill the importance-sampling ratio from the training forward and record its statistics."""
+        sampling = inputs["sampling_per_token_logps"]
+        actor = per_token_logps.detach()
+        ratio, clamp_mask, sequence_level = self._vllm_importance_sampling_ratio(actor, sampling, mask)
+        inputs["importance_sampling_ratio"] = ratio
+        if not self.model.training:
+            return
+        token_mask = mask.bool()
+        delta = torch.abs(actor - sampling).float()
+        delta = delta[token_mask & ~torch.isnan(delta)]
+        flat = ratio.flatten() if sequence_level else ratio[token_mask]
+        clamped = clamp_mask.float().sum() if sequence_level else (clamp_mask & token_mask).float().sum()
+        clamp_count = float(clamp_mask.numel()) if sequence_level else token_mask.float().sum()
+        self._deferred_is_stats.append(
+            torch.stack(
+                [
+                    delta.sum().double(),
+                    torch.tensor(delta.numel(), device=delta.device, dtype=torch.float64),
+                    (delta.max() if delta.numel() else delta.new_zeros(())).double(),
+                    flat.sum().double(),
+                    torch.tensor(flat.numel(), device=flat.device, dtype=torch.float64),
+                    (flat.min() if flat.numel() else flat.new_full((), math.inf)).double(),
+                    (flat.max() if flat.numel() else flat.new_full((), -math.inf)).double(),
+                    torch.as_tensor(clamped, device=flat.device).double(),
+                    torch.as_tensor(clamp_count, device=flat.device).double(),
+                ]
+            )
+        )
+
+    def _flush_deferred_importance_sampling(self, mode):
+        """Emit one update's importance-sampling statistics with scoring-time semantics."""
+        if not self._deferred_is_stats:
+            return
+        local = torch.stack(self._deferred_is_stats)
+        self._deferred_is_stats = []
+        stats = self.accelerator.gather(local.unsqueeze(0)).reshape(-1, local.size(-1))
+        delta_count = stats[:, 1].sum().item()
+        ratio_count = stats[:, 4].sum().item()
+        metrics = self._metrics[mode]
+        metrics["sampling/sampling_logp_difference/mean"].append(stats[:, 0].sum().item() / delta_count if delta_count else 0.0)
+        metrics["sampling/sampling_logp_difference/max"].append(stats[:, 2].max().item())
+        metrics["sampling/sampling_logp_difference/token_count"].append(int(delta_count))
+        metrics["sampling/importance_sampling_ratio/min"].append(stats[:, 5].min().item() if ratio_count else 0.0)
+        metrics["sampling/importance_sampling_ratio/mean"].append(stats[:, 3].sum().item() / ratio_count if ratio_count else 0.0)
+        metrics["sampling/importance_sampling_ratio/max"].append(stats[:, 6].max().item() if ratio_count else 0.0)
+        clamp_total = stats[:, 8].sum().item()
+        metrics["sampling/importance_sampling_ratio/clamped_fraction"].append(
+            stats[:, 7].sum().item() / clamp_total if clamp_total else 0.0
+        )
+
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
         output = super().training_step(model, inputs, num_items_in_batch)
@@ -1697,6 +1794,7 @@ class GRPOTrainer(_BaseTrainer):
         self._current_train_step_time += time_after - time_before
         if self._step % self.current_gradient_accumulation_steps == 0:
             self._metrics["train"]["step_time"].append(self._current_train_step_time)
+            self._flush_deferred_importance_sampling("train")
             self._current_train_step_time = 0.0
         return output
 
@@ -3144,7 +3242,18 @@ class GRPOTrainer(_BaseTrainer):
             needs_vllm_actor_logps = self.use_vllm and (
                 self.vllm_importance_sampling_correction or self.vllm_policy_parity_max_mean_logp_delta is not None
             )
-            if self.args.gradient_accumulation_steps % generate_every != 0 or (needs_vllm_actor_logps):
+            # On-policy, the training forward yields the same log-probs; the ratio is computed in the loss.
+            defer_actor_logps = (
+                self.vllm_importance_sampling_from_training_logps
+                and self.use_vllm
+                and self.vllm_importance_sampling_correction
+                and not self.use_liger_kernel
+                and self.num_iterations == 1
+                and self.args.gradient_accumulation_steps % generate_every == 0
+            )
+            if self.args.gradient_accumulation_steps % generate_every != 0 or (
+                needs_vllm_actor_logps and not defer_actor_logps
+            ):
                 old_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
                     self.model,
                     prompt_completion_ids,
@@ -3159,70 +3268,13 @@ class GRPOTrainer(_BaseTrainer):
                 old_per_token_logps = None
 
             # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
-            if self.use_vllm and self.vllm_importance_sampling_correction:
+            if self.use_vllm and self.vllm_importance_sampling_correction and not defer_actor_logps:
                 mask = completion_mask if tool_mask is None else completion_mask * tool_mask
-                per_token_logps_diff = (old_per_token_logps - sampling_per_token_logps) * mask
-                # Tokens whose sampling logprob was NaN (unavailable from vLLM) get a zero difference, so their
-                # importance ratio is exactly 1 (no correction) rather than propagating NaN through the loss.
-                per_token_logps_diff = torch.nan_to_num(per_token_logps_diff, nan=0.0)
-
-                sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
-                if sequence_level_is:
-                    per_sequence_logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
-                    logps_diff = per_sequence_logps_diff
-                else:
-                    logps_diff = per_token_logps_diff
-
-                raw_vllm_importance_sampling_ratio = torch.exp(logps_diff)
-                importance_sampling_clamp_mask = torch.zeros_like(raw_vllm_importance_sampling_ratio, dtype=torch.bool)
-                vllm_importance_sampling_ratio = raw_vllm_importance_sampling_ratio
-
-                # vllm_importance_sampling_ratio.shape:
-                #   token_* modes:     (B, T)  (per-token ratio)
-                #   sequence_* modes:  (B, 1)  (per-sequence ratio)
-
-                if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
-                    min_val = (
-                        self.vllm_importance_sampling_clip_min
-                        if self.vllm_importance_sampling_clip_min is not None
-                        else -math.inf
-                    )
-                    max_val = (
-                        self.vllm_importance_sampling_clip_max
-                        if self.vllm_importance_sampling_clip_max is not None
-                        else math.inf
-                    )
-                    importance_sampling_clamp_mask = (vllm_importance_sampling_ratio < min_val) | (
-                        vllm_importance_sampling_ratio > max_val
-                    )
-                    vllm_importance_sampling_ratio = torch.clamp(
-                        vllm_importance_sampling_ratio,
-                        min=self.vllm_importance_sampling_clip_min,
-                        max=self.vllm_importance_sampling_clip_max,
-                    )
-                elif self.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
-                    min_val = (
-                        self.vllm_importance_sampling_clip_min
-                        if self.vllm_importance_sampling_clip_min is not None
-                        else -math.inf
-                    )
-                    max_val = (
-                        self.vllm_importance_sampling_clip_max
-                        if self.vllm_importance_sampling_clip_max is not None
-                        else math.inf
-                    )
-
-                    invalid_mis_mask = (vllm_importance_sampling_ratio < min_val) | (
-                        vllm_importance_sampling_ratio > max_val
-                    )
-                    importance_sampling_clamp_mask = invalid_mis_mask
-                    vllm_importance_sampling_ratio = vllm_importance_sampling_ratio.masked_fill(
-                        invalid_mis_mask, value=0.0
-                    )
-                else:
-                    raise ValueError(
-                        f"Unknown vLLM importance sampling level: {self.vllm_importance_sampling_mode}. Possible values are 'token_truncate', 'token_mask', 'sequence_truncate', and 'sequence_mask'."
-                    )
+                (
+                    vllm_importance_sampling_ratio,
+                    importance_sampling_clamp_mask,
+                    sequence_level_is,
+                ) = self._vllm_importance_sampling_ratio(old_per_token_logps, sampling_per_token_logps, mask)
 
             # Compute the per-token log probabilities for the reference model
             if self.beta != 0.0:
@@ -3430,7 +3482,7 @@ class GRPOTrainer(_BaseTrainer):
         if images is not None and self.log_multimodal:
             self._logs["images"].extend(gather_object(images))
 
-        if needs_vllm_actor_logps:
+        if needs_vllm_actor_logps and not defer_actor_logps:
             delta = torch.abs(old_per_token_logps - sampling_per_token_logps).float()
             mask = completion_mask.bool() if tool_mask is None else (completion_mask * tool_mask).bool()
             delta = delta[mask & ~torch.isnan(delta)]
@@ -3498,7 +3550,7 @@ class GRPOTrainer(_BaseTrainer):
                 self._metrics[mode]["sampling/policy_parity_logp_difference/token_count"].append(parity_token_count)
                 self._enforce_vllm_policy_parity(mode, parity_mean_delta, parity_token_count)
 
-        if self.use_vllm and self.vllm_importance_sampling_correction:
+        if self.use_vllm and self.vllm_importance_sampling_correction and not defer_actor_logps:
             if sequence_level_is:
                 flat_is_ratio = vllm_importance_sampling_ratio.flatten()
             else:
@@ -3545,7 +3597,7 @@ class GRPOTrainer(_BaseTrainer):
             output["group_reward_std"] = local_group_reward_std
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
-        if self.use_vllm and self.vllm_importance_sampling_correction:
+        if self.use_vllm and self.vllm_importance_sampling_correction and not defer_actor_logps:
             output["importance_sampling_ratio"] = vllm_importance_sampling_ratio
         if sampling_per_token_logps is not None:
             output["sampling_per_token_logps"] = sampling_per_token_logps
@@ -3775,6 +3827,14 @@ class GRPOTrainer(_BaseTrainer):
         # for importance sampling
         old_per_token_logps = inputs.get("old_per_token_logps")
         old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
+        if (
+            self.use_vllm
+            and self.vllm_importance_sampling_correction
+            and "importance_sampling_ratio" not in inputs
+            and "sampling_per_token_logps" in inputs
+        ):
+            # Deferred from scoring: on-policy, these detached log-probs are the old policy's.
+            self._defer_importance_sampling(inputs, per_token_logps, mask)
 
         if self.off_policy_mask_threshold is not None:
             # OPSM should use inference-time logprobs to detect both sources of off-policyness:

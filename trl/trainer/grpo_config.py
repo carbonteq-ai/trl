@@ -1037,6 +1037,25 @@ class GRPOConfig(_BaseConfig):
             "log probabilities. Reduces peak memory for long completions without changing the objective."
         },
     )
+    gradient_checkpointing_min_tokens: int | None = field(
+        default=None,
+        metadata={
+            "help": "With gradient checkpointing enabled, checkpoint only micro-batches whose unpadded sequence "
+            "is at least this many tokens. Shorter micro-batches keep their activations and skip the recomputed "
+            "forward pass. `None` checkpoints every micro-batch."
+        },
+    )
+    compile_decoder_layers: bool = field(
+        default=False,
+        metadata={
+            "help": "Compile each decoder layer with `torch.compile(dynamic=True)` to fuse its elementwise work. "
+            "Compilation happens on the first training step."
+        },
+    )
+    vllm_importance_sampling_from_training_logps: bool = False
+    """When training is on-policy (one iteration, generation aligned with the optimizer step), compute the vLLM
+    importance-sampling ratio from the training forward's detached log-probs instead of a separate no-grad forward
+    over the generation batch. Both give the current policy's log-probs; this skips the extra pass."""
     vllm_importance_sampling_correction: bool = field(
         default=True,
         metadata={
@@ -1324,6 +1343,8 @@ class GRPOConfig(_BaseConfig):
         if self.use_precomputed_advantages and self.use_liger_kernel:
             raise ValueError("use_precomputed_advantages is not supported by the Liger GRPO kernel")
 
+        if self.gradient_checkpointing_min_tokens is not None and self.gradient_checkpointing_min_tokens < 1:
+            raise ValueError("gradient_checkpointing_min_tokens must be a positive integer when provided.")
         if self.logits_chunk_size is not None and self.logits_chunk_size < 1:
             raise ValueError("logits_chunk_size must be a positive integer when provided.")
 
