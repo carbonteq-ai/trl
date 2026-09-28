@@ -197,6 +197,14 @@ class GRPOConfig(_BaseConfig):
             KL coefficient. If `0.0` (default), the reference model is not loaded, reducing memory usage and improving
             training speed. [DeepSeek-R1 incentivizes reasoning in LLMs through reinforcement
             learning](https://huggingface.co/papers/2501.12948) use a value of `0.001`.
+        peft_reference (`str`, *optional*, defaults to `"adapter_copy"`):
+            Reference policy for the KL penalty when the trainer receives a model that already carries a trained PEFT
+            adapter (for example one loaded with `PeftModel.from_pretrained(..., is_trainable=True)`) and `beta` is
+            non-zero. `"adapter_copy"` freezes a copy of the starting adapter as a `"ref"` adapter, so the penalty and
+            the logged `kl` measure distance from the starting checkpoint. `"base"` creates no `"ref"` adapter and
+            computes reference log-probabilities with adapters disabled, so they measure distance from the base model.
+            A new adapter created from `peft_config` starts at zero, so both choices give the base model there. Models
+            without PEFT use `ref_model` and ignore this setting.
         num_iterations (`int`, *optional*, defaults to `1`):
             Number of iterations per batch (denoted as μ in the algorithm).
         epsilon (`float`, *optional*, defaults to `0.2`):
@@ -771,6 +779,14 @@ class GRPOConfig(_BaseConfig):
             "learning](https://huggingface.co/papers/2501.12948) use a value of `0.001`."
         },
     )
+    peft_reference: str = field(
+        default="adapter_copy",
+        metadata={
+            "help": "KL reference for a model passed with a trained PEFT adapter: 'adapter_copy' freezes a copy of the "
+            "starting adapter, 'base' uses the base model (adapters disabled).",
+            "choices": ["adapter_copy", "base"],
+        },
+    )
     num_iterations: int = field(
         default=1,
         metadata={"help": "Number of iterations per batch (denoted as μ in the algorithm)."},
@@ -1234,6 +1250,8 @@ class GRPOConfig(_BaseConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.peft_reference not in ("adapter_copy", "base"):
+            raise ValueError(f"peft_reference must be 'adapter_copy' or 'base', got {self.peft_reference!r}")
 
         if self.use_transformers_paged:
             warnings.warn(

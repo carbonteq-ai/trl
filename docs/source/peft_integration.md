@@ -150,6 +150,14 @@ trainer = SFTTrainer(
 
 **Cons**: More verbose, requires understanding of PEFT internals
 
+When [`GRPOTrainer`] or [`RLOOTrainer`] receives a model that already carries a trained adapter (for example one loaded
+with `PeftModel.from_pretrained(model, adapter_path, is_trainable=True)` to continue training) and the KL coefficient
+`beta` is non-zero, the reference policy defaults to a frozen copy of the starting adapter
+(`peft_reference="adapter_copy"`), so the penalty and the logged `kl` measure distance from the checkpoint training
+resumed from. Set `peft_reference="base"` to measure distance from the base model instead: no reference adapter is
+created and the reference log-probabilities are computed with adapters disabled. For a new adapter created from
+`peft_config` both settings give the base model.
+
 ## Learning Rate Considerations
 
 When using LoRA or other PEFT methods, you typically need to use a **higher learning rate** (approximately 10x) compared to full fine-tuning. This is because PEFT methods train only a small fraction of parameters, requiring a larger learning rate to achieve similar parameter updates.

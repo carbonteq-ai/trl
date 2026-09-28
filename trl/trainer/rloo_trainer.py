@@ -359,7 +359,9 @@ class RLOOTrainer(_BaseTrainer):
                 get_peft_model_kwargs["autocast_adapter_dtype"] = False
             model = get_peft_model(model, peft_config, **get_peft_model_kwargs)
 
-        elif is_peft_model(model):
+        elif is_peft_model(model) and args.peft_reference == "adapter_copy":
+            # With `peft_reference="base"` this branch is skipped: no "ref" adapter exists, and the reference log probs
+            # come from the base model with adapters disabled.
             # If the model is a PEFT model with a pretrained adapter, we need to create a "ref" adapter that is a copy
             # of the "default" adapter, so that we can use it as the reference model during the training. Before PEFT
             # 0.20.0, only one adapter per model was supported when the LoRA config uses `target_parameters` (see
@@ -1529,6 +1531,7 @@ class RLOOTrainer(_BaseTrainer):
                     # When training a PEFT adapter, how we obtain the reference depends on the setup:
                     # - New adapter: disabling adapters yields the base model.
                     # - Re-training an existing adapter: an initial copy is loaded under the name "ref".
+                    #   With `peft_reference="base"` no copy is made, so the base model is the reference.
                     model = self.accelerator.unwrap_model(self.model)
                     with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
                         ref_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
