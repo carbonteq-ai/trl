@@ -5,7 +5,14 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
-Fork status: `candidate`, version `1.12.0.post11`.
+Fork status: `candidate`, version `1.12.0.post12`.
+Post12 makes float16 training safe for GRPO and RLOO: float16 logits are
+scored in float32 on GRPO's full and chunked-logits paths and RLOO's, and the
+GRPO loss takes float16 log-probabilities and entropies to float32 before its
+KL, importance-ratio and masked-sum arithmetic, which overflowed to NaN on
+masked multi-turn tokens. bfloat16 and float32 behavior is unchanged, and the
+`vllm` extra is unchanged from post11. Branch `codex/fp16-loss-fp32`, on the
+post11 release commit `3135b502d69956200d1c030a514470c351d2ee9f`.
 Post11 adds optional oversampling to active sampling
 (`active_sampling_oversample`, `active_sampling_oversample_refill`) so a long
 multi-turn rollout round absorbs its usual share of zero-spread prompt groups
