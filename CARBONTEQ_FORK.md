@@ -5,7 +5,12 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
-Fork status: `candidate`, version `1.12.0.post10`.
+Fork status: `candidate`, version `1.12.0.post11`.
+Post11 adds optional oversampling to active sampling
+(`active_sampling_oversample`, `active_sampling_oversample_refill`) so a long
+multi-turn rollout round absorbs its usual share of zero-spread prompt groups
+instead of paying for another serial refill round. Both default to `0`, which
+keeps post10 behavior. Its `vllm` extra is unchanged from post10.
 Post10 makes the single-process GRPO actor update cheaper for long agentic
 episodes: each micro-batch is scored at its own real extent instead of the
 generation batch's padding, decoder layers can be compiled individually,
@@ -66,6 +71,7 @@ remain unsupported. Files: `trl/trainer/rollout_admission.py`,
 coverage includes two actual trainer updates for GRPO and active sampling,
 source-row identity, empty candidate rounds and gradients at microbatch 1/2/4.
 Run `python -m pytest tests/test_rollout_admission.py tests/test_olmo3_grpo_config.py`.
+Post11 oversampling adds `tests/test_dapo_dynamic_sampling.py` to that gate.
 The consuming GPU qualification remains open; do not infer throughput fixes.
 Previous post4 commit: `19e6c89a18617f1bd6e6385212705a67f5434962`.
 Post4 source branch: `codex/trl-parity-probe-bound`. It includes the trainer
@@ -116,6 +122,54 @@ authority. A candidate capability is not published until its fork commit,
 immutable release tag, package hashes, and clean-install verification exist.
 
 ## Maintained delta
+
+### Active-sampling oversampling (2026-09-28, post11)
+
+`GRPOTrainer._prepare_active_sampling_inputs` generates the target rows in the
+first round, drops prompt groups whose rewards have no spread, and refills only
+the synchronized number of missing rows. Every refill is a serial round; with
+multi-turn agent episodes each one is a full episode wave for a few groups
+while the inference engine idles. Measured on Posttrain's LFM2.5-2.6B SAMPO run
+(24 prompts x 6 generations, about 88% of groups retained per round), most
+updates needed two rounds and some three.
+
+Two `GRPOConfig` fields, both counts of complete prompt groups per process and
+both requiring `active_sampling=True`:
+
+- `active_sampling_oversample`: the first round requests the target plus this
+  many groups;
+- `active_sampling_oversample_refill`: each refill round requests the missing
+  groups plus this many, but never more than the first round (target plus
+  `active_sampling_oversample`), so the first-round size is the largest
+  concurrent rollout load.
+
+Every round draws from the same bounded candidate pool
+(`active_sampling_max_batches` target batches) and is cut to what remains of
+it. Only a round that cannot even cover its missing rows fails, naming the pool;
+the max-round limit and its error are unchanged. The cursor still advances by
+synchronized amounts, so all processes request the same round size.
+`NoAdmittedRollouts` rounds still count as generated. The batch is assembled
+exactly as before, keeping the first target retained rows in candidate order;
+surplus retained groups are discarded, never carried into a later update.
+Oversampling therefore changes rollout cost and wall time, not which groups
+are trained on. With both fields at `0` no request, metric, or error path
+changes. When either is set, the trainer also records
+`active_sampling/oversampled_groups` (groups generated beyond what each round
+was missing), `active_sampling/discarded_groups`, and per round
+`active_sampling/round_<n>_{requested,generated,retained}_groups`. These count
+prompt groups; the older `candidate_groups_*` counters count rows.
+
+Files: `trl/trainer/grpo_config.py`, `trl/trainer/grpo_trainer.py`,
+`docs/source/grpo_trainer.md`. Regression tests in
+`tests/test_dapo_dynamic_sampling.py` use fake generation and scoring (no GPU):
+unchanged exact refill for three retention patterns, a first round that fills
+the target, refills of missing plus `oversample_refill`, the first-round cap on
+refills, pool cut and exhaustion, a round without admitted rollouts, metrics,
+and configuration validation. `tests/test_rollout_admission.py` runs two real
+trainer updates with `active_sampling_oversample=1` and checks each update
+needs one round. The consumer must size its rollout concurrency (for colocated
+vLLM, `max_num_seqs` through `vllm_engine_kwargs`) for the oversampled first
+round; Posttrain checks this at job planning and trainer start.
 
 ### Actor-update cost for long agentic episodes (2026-09-26, post10)
 
@@ -532,6 +586,13 @@ Run the focused maintained-delta suite from this repository:
       tests/test_dapo_dynamic_sampling.py \
       tests/test_sampo_precomputed_advantages.py \
       tests/experimental/test_iw_opd_trainer.py
+
+Active sampling, including post11 oversampling, is covered by:
+
+    uv run pytest -q \
+      tests/test_dapo_dynamic_sampling.py \
+      tests/test_rollout_admission.py \
+      tests/test_olmo3_grpo_config.py
 
 Run the GRPO selections that cover synchronization, parity, truncation,
 advantages, and projection:
