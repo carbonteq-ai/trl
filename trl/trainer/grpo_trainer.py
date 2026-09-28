@@ -187,6 +187,18 @@ def _pad_completion(values: torch.Tensor, width: int) -> torch.Tensor:
     missing = width - values.size(1)
     return values if missing == 0 else torch.nn.functional.pad(values, (0, missing))
 
+
+def _float32_if_half(values: torch.Tensor | None) -> torch.Tensor | None:
+    """Float16 log-probabilities, logits or entropies as float32; any other dtype unchanged.
+
+    The loss exponentiates log-probability differences (the k3 KL term, importance ratios). In float16, `exp`
+    overflows to infinity once a difference exceeds ln(65504) ~= 11.09, and an infinite term times a zero completion
+    mask (for example a tool-output token of a multi-turn completion) is NaN. bfloat16 shares float32's exponent range
+    and is left unchanged.
+    """
+    return values.float() if values is not None and values.dtype == torch.float16 else values
+
+
 class GRPOTrainer(_BaseTrainer):
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
@@ -1668,7 +1680,9 @@ class GRPOTrainer(_BaseTrainer):
                 logits_chunk_size = self.logits_chunk_size or batch_keep
                 for chunk_start in range(0, batch_keep, logits_chunk_size):
                     chunk_end = min(chunk_start + logits_chunk_size, batch_keep)
-                    logits = lm_head(last_hidden_state[:, chunk_start:chunk_end, :])
+                    # The backbone and head run outside the model forward's autocast; take float16 logits to
+                    # float32 so the log-probs, entropies and the loss computed from them are float32.
+                    logits = _float32_if_half(lm_head(last_hidden_state[:, chunk_start:chunk_end, :]))
                     logits = logits / temperature
                     chunk_ids = completion_ids[:, chunk_start:chunk_end]
                     chunk_logps.append(selective_log_softmax(logits, chunk_ids))
@@ -1688,6 +1702,7 @@ class GRPOTrainer(_BaseTrainer):
                 logits = logits[:, :-1, :]  # (B, L-1, H)
                 # Only keep the last logits_to_keep. For model that support logits_to_keep, this is a no-op.
                 logits = logits[:, -batch_keep:, :]  # (B, batch_keep, H)
+                logits = _float32_if_half(logits)  # float16 log-probs would overflow the loss's exp
                 # Divide logits by sampling temperature.
                 # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
                 logits = logits / temperature
@@ -3853,6 +3868,11 @@ class GRPOTrainer(_BaseTrainer):
             image_position_ids=inputs.get("image_position_ids"),
         )
 
+        # Every log-probability-derived term below is computed in float32 when the scores are float16 (a subclass
+        # or an external scorer may still return float16): see _float32_if_half.
+        per_token_logps = _float32_if_half(per_token_logps)
+        entropies = _float32_if_half(entropies)
+
         if self.top_entropy_quantile < 1.0:
             entropy_mask = self.get_high_entropy_mask(entropies, mask, 1 - self.top_entropy_quantile)
         else:
@@ -3869,7 +3889,7 @@ class GRPOTrainer(_BaseTrainer):
         # (see _generate_and_score_completions) and instead use per_token_logps.detach().
         # The exception is when using vLLM, where we always compute old_per_token_logps
         # for importance sampling
-        old_per_token_logps = inputs.get("old_per_token_logps")
+        old_per_token_logps = _float32_if_half(inputs.get("old_per_token_logps"))
         old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
         if (
             self.use_vllm
@@ -3911,7 +3931,7 @@ class GRPOTrainer(_BaseTrainer):
 
         # Compute the KL divergence between the model and the reference model
         if self.beta != 0.0:
-            ref_per_token_logps = inputs["ref_per_token_logps"]
+            ref_per_token_logps = _float32_if_half(inputs["ref_per_token_logps"])
             per_token_kl = (
                 torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
             )

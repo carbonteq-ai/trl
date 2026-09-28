@@ -75,7 +75,8 @@ coverage includes two actual trainer updates for GRPO and active sampling,
 source-row identity, empty candidate rounds and gradients at microbatch 1/2/4.
 Run `python -m pytest tests/test_rollout_admission.py tests/test_olmo3_grpo_config.py`.
 Post11 adds `tests/test_dapo_dynamic_sampling.py` and
-`tests/test_grpo_peft_reference.py` to that gate.
+`tests/test_grpo_peft_reference.py` to that gate; post12 adds
+`tests/test_grpo_float16_loss.py`.
 The consuming GPU qualification remains open; do not infer throughput fixes.
 Previous post4 commit: `19e6c89a18617f1bd6e6385212705a67f5434962`.
 Post4 source branch: `codex/trl-parity-probe-bound`. It includes the trainer
@@ -126,6 +127,45 @@ authority. A candidate capability is not published until its fork commit,
 immutable release tag, package hashes, and clean-install verification exist.
 
 ## Maintained delta
+
+### Float32 scoring and loss for float16 training (2026-09-29, post12)
+
+Under float16 mixed precision the policy's logits are float16, and GRPO and
+RLOO computed the per-token log-probabilities and entropies, and every loss
+term derived from them, in that dtype. GRPO's chunked-logits path
+(`logits_chunk_size`) calls the backbone and LM head directly, outside the
+autocast wrapper of the model forward, and the full path applies the
+log-softmax outside it, so neither returned float32. In `_compute_loss` the k3
+KL term `exp(ref - logp) - (ref - logp) - 1` is then a float16 `exp`, infinite
+once the log-ratio exceeds ln(65504) ~= 11.09. The completion or tool mask of a
+multi-turn completion zeroes tool and environment tokens that the policy never
+sampled, and whose log-ratio against the reference is unbounded, and an
+infinite term times the zero mask is NaN, so the loss and all gradients were
+NaN and the loss scaler skipped every step. A Posttrain LFM2.5-2.6B SAMPO run
+continued from a trained adapter with the base model as KL reference skipped
+all five fp16 updates this way. bfloat16 has float32's exponent range and never
+overflowed.
+
+GRPO now takes float16 logits to float32 before the log-softmax and entropy in
+both scoring paths, and `_compute_loss` takes float16 policy, old and reference
+log-probabilities and entropies to float32 before any loss arithmetic, so a
+subclass or external scorer that still returns float16 is also safe (KL
+estimators, token and sequence importance ratios, vLLM importance weights,
+clipped policy term, masked sums, entropy bonus). RLOO's scorer does the same.
+bfloat16 and float32 are unchanged. The float32 copy costs one chunk of
+`logits_chunk_size` x vocabulary on the chunked path and one completion's
+logits on the full path, only under float16. The fused Liger loss already
+computes in float32 and is unchanged.
+
+Files: `trl/trainer/grpo_trainer.py` (`_float32_if_half`),
+`trl/trainer/rloo_trainer.py`. Regression test:
+`tests/test_grpo_float16_loss.py` scores a tiny float16 Qwen3 through GRPO's
+full and chunked paths and RLOO's (float32, equal to the float32 log-softmax of
+the model's logits; bfloat16 unchanged), and runs the real GRPO `_compute_loss`
+on float16 scores of a completion with a masked tool token whose reference
+log-probability is 12 nats above the policy's, for the sequence-level (SAMPO)
+and token-level (DAPO, CISPO) objectives: NaN on post11, finite float32 with
+this change.
 
 ### Base-model KL reference for a trained adapter (2026-09-28, post11)
 
@@ -618,6 +658,10 @@ Run the focused maintained-delta suite from this repository:
       tests/test_dapo_dynamic_sampling.py \
       tests/test_sampo_precomputed_advantages.py \
       tests/experimental/test_iw_opd_trainer.py
+
+Float16 scoring and loss arithmetic (post12) are covered by:
+
+    uv run pytest -q tests/test_grpo_float16_loss.py
 
 Active sampling, including post11 oversampling, is covered by:
 

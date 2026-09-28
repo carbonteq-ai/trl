@@ -980,6 +980,9 @@ class RLOOTrainer(_BaseTrainer):
             logits = logits[:, :-1, :]  # (B, L-1, H)
             # Only keep the last logits_to_keep. For model that support logits_to_keep, this is a no-op.
             logits = logits[:, -logits_to_keep:, :]  # (B, logits_to_keep, H)
+            # Float16 log-probs lose the sequence sums and overflow the ratio's exp: score in float32.
+            if logits.dtype == torch.float16:
+                logits = logits.float()
             # Divide logits by sampling temperature.
             # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
             logits = logits / self.temperature
