@@ -10,7 +10,10 @@ Post11 adds optional oversampling to active sampling
 (`active_sampling_oversample`, `active_sampling_oversample_refill`) so a long
 multi-turn rollout round absorbs its usual share of zero-spread prompt groups
 instead of paying for another serial refill round. Both default to `0`, which
-keeps post10 behavior. Its `vllm` extra is unchanged from post10.
+keeps post10 behavior. It also adds `peft_reference` to GRPO and RLOO, so a run
+that continues a trained LoRA adapter can keep the base model as its KL
+reference instead of a frozen copy of the starting adapter. Its `vllm` extra is
+unchanged from post10.
 Post10 makes the single-process GRPO actor update cheaper for long agentic
 episodes: each micro-batch is scored at its own real extent instead of the
 generation batch's padding, decoder layers can be compiled individually,
@@ -71,7 +74,8 @@ remain unsupported. Files: `trl/trainer/rollout_admission.py`,
 coverage includes two actual trainer updates for GRPO and active sampling,
 source-row identity, empty candidate rounds and gradients at microbatch 1/2/4.
 Run `python -m pytest tests/test_rollout_admission.py tests/test_olmo3_grpo_config.py`.
-Post11 oversampling adds `tests/test_dapo_dynamic_sampling.py` to that gate.
+Post11 adds `tests/test_dapo_dynamic_sampling.py` and
+`tests/test_grpo_peft_reference.py` to that gate.
 The consuming GPU qualification remains open; do not infer throughput fixes.
 Previous post4 commit: `19e6c89a18617f1bd6e6385212705a67f5434962`.
 Post4 source branch: `codex/trl-parity-probe-bound`. It includes the trainer
@@ -122,6 +126,34 @@ authority. A candidate capability is not published until its fork commit,
 immutable release tag, package hashes, and clean-install verification exist.
 
 ## Maintained delta
+
+### Base-model KL reference for a trained adapter (2026-09-28, post11)
+
+When `GRPOTrainer` (with `beta != 0`) or `RLOOTrainer` receives a model that
+already carries a trained PEFT adapter, upstream adds a frozen `"ref"` adapter
+copied from it, so the KL penalty and the logged `kl` measure distance from the
+starting checkpoint. Posttrain continues runs from an earlier run's adapter
+(`PeftModel.from_pretrained(base, adapter, is_trainable=True)`); each restart
+reset the anchor to an already drifted policy.
+
+`GRPOConfig.peft_reference` and `RLOOConfig.peft_reference` take
+`"adapter_copy"` (default, upstream behavior) or `"base"`. With `"base"` no
+`"ref"` adapter is created, and the existing reference path,
+`use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None)`,
+disables adapters, so reference log-probabilities come from the base model. A
+new adapter created from `peft_config` starts at zero, so both values give the
+base model there. Models without PEFT use `ref_model`, loaded from the policy's
+own `name_or_path`, and ignore the setting; the vLLM importance-sampling ratio
+compares the sampler with the current policy and never used the reference.
+DPO and KTO keep their own reference-adapter options and are unchanged.
+
+Files: `trl/trainer/grpo_config.py`, `trl/trainer/grpo_trainer.py`,
+`trl/trainer/rloo_config.py`, `trl/trainer/rloo_trainer.py`,
+`docs/source/peft_integration.md`. Regression test:
+`tests/test_grpo_peft_reference.py` loads a non-zero LoRA adapter on a tiny
+GPT-2 with `PeftModel.from_pretrained(..., is_trainable=True)` and shows that
+`"base"` creates no `"ref"` adapter and yields reference log-probabilities equal
+to the base model's, while the default still equals the starting adapter's.
 
 ### Active-sampling oversampling (2026-09-28, post11)
 
