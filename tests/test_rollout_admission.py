@@ -53,8 +53,11 @@ def test_masked_accumulation_matches_retained_sequence_gradient(microbatch):
     )
 
 
-@pytest.mark.parametrize("active_sampling,empty_round", [(False, False), (True, False), (True, True)])
-def test_real_trainer_updates_after_dropping_nonprefix_groups(tmp_path, active_sampling, empty_round):
+@pytest.mark.parametrize(
+    "active_sampling,empty_round,oversample",
+    [(False, False, 0), (True, False, 0), (True, True, 0), (True, False, 1)],
+)
+def test_real_trainer_updates_after_dropping_nonprefix_groups(tmp_path, active_sampling, empty_round, oversample):
     from datasets import Dataset
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -108,6 +111,7 @@ def test_real_trainer_updates_after_dropping_nonprefix_groups(tmp_path, active_s
             loss_type="dapo" if active_sampling else "grpo",
             active_sampling=active_sampling,
             active_sampling_max_batches=2,
+            active_sampling_oversample=oversample,
             scale_rewards="none" if active_sampling else "group",
             report_to="none",
             save_strategy="no",
@@ -120,5 +124,6 @@ def test_real_trainer_updates_after_dropping_nonprefix_groups(tmp_path, active_s
     )
     trainer.train()
     assert trainer.state.global_step == 2
-    assert len(calls) == (4 if active_sampling else 2)
+    # An oversampled first round of five groups keeps its fifth group's spread, so each update needs one round.
+    assert len(calls) == (4 if active_sampling and not oversample else 2)
     assert not torch.equal(before, model.transformer.wte.weight)

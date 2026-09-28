@@ -308,6 +308,20 @@ class GRPOConfig(_BaseConfig):
             Maximum generation rounds used to fill one active-sampling training batch.
         active_sampling_reward_std_epsilon (`float`, *optional*, defaults to `0.0`):
             Minimum within-group reward standard deviation retained by active sampling.
+        active_sampling_oversample (`int`, *optional*, defaults to `0`):
+            Complete prompt groups each process generates in the first active-sampling round beyond its target. Size it
+            to the rollout engine's spare concurrency so that typical zero-spread losses are absorbed inside the first
+            round instead of by a serial refill round.
+        active_sampling_oversample_refill (`int`, *optional*, defaults to `0`):
+            Complete prompt groups each process generates in every refill round beyond the groups it is still missing.
+            A refill round never exceeds the first round (target plus `active_sampling_oversample` groups), so the
+            first-round size is the largest concurrent rollout load active sampling creates.
+
+            Both oversampling controls draw from the same bounded candidate pool and are cut to what remains of it;
+            only the missing groups themselves must fit. The batch is assembled by the same rule as exact refill, the
+            first target retained rows in candidate order, and surplus retained groups are discarded, never carried
+            into a later update. Oversampling therefore changes rollout cost and wall time, not which groups are
+            trained on. `0` for both keeps exact refill.
         mask_truncated_completions (`bool`, *optional*, defaults to `False`):
             When enabled, truncated completions are excluded from the loss calculation, preventing them from being
             incorrectly penalized and introducing noise during training. According to the
@@ -934,6 +948,21 @@ class GRPOConfig(_BaseConfig):
         default=0.0,
         metadata={"help": "Minimum within-group reward standard deviation retained by active sampling."},
     )
+    active_sampling_oversample: int = field(
+        default=0,
+        metadata={
+            "help": "Prompt groups each process generates in the first active-sampling round beyond its target, cut "
+            "to the remaining candidate pool. Surplus retained groups are discarded."
+        },
+    )
+    active_sampling_oversample_refill: int = field(
+        default=0,
+        metadata={
+            "help": "Prompt groups each process generates in every active-sampling refill round beyond the groups it "
+            "is still missing, capped at the first-round size and the remaining candidate pool. Surplus retained "
+            "groups are discarded."
+        },
+    )
     use_precomputed_advantages: bool = field(
         default=False,
         metadata={
@@ -1340,6 +1369,12 @@ class GRPOConfig(_BaseConfig):
                     f"generation_batch_size / world_size ({local_generation_batch_size}) must be divisible by "
                     f"num_generations ({self.num_generations})"
                 )
+        if self.active_sampling_oversample < 0 or self.active_sampling_oversample_refill < 0:
+            raise ValueError("active_sampling_oversample and active_sampling_oversample_refill must be non-negative")
+        if (self.active_sampling_oversample or self.active_sampling_oversample_refill) and not self.active_sampling:
+            raise ValueError(
+                "active_sampling_oversample and active_sampling_oversample_refill require active_sampling=True"
+            )
         if self.use_precomputed_advantages and self.use_liger_kernel:
             raise ValueError("use_precomputed_advantages is not supported by the Liger GRPO kernel")
 

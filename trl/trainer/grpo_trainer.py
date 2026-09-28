@@ -914,6 +914,8 @@ class GRPOTrainer(_BaseTrainer):
         self.active_sampling = args.active_sampling
         self.active_sampling_max_batches = args.active_sampling_max_batches
         self.active_sampling_reward_std_epsilon = args.active_sampling_reward_std_epsilon
+        self.active_sampling_oversample = args.active_sampling_oversample
+        self.active_sampling_oversample_refill = args.active_sampling_oversample_refill
 
         if train_dataset is None:
             # A dataset is optional when an environment owns the data and returns the prompt from `reset()`; then
@@ -1914,7 +1916,13 @@ class GRPOTrainer(_BaseTrainer):
     def _prepare_active_sampling_inputs(
         self, candidate_inputs: list[dict[str, torch.Tensor | Any]]
     ) -> dict[str, torch.Tensor | Any]:
-        """Retain informative groups and generate only the synchronized number of missing rows."""
+        """Retain informative groups and generate only the synchronized number of missing rows.
+
+        The first round may add `active_sampling_oversample` and each refill round `active_sampling_oversample_refill`
+        complete prompt groups. No round exceeds the first, and every round is cut to what remains of the candidate
+        pool. The batch keeps the first `target_size` retained rows in candidate order either way; surplus rows are
+        discarded.
+        """
         if any("image" in row or "images" in row for row in candidate_inputs):
             raise NotImplementedError("active sampling currently supports text-only GRPO datasets")
 
@@ -1922,11 +1930,15 @@ class GRPOTrainer(_BaseTrainer):
         if target_size == 0 or len(candidate_inputs) % self.active_sampling_max_batches != 0:
             raise RuntimeError("active sampling received an incomplete candidate generation batch")
 
+        first_round_extra_rows = self.active_sampling_oversample * self.num_generations
+        refill_extra_rows = self.active_sampling_oversample_refill * self.num_generations
+        oversampling = bool(first_round_extra_rows or refill_extra_rows)
         retained_batches = []
         retained_count = 0
         candidate_count = 0
         candidate_cursor = 0
         generation_rounds = 0
+        oversampled_count = 0
         for _ in range(self.active_sampling_max_batches):
             local_missing = max(target_size - retained_count, 0)
             missing_by_process = self.accelerator.gather(torch.tensor(local_missing, device=self.accelerator.device))
@@ -1936,24 +1948,45 @@ class GRPOTrainer(_BaseTrainer):
             if synchronized_missing % self.num_generations != 0:
                 raise RuntimeError("active sampling refill size must contain complete prompt groups")
 
-            candidate_batch = candidate_inputs[candidate_cursor : candidate_cursor + synchronized_missing]
-            if len(candidate_batch) != synchronized_missing:
-                raise RuntimeError("active sampling exhausted its bounded candidate pool")
-            candidate_cursor += synchronized_missing
+            round_size = synchronized_missing
+            if oversampling:
+                # No round exceeds the first round, whose size the rollout engine's concurrency is sized for. The cursor
+                # advances by synchronized amounts, so every process sees the same remaining pool and requests the same
+                # round size. Extra rows are cut to the pool; missing rows are not.
+                requested = min(
+                    synchronized_missing + (refill_extra_rows if generation_rounds else first_round_extra_rows),
+                    target_size + first_round_extra_rows,
+                )
+                round_size = max(min(requested, len(candidate_inputs) - candidate_cursor), synchronized_missing)
+            candidate_batch = candidate_inputs[candidate_cursor : candidate_cursor + round_size]
+            if len(candidate_batch) != round_size:
+                raise RuntimeError(
+                    f"active sampling exhausted its bounded candidate pool: {synchronized_missing} rows are missing but "
+                    f"only {len(candidate_batch)} of {len(candidate_inputs)} candidates remain"
+                )
+            candidate_cursor += round_size
+            oversampled_count += round_size - synchronized_missing
 
+            round_retained = 0
             try:
                 scored_batch = self._generate_and_score_completions(candidate_batch)
             except NoAdmittedRollouts:
-                generation_rounds += 1
-                candidate_count += len(candidate_batch)
-                continue
-            group_reward_std = scored_batch.pop("group_reward_std")
-            keep = group_reward_std > self.active_sampling_reward_std_epsilon
+                scored_batch = None
             generation_rounds += 1
             candidate_count += len(candidate_batch)
-            if keep.any():
-                retained_batches.append(self._select_dynamic_sampling_rows(scored_batch, keep))
-                retained_count += int(keep.sum().item())
+            if scored_batch is not None:
+                group_reward_std = scored_batch.pop("group_reward_std")
+                keep = group_reward_std > self.active_sampling_reward_std_epsilon
+                if keep.any():
+                    retained_batches.append(self._select_dynamic_sampling_rows(scored_batch, keep))
+                    round_retained = int(keep.sum().item())
+                    retained_count += round_retained
+            if oversampling:
+                # Per-round prompt-group counts; generated can be below requested when the candidate pool runs out.
+                for name, rows in (("requested", requested), ("generated", round_size), ("retained", round_retained)):
+                    self._metrics["train"][f"active_sampling/round_{generation_rounds}_{name}_groups"].append(
+                        rows // self.num_generations
+                    )
 
         local_ready = torch.tensor(retained_count >= target_size, device=self.accelerator.device)
         all_ready = self.accelerator.gather(local_ready)
@@ -1986,6 +2019,14 @@ class GRPOTrainer(_BaseTrainer):
         self._metrics["train"]["active_sampling/candidate_groups_unused"].append(
             len(candidate_inputs) - candidate_cursor
         )
+        if oversampling:
+            # Unlike the row-valued counters above, these count prompt groups. Oversampled groups were generated beyond
+            # what was missing; discarded groups had reward spread but arrived after the target was full.
+            groups = self.num_generations
+            self._metrics["train"]["active_sampling/oversampled_groups"].append(oversampled_count // groups)
+            self._metrics["train"]["active_sampling/discarded_groups"].append(
+                max(retained_count - target_size, 0) // groups
+            )
         return batch
 
     @staticmethod

@@ -145,6 +145,19 @@ Use `active_sampling=True` to retain the same zero-gradient filtering while redu
 synchronized number of missing rows. `active_sampling_max_batches` bounds its generation rounds. The OLMo 3 preset
 selects this more efficient strategy.
 
+Refill rounds are serial. When rollouts are long, for example multi-turn agent episodes, a refill round for a handful
+of groups can take nearly as long as the first round while the inference engine sits mostly idle. Set
+`active_sampling_oversample` to generate that many extra complete prompt groups per process in the first round, and
+`active_sampling_oversample_refill` to add that many to every refill round. A refill round never exceeds the first
+round, so the first-round size, target plus `active_sampling_oversample` groups, is the largest concurrent rollout load. If a share `p` of groups usually has no
+reward spread and each process targets `G` groups, about `G * p / (1 - p)` extra groups plus a margin usually fill the
+batch in one round. Requests draw from the same bounded candidate pool and are cut to what remains of it. The batch is
+assembled by the same rule as exact refill, the first target retained rows in candidate order, and surplus retained
+groups are discarded rather than carried into the next update. `active_sampling/oversampled_groups` and
+`active_sampling/discarded_groups` record the cost, and `active_sampling/round_<n>_{requested,generated,retained}_groups`
+records each round. Oversampling only saves time when the rollout engine runs the larger round concurrently; for
+colocated vLLM, raise `max_num_seqs` through `vllm_engine_kwargs` if needed.
+
 Dynamic sampling currently supports text-only datasets and requires each process's generation batch to contain complete
 prompt groups. These constraints are validated before or at trainer startup instead of producing partial or
 cross-process groups.
