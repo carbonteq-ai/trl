@@ -139,12 +139,13 @@ def test_stable_k3_branches_match_decimal(dtype, value):
 
 @pytest.mark.parametrize("score_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("sign", [-1, 1])
-def test_half_rounded_kl_transition_preserves_fp32_value(score_dtype, sign):
+@pytest.mark.parametrize("magnitude", [0.01, 0.0501, 0.051178, 0.249, 0.25, 0.251])
+def test_half_rounded_kl_transition_preserves_fp32_value(score_dtype, sign, magnitude):
     from trl.trainer.grpo_trainer import _stable_sampled_k3
 
     # The probability pipeline promotes half scores; preserve the represented
     # input rather than comparing against an ideal unrounded decimal0.01.
-    x = torch.tensor(sign * 0.01, dtype=score_dtype).float().requires_grad_(True)
+    x = torch.tensor(sign * magnitude, dtype=score_dtype).float().requires_grad_(True)
     with localcontext() as context:
         context.prec = 80
         d = Decimal.from_float(x.item())

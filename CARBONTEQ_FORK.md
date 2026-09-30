@@ -6,6 +6,18 @@ job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
 Fork status: `candidate`, version `1.12.0.post13`.
+Source-only finer KL boundary correction (2026-10-01): a represented-input
+sweep finds 268 failures among 2332 TRL/veRL kernel checks around the 0.05
+transition at relative tolerance 1e-6. Maximum value error is 1.48e-6;
+expm1 backward still subtracts one from exp outside the series region.
+Use a tenth-order expansion through absolute delta 0.25. Its omitted value
+and derivative terms are below 2e-12 relative in exact arithmetic there.
+The wider 3880-case sweep includes both previous boundaries and the new
+transition, FP16/BF16/FP32 represented inputs and Decimal80 references;
+all checks pass. Focused SAMPO tests pass 92 cases. Estimator, coefficient,
+masking and derivative convention remain unchanged. This source candidate
+does not change a published wheel or production runtime pin.
+
 Source-only sampled KL transition correction (2026-10-01): half-represented
 delta0.01 rounds upward and escapes the original0.01 series region after
 promotion, exposing value or gradient cancellation in all four independent
