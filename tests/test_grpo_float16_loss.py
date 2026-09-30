@@ -123,10 +123,11 @@ class _Float16Scores(GRPOTrainer):
     ("importance_sampling_level", "loss_type"),
     [("sequence", "grpo"), ("token", "dapo"), ("token", "cispo")],
 )
-def test_grpo_loss_is_float32_for_float16_scores(importance_sampling_level, loss_type):
+@pytest.mark.parametrize("masked_policy_logp", [-14.0, -114.0])
+def test_grpo_loss_is_float32_for_float16_scores(importance_sampling_level, loss_type, masked_policy_logp):
     """The real GRPO loss over one multi-turn completion: two policy tokens and a
-    masked tool-output token whose reference log-prob is 12 nats above the
-    policy's, so its float16 KL term overflows although the token is masked."""
+    masked tool-output token whose reference log-prob is 12 or 112 nats above
+    the policy's, overflowing float16 or float32 unless excluded before exponentiation."""
 
     trainer = _bare(
         _Float16Scores,
@@ -146,6 +147,7 @@ def test_grpo_loss_is_float32_for_float16_scores(importance_sampling_level, loss
         max_completion_length=3,
     )
     trainer.args = SimpleNamespace(use_bias_correction_kl=False, delta=None, steps_per_generation=1)
+    trainer.policy = torch.tensor([[-0.5, -1.0, masked_policy_logp]], dtype=torch.float16)
     inputs = {
         "prompt_ids": torch.zeros((1, 2), dtype=torch.long),
         "prompt_mask": torch.ones((1, 2), dtype=torch.long),
@@ -153,7 +155,7 @@ def test_grpo_loss_is_float32_for_float16_scores(importance_sampling_level, loss
         "completion_mask": torch.ones((1, 3), dtype=torch.long),
         "tool_mask": torch.tensor([[1, 1, 0]]),
         "advantages": torch.tensor([0.7]),
-        "old_per_token_logps": _Float16Scores.policy.clone(),
+        "old_per_token_logps": trainer.policy.clone(),
         "ref_per_token_logps": torch.tensor([[-0.6, -0.9, -2.0]], dtype=torch.float16),
         "num_items_in_batch": torch.tensor(2.0),
     }

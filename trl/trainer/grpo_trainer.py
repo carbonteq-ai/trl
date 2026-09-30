@@ -3921,6 +3921,12 @@ class GRPOTrainer(_BaseTrainer):
         elif self.importance_sampling_level == "sequence":
             log_importance_weights = (log_ratio * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
             log_importance_weights = log_importance_weights.unsqueeze(-1)
+            if advantages.size(1) > 1:
+                # Token-aligned advantages must retain local credit instead of collapsing to their sequence mean.
+                # Keep the sequence ratio's value, with the GSPO token-local gradient for each sampled action.
+                log_importance_weights = (
+                    log_importance_weights.detach() + (per_token_logps - per_token_logps.detach())
+                )
         else:
             raise ValueError(
                 f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token' "
@@ -3932,15 +3938,16 @@ class GRPOTrainer(_BaseTrainer):
         # Compute the KL divergence between the model and the reference model
         if self.beta != 0.0:
             ref_per_token_logps = _float32_if_half(inputs["ref_per_token_logps"])
-            per_token_kl = (
-                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-            )
+            # Excluded tool/padding tokens must not overflow before the loss is masked (inf * 0 is NaN).
+            # expm1 also avoids subtracting two values near one for small reference/policy differences.
+            ref_log_ratio = (ref_per_token_logps - per_token_logps).masked_fill(mask == 0, 0.0)
+            per_token_kl = torch.expm1(ref_log_ratio) - ref_log_ratio
             # Importance sampling correction for the KL divergence
             if self.args.use_bias_correction_kl:
                 per_token_kl = per_token_kl * coef_1
 
         # From here, log_importance_weights (and all subsequent tensors, coef_1, coef_2, etc.) shape depends on
-        # importance_sampling_level: "token" level: (B, T); "sequence" level: (B, 1)
+        # importance_sampling_level: "token": (B, T); "sequence": (B, 1), or (B, T) for token-aligned advantages.
         if self.loss_type == "cispo":
             clamped_ratios = torch.clamp(coef_1, max=self.epsilon_high).detach()
             per_token_loss = -clamped_ratios * advantages * per_token_logps

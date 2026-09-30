@@ -1,7 +1,94 @@
+from collections import defaultdict
+from types import SimpleNamespace
+
 import pytest
+import torch
 
 from trl.trainer.grpo_config import GRPOConfig
-from trl.trainer.grpo_trainer import _validate_precomputed_advantages
+from trl.trainer.grpo_trainer import GRPOTrainer, _validate_precomputed_advantages
+
+
+class _IdentityAccelerator:
+    num_processes = 1
+
+    def gather(self, value):
+        return value
+
+    def reduce(self, value, reduction):
+        return value
+
+
+class _Scores(GRPOTrainer):
+    def _get_per_token_logps_and_entropies(self, *args, **kwargs):
+        return self.scores, torch.ones_like(self.scores), None
+
+
+def _loss(advantages, mask, log_ratio=0.0, accumulation=1, reference=None):
+    trainer = _Scores.__new__(_Scores)
+    trainer.__dict__.update(
+        accelerator=_IdentityAccelerator(),
+        args=SimpleNamespace(use_bias_correction_kl=False, delta=None, steps_per_generation=1),
+        top_entropy_quantile=1.0,
+        aux_loss_enabled=False,
+        use_vllm=False,
+        vllm_importance_sampling_correction=False,
+        off_policy_mask_threshold=None,
+        importance_sampling_level="sequence",
+        beta=0.0 if reference is None else 1.0,
+        loss_type="grpo",
+        epsilon_low=0.003,
+        epsilon_high=0.004,
+        _entropy_bonus_enabled=False,
+        _metrics={"train": defaultdict(list)},
+        model=SimpleNamespace(training=True),
+        current_gradient_accumulation_steps=accumulation,
+        scores=torch.full((1, len(mask)), log_ratio, requires_grad=True),
+    )
+    ids = torch.zeros_like(trainer.scores, dtype=torch.long)
+    inputs = {
+        "prompt_ids": ids[:, :1],
+        "prompt_mask": torch.ones_like(ids[:, :1]),
+        "completion_ids": ids,
+        "completion_mask": torch.ones_like(ids),
+        "tool_mask": torch.tensor([mask]),
+        "advantages": torch.tensor(advantages, dtype=torch.float32),
+        "old_per_token_logps": torch.zeros_like(trainer.scores),
+    }
+    if reference is not None:
+        inputs["ref_per_token_logps"] = torch.tensor([reference])
+    loss = trainer._compute_loss(None, inputs)
+    loss.backward()
+    return loss.detach(), trainer.scores.grad
+
+
+def test_opposite_turn_credit_does_not_cancel_and_tool_tokens_have_no_gradient():
+    loss, grad = _loss([[1.0, 99.0, -1.0]], [1, 0, 1])
+    torch.testing.assert_close(loss, torch.tensor(0.0))
+    torch.testing.assert_close(grad, torch.tensor([[-0.5, 0.0, 0.5]]))
+
+
+@pytest.mark.parametrize("advantages", [[0.7], [[0.7, 0.7, 0.7]]])
+def test_constant_credit_matches_existing_sequence_gradient(advantages):
+    loss, grad = _loss(advantages, [1, 0, 1], accumulation=2)
+    torch.testing.assert_close(loss, torch.tensor(-0.35))
+    torch.testing.assert_close(grad, torch.tensor([[-0.175, 0.0, -0.175]]))
+
+
+@pytest.mark.parametrize(
+    ("log_ratio", "expected"),
+    [(0.01, [[0.0, 0.0, 0.505025]]), (-0.01, [[-0.495025, 0.0, 0.0]])],
+)
+def test_sequence_clipping_preserves_advantage_sign_and_local_credit(log_ratio, expected):
+    _, grad = _loss([[1.0, 99.0, -1.0]], [1, 0, 1], log_ratio=log_ratio)
+    torch.testing.assert_close(grad, torch.tensor(expected), atol=1e-6, rtol=1e-5)
+
+
+def test_small_kl_is_positive_and_masked_overflow_has_no_gradient():
+    loss, grad = _loss([[0.0, 0.0, 0.0]], [1, 0, 1], reference=[1e-4, 112.0, -1e-4])
+    delta = torch.tensor([1e-4, -1e-4], dtype=torch.float64)
+    expected = (torch.expm1(delta) - delta).mean().float()
+    torch.testing.assert_close(loss, expected, atol=1e-12, rtol=5e-4)
+    torch.testing.assert_close(grad, torch.tensor([[-0.00005, 0.0, 0.00005]]), atol=1e-8, rtol=1e-4)
 
 
 def test_precomputed_advantages_require_rollout_path_not_liger(tmp_path):

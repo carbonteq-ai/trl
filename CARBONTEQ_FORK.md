@@ -5,7 +5,29 @@ This ledger records the maintained, generally reusable delta between
 job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
-Fork status: `candidate`, version `1.12.0.post12`.
+Fork status: `candidate`, version `1.12.0.post13`.
+Post13 preserves token-local credit when sequence importance sampling is
+combined with token-aligned advantages. Previously, differentiating the shared
+sequence ratio averaged all advantages in the trajectory: opposite turn credit
+could cancel completely. The corrected path keeps the same geometric sequence
+ratio and clipping bounds, but differentiates each sampled action through its
+own log-probability, as in GSPO-token. Scalar episode advantages retain their
+existing behavior. This is an objective correction, not a change to rollout
+grouping, optimizer scheduling, KL strength, or inference weight refresh.
+Branch `codex/sampo-local-credit` starts at the immutable post12 release
+`c4d0db051a7839fe1b1d587185fac33ba88c784f`. Regression gate:
+`python -m pytest tests/test_sampo_precomputed_advantages.py tests/test_grpo_float16_loss.py`.
+The focused tests cover opposing credit, masked tool tokens, signed clipping,
+gradient accumulation, scalar compatibility, and the retained float16 behavior.
+The shared GRPO loss also excludes masked tool/padding reference ratios before
+KL exponentiation, preventing masked float32 overflow from producing NaN.
+`expm1(delta) - delta` preserves small positive k3 values that direct subtraction
+rounded to zero. These are numerically equivalent on scored tokens in exact
+arithmetic; no KL estimator or coefficient is changed. The regression includes
+112-nat masked gaps across sequence GRPO, DAPO, and CISPO, and small-gap KL
+values and gradients. These guards do not clamp a genuinely large scored-token KL.
+Development publication and installed-wheel verification must complete before
+the consumer pin changes; stable and live training qualification remain open.
 Post12 makes float16 training safe for GRPO and RLOO: float16 logits are
 scored in float32 on GRPO's full and chunked-logits paths and RLOO's, and the
 GRPO loss takes float16 log-probabilities and entropies to float32 before its

@@ -100,6 +100,14 @@ Note that this method only has an effect when training goes slightly off-policyâ
 
 TRL also provide an experimental implementation of GSPO-token, see [Experimental - GSPO-Token](gspo_token).
 
+When supplying token-aligned advantages to the CarbonTeq sequence-ratio path,
+the ratio value remains the masked geometric mean over the sequence. Its
+gradient is token-local: `stop_gradient(log_sequence_ratio) + logp -
+stop_gradient(logp)`. This preserves distinct turn credit, including opposite
+signs within one trajectory. Scalar episode advantages continue to use the
+ordinary sequence-ratio derivative. The rollout row boundary and the optimizer
+minibatch schedule are separate choices; neither changes with this correction.
+
 #### Policy ratio: GRPO vs. GSPO
 
 In GSPO, the policy ratio is defined at the sequence-level. In other words, it is the ratio between the probability of the current policy generating a sequence over the old policy generating that same sequence.
