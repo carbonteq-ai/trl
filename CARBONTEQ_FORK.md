@@ -32,8 +32,19 @@ loss numerator. Previously, tool-output tokens enlarged the denominator and
 diluted token-normalized objectives. `tests/test_dapo_dynamic_sampling.py`
 checks both refill strategies with sampled and excluded tokens; ordinary
 single-turn counts stay unchanged.
-Development publication and installed-wheel verification must complete before
-the consumer pin changes; stable and live training qualification remain open.
+Published development candidate: immutable source
+`d97a2cf619f94c7076a720116d75f85dfd62382b`, tag `carbonteq-v1.12.0.post13`.
+Wheel SHA-256: `d5530d28b16a4a16ffed1f786356caa9c68a2ad40bdfa6c1b2ab67d03d0d355a`;
+sdist SHA-256: `bf075f003c5134240bbddf7195b93c71ee01ff95f142b68ce200146c20e03510`.
+Posttrain retained-asset publisher `36727590142` succeeded in development
+publication, exact-byte readback, and clean installation. Forty-two isolated
+installed-wheel regression cases pass. The four PEFT reference tests pass with
+PEFT installed in an isolated target. A local RTX 3070 Ti float32 tiny GPT-2
+LoRA canary (rank 4, alpha 8, LR 1e-4) produces local log-probability gradients
+[-0.5, 0, 0.5] and a nonzero adapter update; restoring the exact post12 trainer
+source gives zero gradients and zero update on the identical synthetic fixture.
+This is mathematical canary evidence, not LFM convergence or throughput
+qualification. Stable promotion and live LFM training qualification remain open.
 Post12 makes float16 training safe for GRPO and RLOO: float16 logits are
 scored in float32 on GRPO's full and chunked-logits paths and RLOO's, and the
 GRPO loss takes float16 log-probabilities and entropies to float32 before its
