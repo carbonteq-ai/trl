@@ -26,6 +26,12 @@ rounded to zero. These are numerically equivalent on scored tokens in exact
 arithmetic; no KL estimator or coefficient is changed. The regression includes
 112-nat masked gaps across sequence GRPO, DAPO, and CISPO, and small-gap KL
 values and gradients. These guards do not clamp a genuinely large scored-token KL.
+After active or dynamic sampling refills, the retained batch's token normalizer
+now counts `completion_mask * tool_mask`, matching initial collection and the
+loss numerator. Previously, tool-output tokens enlarged the denominator and
+diluted token-normalized objectives. `tests/test_dapo_dynamic_sampling.py`
+checks both refill strategies with sampled and excluded tokens; ordinary
+single-turn counts stay unchanged.
 Development publication and installed-wheel verification must complete before
 the consumer pin changes; stable and live training qualification remain open.
 Post12 makes float16 training safe for GRPO and RLOO: float16 logits are

@@ -98,6 +98,25 @@ def test_active_sampling_refills_only_missing_rows():
     assert trainer._metrics["train"]["active_sampling/candidate_groups_unused"] == [2]
 
 
+@pytest.mark.parametrize("strategy", ["active", "dynamic"])
+def test_refilled_batch_normalizer_counts_only_sampled_action_tokens(strategy):
+    trainer = _active_sampling_trainer(max_batches=2)
+    trainer.dynamic_sampling_max_batches = 2
+    trainer.dynamic_sampling_reward_std_epsilon = 0.0
+    group_stds = iter([[1.0, 1.0, 0.0, 0.0], [2.0, 2.0, 0.0, 0.0]])
+
+    def generate(candidate_inputs):
+        batch = _scored_batch(next(group_stds)[: len(candidate_inputs)])
+        batch["tool_mask"] = torch.tensor([[1, 0]] * len(batch["completion_ids"]))
+        return batch
+
+    trainer._generate_and_score_completions = generate
+    prepare = getattr(trainer, f"_prepare_{strategy}_sampling_inputs")
+    batch = prepare([{"prompt": str(index)} for index in range(8)])
+    assert batch["completion_mask"].sum().item() == 8
+    assert batch["num_items_in_batch"].item() == 4
+
+
 def _group_candidates(num_groups, num_generations=2):
     return [{"prompt": str(group), "group": group} for group in range(num_groups) for _ in range(num_generations)]
 

@@ -1916,7 +1916,10 @@ class GRPOTrainer(_BaseTrainer):
         batch = self._select_dynamic_sampling_rows(
             batch, torch.arange(len(batch["completion_ids"]), device=self.accelerator.device) < target_size
         )
-        local_tokens = batch["completion_mask"].sum()
+        loss_mask = batch["completion_mask"]
+        if "tool_mask" in batch:
+            loss_mask = loss_mask * batch["tool_mask"]
+        local_tokens = loss_mask.sum()
         batch["num_items_in_batch"] = self.accelerator.gather(local_tokens).sum()
         self._metrics["train"]["dynamic_sampling/candidate_batches"].append(candidate_batches_used)
         self._metrics["train"]["dynamic_sampling/retained_fraction"].append(retained_count / candidate_count)
@@ -2021,7 +2024,10 @@ class GRPOTrainer(_BaseTrainer):
         batch = self._select_dynamic_sampling_rows(
             batch, torch.arange(len(batch["completion_ids"]), device=self.accelerator.device) < target_size
         )
-        local_tokens = batch["completion_mask"].sum()
+        loss_mask = batch["completion_mask"]
+        if "tool_mask" in batch:
+            loss_mask = loss_mask * batch["tool_mask"]
+        local_tokens = loss_mask.sum()
         batch["num_items_in_batch"] = self.accelerator.gather(local_tokens).sum()
         self._metrics["train"]["active_sampling/generation_rounds"].append(generation_rounds)
         self._metrics["train"]["active_sampling/retained_fraction"].append(retained_count / candidate_count)
