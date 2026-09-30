@@ -6,6 +6,17 @@ job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
 Fork status: `candidate`, version `1.12.0.post13`.
+Source-only sampled KL transition correction (2026-10-01): half-represented
+delta0.01 rounds upward and escapes the original0.01 series region after
+promotion, exposing value or gradient cancellation in all four independent
+transition checks. Extend the sixth-order stable region through absolute delta0.05;
+omitted terms remain below FP32 rounding there. No estimator, beta or
+bias-correction change. The new regression preserves represented inputs and
+uses an80-digit Decimal reference. This is a source candidate, not a wheel
+release or runtime pin update.
+Focused validation: `python -m pytest -c /dev/null -p no:cacheprovider
+tests/test_sampo_precomputed_advantages.py -q` passes72 cases after correction;
+the new half-rounded negative control fails4/4 before correction.
 Source-only f-DPO cancellation correction (2026-09-30): forward-KL and
 alpha-divergence score transforms use `expm1` rather than subtracting one
 from `exp`. Alpha values close to one amplified FP32 cancellation during

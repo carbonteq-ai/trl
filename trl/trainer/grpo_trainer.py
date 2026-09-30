@@ -189,7 +189,7 @@ def _pad_completion(values: torch.Tensor, width: int) -> torch.Tensor:
 
 def _stable_sampled_k3(log_ratio: torch.Tensor) -> torch.Tensor:
     """Preserve k3 value and derivative when expm1(x) - x cancels near zero."""
-    small = log_ratio.abs() <= 0.01
+    small = log_ratio.abs() <= 0.05
     # Restrict the polynomial's input: torch.where evaluates both branches,
     # and overflowing unused polynomial terms would poison backward with NaN.
     x = log_ratio.masked_fill(~small, 0.0)

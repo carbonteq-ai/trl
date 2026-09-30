@@ -137,6 +137,25 @@ def test_stable_k3_branches_match_decimal(dtype, value):
     torch.testing.assert_close(gradient, torch.tensor(expected_gradient, dtype=dtype), atol=0, rtol=tolerance)
 
 
+@pytest.mark.parametrize("score_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_half_rounded_kl_transition_preserves_fp32_value(score_dtype, sign):
+    from trl.trainer.grpo_trainer import _stable_sampled_k3
+
+    # The probability pipeline promotes half scores; preserve the represented
+    # input rather than comparing against an ideal unrounded decimal0.01.
+    x = torch.tensor(sign * 0.01, dtype=score_dtype).float().requires_grad_(True)
+    with localcontext() as context:
+        context.prec = 80
+        d = Decimal.from_float(x.item())
+        expected = float(d.exp() - 1 - d)
+        expected_gradient = float(d.exp() - 1)
+    actual = _stable_sampled_k3(x)
+    gradient = torch.autograd.grad(actual, x)[0]
+    torch.testing.assert_close(actual, torch.tensor(expected), rtol=1e-6, atol=0)
+    torch.testing.assert_close(gradient, torch.tensor(expected_gradient), rtol=1e-6, atol=0)
+
+
 def test_precomputed_advantages_require_rollout_path_not_liger(tmp_path):
     with pytest.raises(ValueError, match="Liger"):
         GRPOConfig(
