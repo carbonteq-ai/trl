@@ -1484,6 +1484,10 @@ class IWOPDTrainer(_BaseTrainer):
         num_items_in_batch=None,
     ) -> torch.Tensor:
         """Compute the sampled-token Importance-Weighted On-Policy Distillation loss."""
+        # Keep the probability calculation and policy score differences out of half precision.
+        # Casting after log-softmax cannot recover the lost mantissa bits.
+        if student_logits.dtype in (torch.float16, torch.bfloat16):
+            student_logits = student_logits.float()
         student_log_probs = F.log_softmax(student_logits / self.temperature, dim=-1)
         student_actual_logprobs = student_log_probs.gather(dim=-1, index=completion_tokens.unsqueeze(-1)).squeeze(-1)
 

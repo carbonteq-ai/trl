@@ -776,7 +776,9 @@ class TestIWOPDTrainer(TrlTestCase):
 
         assert trainer.state.log_history[-1]["train_loss"] is not None
         assert trainer.state.log_history[0]["eval_loss"] is not None
-        assert train_result.metrics["train_loss"] >= 0.0
+        # The sampled IW-OPD surrogate is signed; positivity belongs to the
+        # exact distributional KL, not this frozen-advantage training loss.
+        assert math.isfinite(train_result.metrics["train_loss"])
         assert "model.safetensors" in os.listdir(self.tmp_dir + "/checkpoint-2")
 
     @pytest.mark.parametrize(

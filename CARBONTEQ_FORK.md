@@ -6,6 +6,26 @@ job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
 Fork status: `candidate`, version `1.12.0.post13`.
+Additional source-only corrections (2026-09-30): GRPO neutralizes excluded
+tool/padding log ratios before importance-ratio exponentiation. Missing old
+scores and 112-nat excluded gaps must not poison the scored loss or gradient.
+Eight new regressions cover token/sequence ratios and scalar/token credit;
+the focused SAMPO/precision slice passes 30 tests. Posttrain's independent
+248-case Python loss/gradient grid passes after this guard; six cases failed
+before it. Real Qwen/LFM BF16 backward canaries with excluded behavior scores
+also retain finite, nonzero LoRA updates. Required action scores remain checked
+by existing contracts; this guard does not clamp scored ratios.
+
+Sampled IW-OPD promotes FP16/BF16 student logits before temperature and
+log-softmax, preserving FP32/FP64 inputs. The independent probability/gradient
+grid passes 66 cases, including precision cases that failed before correction.
+Both new precision regressions fail against the isolated original post13 wheel.
+The IW-OPD suite passes 73 tests with one optional Liger skip. Its local-teacher
+training test checks finite surrogate loss instead of nonnegativity: frozen
+sampled advantages produce a signed loss. No objective, gamma, or temperature
+setting changes. These source fixes are not a wheel release or production pin;
+alternative JSD paths, teacher transport, and long-context memory remain gates.
+
 Unpublished follow-on numerical correction: GRPO's full and chunked scorers
 and RLOO's scorer promote BF16 logits before temperature/log-softmax; GRPO also
 promotes external BF16 scores before ratio/KL/loss arithmetic. BF16 exponent

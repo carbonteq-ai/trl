@@ -23,7 +23,7 @@ class _Scores(GRPOTrainer):
         return self.scores, torch.ones_like(self.scores), None
 
 
-def _loss(advantages, mask, log_ratio=0.0, accumulation=1, reference=None):
+def _loss(advantages, mask, log_ratio=0.0, accumulation=1, reference=None, old=None, level="sequence"):
     trainer = _Scores.__new__(_Scores)
     trainer.__dict__.update(
         accelerator=_IdentityAccelerator(),
@@ -33,7 +33,7 @@ def _loss(advantages, mask, log_ratio=0.0, accumulation=1, reference=None):
         use_vllm=False,
         vllm_importance_sampling_correction=False,
         off_policy_mask_threshold=None,
-        importance_sampling_level="sequence",
+        importance_sampling_level=level,
         beta=0.0 if reference is None else 1.0,
         loss_type="grpo",
         epsilon_low=0.003,
@@ -52,13 +52,25 @@ def _loss(advantages, mask, log_ratio=0.0, accumulation=1, reference=None):
         "completion_mask": torch.ones_like(ids),
         "tool_mask": torch.tensor([mask]),
         "advantages": torch.tensor(advantages, dtype=torch.float32),
-        "old_per_token_logps": torch.zeros_like(trainer.scores),
+        "old_per_token_logps": torch.zeros_like(trainer.scores) if old is None else torch.tensor([old]),
     }
     if reference is not None:
         inputs["ref_per_token_logps"] = torch.tensor([reference])
     loss = trainer._compute_loss(None, inputs)
     loss.backward()
     return loss.detach(), trainer.scores.grad
+
+
+@pytest.mark.parametrize("level", ["token", "sequence"])
+@pytest.mark.parametrize("excluded_old", [-112.0, float("nan")])
+@pytest.mark.parametrize("advantages", [[0.7], [[1.0, 0.0, -1.0]]])
+def test_excluded_behavior_scores_cannot_corrupt_loss_or_gradient(level, excluded_old, advantages):
+    expected_loss, expected_grad = _loss(advantages, [1, 0, 1], level=level)
+    loss, grad = _loss(advantages, [1, 0, 1], old=[0.0, excluded_old, 0.0], level=level)
+    assert torch.isfinite(loss)
+    assert torch.isfinite(grad).all()
+    torch.testing.assert_close(loss, expected_loss)
+    torch.testing.assert_close(grad, expected_grad)
 
 
 def test_opposite_turn_credit_does_not_cancel_and_tool_tokens_have_no_gradient():

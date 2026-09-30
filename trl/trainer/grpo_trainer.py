@@ -3922,7 +3922,9 @@ class GRPOTrainer(_BaseTrainer):
                 off_policy_threshold=self.off_policy_mask_threshold,
             )
 
-        log_ratio = per_token_logps - old_per_token_logps
+        # Excluded tool/padding actions must not overflow or propagate missing behavior scores
+        # before masking (exp(112) * 0 and NaN * 0 are not finite in float32).
+        log_ratio = (per_token_logps - old_per_token_logps).masked_fill(mask == 0, 0.0)
         if self.importance_sampling_level == "token":
             log_importance_weights = log_ratio
         elif self.importance_sampling_level == "sequence":
