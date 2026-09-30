@@ -189,14 +189,15 @@ def _pad_completion(values: torch.Tensor, width: int) -> torch.Tensor:
 
 
 def _float32_if_half(values: torch.Tensor | None) -> torch.Tensor | None:
-    """Float16 log-probabilities, logits or entropies as float32; any other dtype unchanged.
+    """Half-precision log-probabilities, logits or entropies as float32.
 
     The loss exponentiates log-probability differences (the k3 KL term, importance ratios). In float16, `exp`
     overflows to infinity once a difference exceeds ln(65504) ~= 11.09, and an infinite term times a zero completion
-    mask (for example a tool-output token of a multi-turn completion) is NaN. bfloat16 shares float32's exponent range
-    and is left unchanged.
+    mask (for example a tool-output token of a multi-turn completion) is NaN. Bfloat16 has float32's exponent range
+    but insufficient mantissa precision for narrow importance-ratio clipping: near -10 nats its log-probability
+    spacing is 0.0625. Promote logits before temperature/log-softmax, and promote external scores before loss math.
     """
-    return values.float() if values is not None and values.dtype == torch.float16 else values
+    return values.float() if values is not None and values.dtype in (torch.float16, torch.bfloat16) else values
 
 
 class GRPOTrainer(_BaseTrainer):

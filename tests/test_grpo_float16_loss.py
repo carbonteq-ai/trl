@@ -95,11 +95,22 @@ def test_grpo_scores_a_float16_model_in_float32(logits_chunk_size):
 
 
 @pytest.mark.parametrize("logits_chunk_size", [None, 2], ids=["full", "chunked"])
-def test_grpo_scoring_keeps_bfloat16(logits_chunk_size):
+def test_grpo_scores_a_bfloat16_model_in_float32(logits_chunk_size):
     model = _tiny_model(torch.bfloat16)
     ids = torch.randint(0, 64, (2, 9), generator=torch.Generator().manual_seed(1))
     logps, entropies = _score(_bare(GRPOTrainer, logits_chunk_size=logits_chunk_size), model, ids)
-    assert (logps.dtype, entropies.dtype) == (torch.bfloat16, torch.bfloat16)
+    assert (logps.dtype, entropies.dtype) == (torch.float32, torch.float32)
+    expected_logps, expected_entropies = _expected(model, ids)
+    torch.testing.assert_close(logps, expected_logps, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(entropies, expected_entropies, atol=1e-5, rtol=1e-5)
+
+
+def test_rloo_scores_a_bfloat16_model_in_float32():
+    model = _tiny_model(torch.bfloat16)
+    ids = torch.randint(0, 64, (2, 9), generator=torch.Generator().manual_seed(1))
+    logps, entropies = _score(_bare(RLOOTrainer), model, ids)
+    assert (logps.dtype, entropies.dtype) == (torch.float32, torch.float32)
+    torch.testing.assert_close(logps, _expected(model, ids)[0], atol=1e-5, rtol=1e-5)
 
 
 def test_rloo_scores_a_float16_model_in_float32():
@@ -117,6 +128,42 @@ class _Float16Scores(GRPOTrainer):
 
     def _get_per_token_logps_and_entropies(self, model, *args, **kwargs):
         return self.policy.clone().requires_grad_(), torch.full_like(self.policy, 1.5), None
+
+
+@pytest.mark.parametrize(("policy", "advantage", "expected"), [(-9.9375, 1.0, -1.004), (-10.0625, -1.0, 0.997)])
+def test_bfloat16_external_scores_preserve_narrow_clip_bounds(policy, advantage, expected):
+    """BF16 clamp would round 1.004 to 1.0078125 and 0.997 to 0.99609375."""
+    trainer = _bare(
+        _Float16Scores,
+        top_entropy_quantile=1.0,
+        aux_loss_enabled=False,
+        use_vllm=False,
+        vllm_importance_sampling_correction=False,
+        off_policy_mask_threshold=None,
+        importance_sampling_level="token",
+        beta=0.0,
+        loss_type="grpo",
+        epsilon_low=0.003,
+        epsilon_high=0.004,
+        _metrics={"train": defaultdict(list)},
+        model=SimpleNamespace(training=True),
+        current_gradient_accumulation_steps=1,
+    )
+    trainer.args = SimpleNamespace(use_bias_correction_kl=False, delta=None, steps_per_generation=1)
+    trainer.policy = torch.tensor([[policy]], dtype=torch.bfloat16)
+    loss = trainer._compute_loss(
+        None,
+        {
+            "prompt_ids": torch.zeros((1, 2), dtype=torch.long),
+            "prompt_mask": torch.ones((1, 2), dtype=torch.long),
+            "completion_ids": torch.zeros((1, 1), dtype=torch.long),
+            "completion_mask": torch.ones((1, 1), dtype=torch.long),
+            "advantages": torch.tensor([advantage]),
+            "old_per_token_logps": torch.tensor([[-10.0]], dtype=torch.bfloat16),
+        },
+    )
+    assert loss.dtype == torch.float32
+    assert loss.item() == pytest.approx(expected, abs=1e-6)
 
 
 @pytest.mark.parametrize(

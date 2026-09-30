@@ -6,6 +6,24 @@ job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
 Fork status: `candidate`, version `1.12.0.post13`.
+Unpublished follow-on numerical correction: GRPO's full and chunked scorers
+and RLOO's scorer promote BF16 logits before temperature/log-softmax; GRPO also
+promotes external BF16 scores before ratio/KL/loss arithmetic. BF16 exponent
+range avoided overflow but did not preserve narrow clipping thresholds. Near
+-10 nats its score spacing is 0.0625, exceeding Posttrain's 0.003/0.004 band.
+`tests/test_grpo_float16_loss.py` checks both BF16 GRPO paths and RLOO against
+FP32 log-softmax of identical logits. Twenty focused precision and SAMPO tests
+pass in the local Torch2.13 / Transformers5.16.1 research environment. The wider
+precision/SAMPO/PEFT-reference/padding slice passes 29 cases. Two token-ratio
+clip-boundary regressions fail against the isolated installed post13 wheel and
+pass with the candidate. Sequence reduction already promotes its ratio in the
+tested old path; its remaining BF16 problem is score precision before reduction.
+This
+candidate is not part of the published post13 tag and is not a production pin.
+Posttrain's bounded real-model experiment uses cached Qwen3.5-0.8B and
+LFM2.5-1.2B; loss/logp-gradient agreement does not qualify distributed/fused
+paths, native Verifiers projection, or task convergence. KL estimator choice
+is unchanged. Keep float32/float64 inputs unchanged during future rebases.
 Post13 preserves token-local credit when sequence importance sampling is
 combined with token-aligned advantages. Previously, differentiating the shared
 sequence ratio averaged all advantages in the trajectory: opposite turn credit
