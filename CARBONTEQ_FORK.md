@@ -6,6 +6,23 @@ job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
 Fork status: `candidate`, version `1.12.0.post13`.
+Source-only f-DPO cancellation correction (2026-09-30): forward-KL and
+alpha-divergence score transforms use `expm1` rather than subtracting one
+from `exp`. Alpha values close to one amplified FP32 cancellation during
+BF16/FP16 scoring. Preserve the existing alpha-limit cutoff and exponent
+clamps; preserve double inputs for diagnostic references. No production
+FP64 model support, objective selection, beta or runtime pin change is implied.
+An independent 306-case grid reduces failures from 69 to 13: 28 supported
+half-input alpha-near-one failures and 28 double-reference exceptions close.
+Remaining strict absolute-value misses have gradient errors at most 3.8e-10
+and loss relative errors at most 6.2e-7; retain them as failed gates.
+The focused f-divergence/half-precision slice passes 25 tests; all four broader
+native DPO training tests for the divergence choices pass. Matched direct
+BF16 Qwen0.8B and LFM1.2B runs, each three preference updates at alpha=.999998,
+reproduce 1.9–2.3% parameter-gradient discrepancies before correction and
+exact agreement after. These fixed-pair LoRA experiments do not qualify full,
+fused or distributed preference training or explain on-policy SAMPO performance.
+
 Source-only near-zero sampled KL correction (2026-09-30): GRPO evaluates
 `expm1(d)-d` with a sixth-order series for |d| <= 0.01. This preserves the
 existing k3 estimator and bias-correction setting while avoiding cancellation

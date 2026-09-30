@@ -1449,8 +1449,8 @@ class DPOTrainer(_BaseTrainer):
             rejected_scores = rejected_logratios
         elif self.f_divergence_type == "forward_kl":
             # f'(t) = 1 - 1/t
-            chosen_scores = 1 - torch.exp(-chosen_logratios)
-            rejected_scores = 1 - torch.exp(-rejected_logratios)
+            chosen_scores = -torch.expm1(-chosen_logratios)
+            rejected_scores = -torch.expm1(-rejected_logratios)
         elif self.f_divergence_type == "js_divergence":
             # f'(t) = log(2t/(t+1)) = log 2 + logsigmoid(log t)
             chosen_scores = math.log(2) + F.logsigmoid(chosen_logratios)
@@ -1466,11 +1466,15 @@ class DPOTrainer(_BaseTrainer):
                 t_rejected = (self.f_alpha_divergence_coef - 1.0) * rejected_logratios
                 dtype = t_chosen.dtype
                 # Clamp max so exp(.) stays representable after casting back
-                clamp_max = {torch.float16: 11.0, torch.bfloat16: 80.0, torch.float32: 80.0}[dtype]
-                t_chosen_float = torch.clamp(t_chosen.float(), max=clamp_max)
-                t_rejected_float = torch.clamp(t_rejected.float(), max=clamp_max)
-                chosen_scores = (torch.exp(t_chosen_float) - 1.0).to(dtype) * coef
-                rejected_scores = (torch.exp(t_rejected_float) - 1.0).to(dtype) * coef
+                clamp_max = {torch.float16: 11.0, torch.bfloat16: 80.0, torch.float32: 80.0, torch.float64: 80.0}[dtype]
+                # Preserve double references; half work still uses FP32. expm1 is
+                # essential near alpha=1, where dividing exp(x)-1 amplifies cancellation.
+                chosen_work = t_chosen.float() if dtype in (torch.float16, torch.bfloat16) else t_chosen
+                rejected_work = t_rejected.float() if dtype in (torch.float16, torch.bfloat16) else t_rejected
+                t_chosen_float = torch.clamp(chosen_work, max=clamp_max)
+                t_rejected_float = torch.clamp(rejected_work, max=clamp_max)
+                chosen_scores = torch.expm1(t_chosen_float).to(dtype) * coef
+                rejected_scores = torch.expm1(t_rejected_float).to(dtype) * coef
         else:
             raise ValueError(f"Unknown f_divergence_type: {self.f_divergence_type}")
 
