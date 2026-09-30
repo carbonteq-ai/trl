@@ -6,6 +6,21 @@ job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
 Fork status: `candidate`, version `1.12.0.post13`.
+Source-only near-zero sampled KL correction (2026-09-30): GRPO evaluates
+`expm1(d)-d` with a sixth-order series for |d| <= 0.01. This preserves the
+existing k3 estimator and bias-correction setting while avoiding cancellation
+in both value and autograd derivative. The unused polynomial branch receives
+zero for large inputs, preventing overflow from poisoning backward. A
+Decimal80 grid reproduces 22/28 failures before correction and passes all 28
+after; the focused precision/SAMPO slice passes 82 tests, including FP32/FP64
+boundary and large-negative-input checks. Real Trainer loops on Qwen0.8B and
+LFM1.2B, each in BF16 and FP32, execute three updates of a supplied multi-turn
+trace group. All 24 microbatch derivative checks pass after correction. Before,
+three BF16 checks miss strict parameter-gradient tolerance by 0.61–1.36%; those
+matched cases now agree exactly. This is controlled trace/optimizer evidence,
+not fresh native Verifiers collection, live judge quality, or convergence.
+No new wheel, production pin, KL estimator, beta, or training recipe is implied.
+
 Source-only DPO probability correction (2026-09-30): the policy, online
 reference, and cached reference promote FP16/BF16 logits before scoring.
 An independent Python probability/finite-difference grid reproduces failures

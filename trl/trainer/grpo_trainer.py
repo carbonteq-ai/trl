@@ -163,7 +163,6 @@ class _SupportsReset(Protocol):
 EnvironmentFactory = Callable[[], _SupportsReset]
 
 
-
 def _trim_to_real_tokens(
     input_ids: torch.Tensor, attention_mask: torch.Tensor, logits_to_keep: int
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
@@ -186,6 +185,16 @@ def _pad_completion(values: torch.Tensor, width: int) -> torch.Tensor:
     """Right-pad per-completion-token values back to the padded completion width."""
     missing = width - values.size(1)
     return values if missing == 0 else torch.nn.functional.pad(values, (0, missing))
+
+
+def _stable_sampled_k3(log_ratio: torch.Tensor) -> torch.Tensor:
+    """Preserve k3 value and derivative when expm1(x) - x cancels near zero."""
+    small = log_ratio.abs() <= 0.01
+    # Restrict the polynomial's input: torch.where evaluates both branches,
+    # and overflowing unused polynomial terms would poison backward with NaN.
+    x = log_ratio.masked_fill(~small, 0.0)
+    series = x.square() * (0.5 + x * (1 / 6 + x * (1 / 24 + x * (1 / 120 + x / 720))))
+    return torch.where(small, series, torch.expm1(log_ratio) - log_ratio)
 
 
 def _float32_if_half(values: torch.Tensor | None) -> torch.Tensor | None:
@@ -1738,8 +1747,12 @@ class GRPOTrainer(_BaseTrainer):
         else:
             logps_diff = per_token_logps_diff
         ratio = torch.exp(logps_diff)
-        min_val = self.vllm_importance_sampling_clip_min if self.vllm_importance_sampling_clip_min is not None else -math.inf
-        max_val = self.vllm_importance_sampling_clip_max if self.vllm_importance_sampling_clip_max is not None else math.inf
+        min_val = (
+            self.vllm_importance_sampling_clip_min if self.vllm_importance_sampling_clip_min is not None else -math.inf
+        )
+        max_val = (
+            self.vllm_importance_sampling_clip_max if self.vllm_importance_sampling_clip_max is not None else math.inf
+        )
         if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
             clamp_mask = (ratio < min_val) | (ratio > max_val)
             ratio = torch.clamp(
@@ -1795,11 +1808,15 @@ class GRPOTrainer(_BaseTrainer):
         delta_count = stats[:, 1].sum().item()
         ratio_count = stats[:, 4].sum().item()
         metrics = self._metrics[mode]
-        metrics["sampling/sampling_logp_difference/mean"].append(stats[:, 0].sum().item() / delta_count if delta_count else 0.0)
+        metrics["sampling/sampling_logp_difference/mean"].append(
+            stats[:, 0].sum().item() / delta_count if delta_count else 0.0
+        )
         metrics["sampling/sampling_logp_difference/max"].append(stats[:, 2].max().item())
         metrics["sampling/sampling_logp_difference/token_count"].append(int(delta_count))
         metrics["sampling/importance_sampling_ratio/min"].append(stats[:, 5].min().item() if ratio_count else 0.0)
-        metrics["sampling/importance_sampling_ratio/mean"].append(stats[:, 3].sum().item() / ratio_count if ratio_count else 0.0)
+        metrics["sampling/importance_sampling_ratio/mean"].append(
+            stats[:, 3].sum().item() / ratio_count if ratio_count else 0.0
+        )
         metrics["sampling/importance_sampling_ratio/max"].append(stats[:, 6].max().item() if ratio_count else 0.0)
         clamp_total = stats[:, 8].sum().item()
         metrics["sampling/importance_sampling_ratio/clamped_fraction"].append(
@@ -3933,9 +3950,7 @@ class GRPOTrainer(_BaseTrainer):
             if advantages.size(1) > 1:
                 # Token-aligned advantages must retain local credit instead of collapsing to their sequence mean.
                 # Keep the sequence ratio's value, with the GSPO token-local gradient for each sampled action.
-                log_importance_weights = (
-                    log_importance_weights.detach() + (per_token_logps - per_token_logps.detach())
-                )
+                log_importance_weights = log_importance_weights.detach() + (per_token_logps - per_token_logps.detach())
         else:
             raise ValueError(
                 f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token' "
@@ -3950,7 +3965,7 @@ class GRPOTrainer(_BaseTrainer):
             # Excluded tool/padding tokens must not overflow before the loss is masked (inf * 0 is NaN).
             # expm1 also avoids subtracting two values near one for small reference/policy differences.
             ref_log_ratio = (ref_per_token_logps - per_token_logps).masked_fill(mask == 0, 0.0)
-            per_token_kl = torch.expm1(ref_log_ratio) - ref_log_ratio
+            per_token_kl = _stable_sampled_k3(ref_log_ratio)
             # Importance sampling correction for the KL divergence
             if self.args.use_bias_correction_kl:
                 per_token_kl = per_token_kl * coef_1

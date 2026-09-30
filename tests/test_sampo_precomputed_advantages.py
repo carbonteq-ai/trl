@@ -1,4 +1,5 @@
 from collections import defaultdict
+from decimal import Decimal, localcontext
 from types import SimpleNamespace
 
 import pytest
@@ -101,6 +102,39 @@ def test_small_kl_is_positive_and_masked_overflow_has_no_gradient():
     expected = (torch.expm1(delta) - delta).mean().float()
     torch.testing.assert_close(loss, expected, atol=1e-12, rtol=5e-4)
     torch.testing.assert_close(grad, torch.tensor([[-0.00005, 0.0, 0.00005]]), atol=1e-8, rtol=1e-4)
+
+
+@pytest.mark.parametrize("level", ["token", "sequence"])
+@pytest.mark.parametrize("sign", [-1, 1])
+@pytest.mark.parametrize("exponent", range(2, 9))
+def test_small_kl_value_and_gradient_match_decimal(level, sign, exponent):
+    delta = float(torch.tensor(sign * 10**-exponent, dtype=torch.float32))
+    with localcontext() as context:
+        context.prec = 80
+        d = Decimal.from_float(delta)
+        expected_value = float(d.exp() - 1 - d)
+        expected_gradient = float(-(d.exp() - 1) / 2)
+    loss, grad = _loss([[0.0, 99.0, 0.0]], [1, 0, 1], reference=[delta, 112.0, delta], level=level)
+    torch.testing.assert_close(loss, torch.tensor(expected_value), rtol=5e-6, atol=0)
+    torch.testing.assert_close(grad, torch.tensor([[expected_gradient, 0.0, expected_gradient]]), rtol=5e-6, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("value", [-1e10, -50.0, -1.0, -0.010001, -0.01, -1e-8, 0.0, 1e-8, 0.01, 0.010001, 1.0, 50.0])
+def test_stable_k3_branches_match_decimal(dtype, value):
+    from trl.trainer.grpo_trainer import _stable_sampled_k3
+
+    x = torch.tensor(value, dtype=dtype, requires_grad=True)
+    with localcontext() as context:
+        context.prec = 80
+        d = Decimal.from_float(x.item())
+        expected = float(d.exp() - 1 - d)
+        expected_gradient = float(d.exp() - 1)
+    result = _stable_sampled_k3(x)
+    gradient = torch.autograd.grad(result, x)[0]
+    tolerance = 1e-5 if dtype == torch.float32 else 1e-10
+    torch.testing.assert_close(result, torch.tensor(expected, dtype=dtype), atol=0, rtol=tolerance)
+    torch.testing.assert_close(gradient, torch.tensor(expected_gradient, dtype=dtype), atol=0, rtol=tolerance)
 
 
 def test_precomputed_advantages_require_rollout_path_not_liger(tmp_path):
