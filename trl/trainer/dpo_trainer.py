@@ -62,7 +62,6 @@ from .utils import (
     hash_module,
     maybe_gather_lm_head_ctx,
     pad,
-    selective_log_softmax,
     use_adapter,
 )
 
@@ -78,6 +77,16 @@ if is_peft_available():
 
 
 logger = get_logger(__name__)
+
+
+def _preference_log_softmax(logits, labels):
+    """Stable selected probabilities, retaining only one vocabulary row batch."""
+    return torch.stack(
+        [
+            row.log_softmax(-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+            for row, targets in zip(logits, labels, strict=True)
+        ]
+    )
 
 
 FLASH_ATTENTION_VARIANTS = {
@@ -1228,7 +1237,9 @@ class DPOTrainer(_BaseTrainer):
         shift_labels = input_ids[..., 1:]
         shift_completion_mask = completion_mask[..., 1:]
         ref_shift_logits = ref_outputs.logits[..., :-1, :]
-        ref_per_token_logps = selective_log_softmax(ref_shift_logits, shift_labels)
+        if ref_shift_logits.dtype in (torch.float16, torch.bfloat16):
+            ref_shift_logits = ref_shift_logits.float()
+        ref_per_token_logps = _preference_log_softmax(ref_shift_logits, shift_labels)
         ref_per_token_logps[shift_completion_mask == 0] = 0.0
 
         if self.ld_alpha is None:
@@ -1372,9 +1383,13 @@ class DPOTrainer(_BaseTrainer):
         input_ids = inputs["input_ids"]
         completion_mask = inputs["completion_mask"]
         shift_logits = outputs.logits[..., :-1, :]
+        # Compute probabilities and completion sums in FP32 for half-precision
+        # models; casting only the final preference loss loses score precision.
+        if shift_logits.dtype in (torch.float16, torch.bfloat16):
+            shift_logits = shift_logits.float()
         shift_labels = input_ids[..., 1:]
         shift_completion_mask = completion_mask[..., 1:]
-        per_token_logps = selective_log_softmax(shift_logits, shift_labels)
+        per_token_logps = _preference_log_softmax(shift_logits, shift_labels)
         per_token_logps[shift_completion_mask == 0] = 0.0  # mask out non-completion tokens
         if self.ld_alpha is None:
             logps = per_token_logps.sum(dim=1)  # sum over sequence length
@@ -1412,7 +1427,9 @@ class DPOTrainer(_BaseTrainer):
                     ref_outputs = self.ref_model(**ref_model_kwargs)
 
             ref_shift_logits = ref_outputs.logits[..., :-1, :]
-            ref_per_token_logps = selective_log_softmax(ref_shift_logits, shift_labels)
+            if ref_shift_logits.dtype in (torch.float16, torch.bfloat16):
+                ref_shift_logits = ref_shift_logits.float()
+            ref_per_token_logps = _preference_log_softmax(ref_shift_logits, shift_labels)
             ref_per_token_logps[shift_completion_mask == 0] = 0.0  # mask out non-completion tokens
             if self.ld_alpha is None:
                 ref_logps = ref_per_token_logps.sum(dim=1)  # sum over sequence length

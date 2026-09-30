@@ -6,6 +6,26 @@ job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
 Fork status: `candidate`, version `1.12.0.post13`.
+Source-only DPO probability correction (2026-09-30): the policy, online
+reference, and cached reference promote FP16/BF16 logits before scoring.
+An independent Python probability/finite-difference grid reproduces failures
+in all 40 half-precision cases; all 60 tested DPO/SFT-branch cases pass after
+correction. Six focused regressions fail against the isolated post13 wheel.
+Selected-logit minus logsumexp can also erase near-certain-token gradients:
+on logits [20, 4, 0], it returns a zero chosen-logit gradient instead of about
+1.146e-7. DPO now uses row-wise stable log-softmax and gather in all three
+scoring paths. A double-probability regression covers this cancellation.
+Ten focused precision/collator tests and 21 broader trainer cases across loss
+branches, WPO, length-discount and f-divergences pass on the final source.
+Real BF16 Qwen and LFM each complete
+three SFT and three DPO direct-loss updates with finite, nonzero LoRA movement
+and matching independently derived score-credit gradients. Before stable
+scoring, Qwen has approximately 2% parameter-gradient discrepancies from raw
+logit errors around 8e-8; after correction those comparisons match exactly.
+This changes no preference objective or beta. Full/fused/distributed Trainer
+qualification and the separately discovered LFM renderer SFT header-mask
+failure remain open; no new wheel or production pin is implied.
+
 Additional source-only corrections (2026-09-30): GRPO neutralizes excluded
 tool/padding log ratios before importance-ratio exponentiation. Missing old
 scores and 112-nat excluded gaps must not poison the scored loss or gradient.
