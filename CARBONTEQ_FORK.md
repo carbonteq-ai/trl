@@ -19,6 +19,9 @@ derivative regressions. FP32/FP64 backward retains normalized vocabulary
 buffers; larger-model memory/throughput qualification and native TRL optimizer
 qualification remain open. This is a source candidate, not a new wheel,
 production pin or demonstrated cause of poor task performance.
+Published source:4020c122e4ba2147829ecc0bbaddf6b566a0c8b5 on
+origin/codex/sampo-local-credit. Focused command in the compatible qualification
+runtime: python -m pytest tests/test_utils.py -q -k TestSelectiveLogSoftmax.
 
 Source-only finer KL boundary correction (2026-10-01): a represented-input
 sweep finds 268 failures among 2332 TRL/veRL kernel checks around the 0.05
