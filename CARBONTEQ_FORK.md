@@ -22,6 +22,13 @@ production pin or demonstrated cause of poor task performance.
 Published source:4020c122e4ba2147829ecc0bbaddf6b566a0c8b5 on
 origin/codex/sampo-local-credit. Focused command in the compatible qualification
 runtime: python -m pytest tests/test_utils.py -q -k TestSelectiveLogSoftmax.
+Actual-model qualification subsequently exercises both repaired backend source
+bodies over four Qwen/LFM BF16/FP16 full-response fixtures. Sixteen detached-logit
+score backwards and80 independent full-vocabulary scalar checks pass; maximum
+score error3.39e-7 and checked coordinate derivative5.97e-10, peaks3.152GB Qwen
+and4.545GB LFM with model resident. Observed unshifted scaled logits[-28.44,48.75]
+do not show synthetic extreme offsets. Detached-logit memory is qualified;
+complete model/optimizer backward and representative throughput remain open.
 
 Source-only finer KL boundary correction (2026-10-01): a represented-input
 sweep finds 268 failures among 2332 TRL/veRL kernel checks around the 0.05
