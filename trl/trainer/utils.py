@@ -504,19 +504,16 @@ def selective_log_softmax(logits, index) -> torch.Tensor:
     if squeeze:
         index = index.unsqueeze(-1)
 
-    if logits.dtype in [torch.float32, torch.float64]:
-        selected_logits = torch.gather(logits, dim=-1, index=index)
-        # loop to reduce peak mem consumption
-        logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
-        per_token_logps = selected_logits - logsumexp_values.unsqueeze(-1)  # log_softmax(x_i) = x_i - logsumexp(x)
-    else:
-        # logsumexp approach is unstable with bfloat16, fall back to slightly less efficient approach
-        per_token_logps = []
-        for row_logits, row_labels in zip(logits, index, strict=True):  # loop to reduce peak mem consumption
-            row_logps = F.log_softmax(row_logits, dim=-1)
-            row_per_token_logps = row_logps.gather(dim=-1, index=row_labels)
-            per_token_logps.append(row_per_token_logps)
-        per_token_logps = torch.stack(per_token_logps)
+    # Subtracting an absolute logsumexp loses the normalizer correction at
+    # large common offsets even in float32/float64, corrupting its derivative.
+    # Normalize stably before gathering; retain batch-row processing to limit
+    # temporary allocations and preserve the existing half-precision path.
+    per_token_logps = []
+    for row_logits, row_labels in zip(logits, index, strict=True):
+        row_logps = F.log_softmax(row_logits, dim=-1)
+        row_per_token_logps = row_logps.gather(dim=-1, index=row_labels)
+        per_token_logps.append(row_per_token_logps)
+    per_token_logps = torch.stack(per_token_logps)
 
     if squeeze:
         per_token_logps = per_token_logps.squeeze(-1)

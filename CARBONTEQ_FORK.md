@@ -6,6 +6,20 @@ job configuration, and qualification evidence remain in the consuming
 Posttrain framework.
 
 Fork status: `candidate`, version `1.12.0.post13`.
+Source-only selected-logprob cancellation correction (2026-10-01): normalize
+with batch-row log_softmax before gathering for every dtype. Absolute selected
+logit minus logsumexp loses its small correction at large common FP32 offsets;
+equal logits1e8 returned0 and gradient[0,-1] rather than-log2 and[.5,-.5].
+Preserve half behavior, dtype and single/top-K indices, including repeated
+indices. Ownership: trl/trainer/utils.py:selective_log_softmax and
+tests/test_utils.py:TestSelectiveLogSoftmax. Six of eight new CPU cases fail
+before correction; all28 CPU/CUDA single/top-K/value/gradient cases pass after.
+Ruff/diff checks pass. Rebase must retain stable normalization and scalar
+derivative regressions. FP32/FP64 backward retains normalized vocabulary
+buffers; larger-model memory/throughput qualification and native TRL optimizer
+qualification remain open. This is a source candidate, not a new wheel,
+production pin or demonstrated cause of poor task performance.
+
 Source-only finer KL boundary correction (2026-10-01): a represented-input
 sweep finds 268 failures among 2332 TRL/veRL kernel checks around the 0.05
 transition at relative tolerance 1e-6. Maximum value error is 1.48e-6;

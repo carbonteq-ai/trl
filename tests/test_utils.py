@@ -904,6 +904,33 @@ class TestPrintPromptCompletionsSample(TrlTestCase):
 
 
 class TestSelectiveLogSoftmax(TrlTestCase):
+    @pytest.mark.parametrize("offset", [0.0, 10000.0, 600000.0, 1e8])
+    @pytest.mark.parametrize("multi_index", [False, True])
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_common_offset_preserves_value_and_gradient(self, offset, multi_index, device):
+        import math
+
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("requires CUDA selected-logprob qualification")
+        logits = torch.tensor([[[offset, offset], [offset, offset + 1]]], device=device, requires_grad=True)
+        before = logits.detach().clone()
+        index = torch.tensor([[[0, 0], [0, 0]]], device=device) if multi_index else torch.tensor([[0, 0]], device=device)
+        scores = selective_log_softmax(logits, index)
+        gradient = torch.autograd.grad(scores.sum(), logits)[0]
+        expected_scores = []
+        expected_gradients = []
+        count = 2 if multi_index else 1
+        for row in before[0].tolist():
+            maximum = max(row)
+            weights = [math.exp(value - maximum) for value in row]
+            total = math.fsum(weights)
+            score = row[0] - maximum - math.log(total)
+            expected_scores.append([score] * count if multi_index else score)
+            expected_gradients.append([count * (1 - weights[0] / total), -count * weights[1] / total])
+        torch.testing.assert_close(scores.cpu(), torch.tensor([expected_scores]), atol=1e-6, rtol=0)
+        torch.testing.assert_close(gradient.cpu(), torch.tensor([expected_gradients]), atol=1e-6, rtol=0)
+        assert torch.equal(logits.detach(), before)
+
     @pytest.mark.parametrize("dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16])
     def test_selective_log_softmax(self, dtype):
         """Test selective_log_softmax with logits of different dtypes"""
