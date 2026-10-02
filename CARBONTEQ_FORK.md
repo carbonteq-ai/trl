@@ -1,9 +1,15 @@
 # CarbonTeq TRL fork ledger
 
-Candidate distribution version is `1.12.0.post14` (unpublished); remote releases
-checked2026-10-02 currently end at `carbonteq-v1.12.0.post13`. No tag, release,
-index promotion or consumer-pin adoption of post14 is claimed. R129 qualifies
+Candidate distribution version `1.12.0.post14` is published as the GitHub
+prerelease `carbonteq-v1.12.0.post14`, immutable source commit
+`09312dd1d96603587d1a24c3b714836cf67400f1` (2026-10-02). R129 qualifies
 the corrected Posttrain provenance contract and this candidate version together.
+Posttrain-owned development-index publication is a separate gate; no stable
+promotion or consumer-pin adoption is claimed. Retained GitHub asset digests:
+wheel `ef77a1f07154d3958d9f32eb90d2ce01e16048ff5d7e33bbf5be9e215666dc40`,
+sdist `ed6a99c71f950af7147367ec582fda65f7cf22933460c86b73b7aadeabbac2dd`.
+The release tag and retained assets must not be rewritten; subsequent fixes use
+a new version. Later historical candidate entries describe their original state.
 
 ## Candidate: mixed PEFT checkpoint restoration (2026-10-02)
 
