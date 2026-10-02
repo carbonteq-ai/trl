@@ -76,6 +76,37 @@ class _BaseTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self._send_telemetry()
 
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        """Restore PEFT's root default adapter alongside subdirectory adapters.
+
+        Transformers 5.14 only loads subdirectories when any adapter subdir
+        exists. PEFT saves ``default`` at the root, so a frozen ``ref`` subdir
+        otherwise causes the trained policy weights to be silently skipped.
+        Keep native state loading and supplement only that mixed layout.
+        """
+        target = self.model if model is None else model
+        checkpoint = Path(resume_from_checkpoint)
+        root_adapter = any((checkpoint / name).is_file() for name in (
+            "adapter_model.safetensors", "adapter_model.bin",
+        ))
+        sub_adapters = any(
+            child.is_dir() and any((child / name).is_file() for name in (
+                "adapter_model.safetensors", "adapter_model.bin",
+            )) for child in checkpoint.iterdir()
+        ) if checkpoint.is_dir() else False
+        repair_root = (is_peft_model(target) and root_adapter and sub_adapters
+                       and "default" in target.peft_config
+                       and not any((checkpoint / name).is_file() for name in (
+                           "model.safetensors", "pytorch_model.bin",
+                           "model.safetensors.index.json", "pytorch_model.bin.index.json",
+                       ))
+                       and not self.is_fsdp_enabled and not self.is_deepspeed_enabled)
+        super()._load_from_checkpoint(resume_from_checkpoint, model=model)
+        if repair_root:
+            active = target.active_adapter
+            target.load_adapter(resume_from_checkpoint, "default", is_trainable="default" in target.active_adapters)
+            target.set_adapter(active)
+
     def _send_telemetry(self):
         # Only send from rank 0 to avoid multiplying pings by world size, and skip CI runs so automated tests don't
         # bias the data. Honors `HF_HUB_DISABLE_TELEMETRY=1` and `HF_HUB_OFFLINE=1` (handled by `send_telemetry`).

@@ -1,5 +1,83 @@
 # CarbonTeq TRL fork ledger
 
+Candidate distribution version is `1.12.0.post14` (unpublished); remote releases
+checked2026-10-02 currently end at `carbonteq-v1.12.0.post13`. No tag, release,
+index promotion or consumer-pin adoption of post14 is claimed. R129 qualifies
+the corrected Posttrain provenance contract and this candidate version together.
+
+## Candidate: mixed PEFT checkpoint restoration (2026-10-02)
+
+The same unpublished `codex/hf-sampled-policy-scores` checkout now supplements
+native Transformers5.14 checkpoint loading for PEFT's mixed layout: `default`
+at the root plus named adapters such as `ref/` in subdirectories. The native
+loader scans subdirectories and skips the root when any subadapter exists.
+`trl/trainer/base_trainer.py::_load_from_checkpoint` retains native loading and
+then restores the root default adapter, preserving active/trainable selection.
+It does not intervene in FSDP, DeepSpeed or full-model checkpoint loading.
+`tests/test_peft_checkpoint_layout.py` reproduces saved policy/reference state
+with an offline tiny GPT2 model and verifies exact weights and trainability.
+The CPU regression passes in Torch2.13cu130, Transformers5.14.1, PEFT0.19.1.
+GPU continuation and final immutable consumer adoption remain separate gates.
+This is a generic checkpoint-layout fix, not a loss or recipe change. Retire
+the supplement when the supported Transformers loader restores both locations.
+R126 native BF16 LFM2.5-2.6B continuation now exits0 with132 tensors (policy,
+optimizer, scheduler, RNG, frozen scores) and retained native evidence/credit/
+correction exactly matching the uninterrupted second update. This is a bounded
+diagnostic against a historical identity; final Posttrain qualification must use
+the strengthened inherited-source fingerprint. No fork commit, distribution
+publication or dependency-pin update is claimed.
+All5 focused fork regressions subsequently pass using pytest in the exact
+qualification image (offline CPU container,6.18s):
+`python -m pytest -c /dev/null tests/test_grpo_generation_logprobs.py
+tests/test_peft_checkpoint_layout.py -q`. Final post14 rerun passes5 tests in5.77s.
+R129's strengthened-identity native precision/packing/schedule/recovery suite
+exits0 over retained informative2.6B evidence. All four branches pass two applied
+updates, independent objective/gradient/clipping references and exact full-state
+continuation. BF16 records1/records2 saved adapters match exactly at both update
+boundaries; the full-population continuation compares164 tensors exactly.
+This does not qualify fresh all-FP16 collection, distributed execution or active
+SAMPO. R128's sampler-provenance rejection remains retained negative evidence.
+
+## Candidate: opt-in Transformers sampled-score receipts (2026-10-02)
+
+Unpublished branch `codex/hf-sampled-policy-scores`, based on maintained commit
+`d97a2cf619f94c7076a720116d75f85dfd62382b`; upstream ancestry and remotes remain
+those recorded below. The clean candidate worktree is
+`/home/hammad/projects/trl-engine-generation`. Current upstream GRPO source also
+returns `None` for regular Transformers generation log probabilities; a source
+and issue/PR search found no directly reusable opt-in receipt path.
+
+`trl/trainer/grpo_trainer.py::_generate_single_turn` accepts the keyword-only
+`return_generation_logprobs=False`. Opting in retains processed generation
+scores and gathers the actual sampled token's FP32 log-softmax value after
+temperature/processors/warpers, with the same EOS mask as token IDs. The default
+path preserves its tensor generation result and returns no scores. Continuous
+batching rejects the unsupported receipt request. vLLM keeps its existing native
+receipts. This is a trace transport capability, not an objective or recipe change.
+
+`tests/test_grpo_generation_logprobs.py` covers unequal EOS lengths, masked-out
+vocabulary logits, independent score normalization in BF16/FP16/FP32, default
+behavior and continuous-batching rejection. Focused command from this checkout:
+`python -m pytest tests/test_grpo_generation_logprobs.py -q` (four pass in the
+isolated Posttrain native runtime). Fresh real-model GPU generation/training and
+native-trace integration remain release gates. Score retention temporarily holds
+one vocabulary score tensor per generation step; qualify bounded token/batch
+budgets before production use. Rebase this opt-in against the regular generation
+and EOS extraction boundary, and retire it when upstream exposes equivalent
+aligned processed-score receipts. No dependency pin or published release changes.
+
+Fresh GPU transport qualification subsequently passes in Posttrain revision 36:
+ordinary candidate TRL jobs collect native AutomationBench episodes, execute
+three optimizer slots and save three verified checkpoints each. BF16 uses
+LFM2.5 Thinking commit 95053d21d8e0b7ca99421a2127ae39c64f685ff3; FP16 uses
+LFM2.5 Instruct df58c174f05ff733f83f8cae10ea9298224c8006, LoRA rank 8/alpha 16,
+two-episode groups and 256 tokens per turn. Thinking truncates all episodes;
+Instruct succeeds on all episodes. Thus all GRPO advantages/gradients are zero:
+generation/trace/checkpoint transport passes, productive learning and resume
+remain open. These are different variants, not a precision-parity comparison.
+Receipts and exact source archives live outside Git under Posttrain's
+fresh-trl-job-r36 qualification directory; the consumer plan records hashes.
+
 This ledger records the maintained, generally reusable delta between
 `carbonteq-ai/trl` and `huggingface/trl`. Model selections, environment policy,
 job configuration, and qualification evidence remain in the consuming

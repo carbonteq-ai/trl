@@ -2306,7 +2306,14 @@ class GRPOTrainer(_BaseTrainer):
             multimodal_fields = {}
         return prompt_ids, images, multimodal_fields
 
-    def _generate_single_turn(self, prompt_ids, images, multimodal_fields, has_tool_images=False):
+    def _generate_single_turn(
+        self, prompt_ids, images, multimodal_fields, has_tool_images=False, *, return_generation_logprobs=False
+    ):
+        # Native trace consumers need the processed distribution that actually
+        # sampled each token, including temperature and sampling warpers.
+        # Keep score retention opt-in: the default trainer does not need it.
+        if return_generation_logprobs and self.use_transformers_continuous_batching:
+            raise ValueError("sampled generation logprobs are not supported with Transformers continuous batching")
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
@@ -2400,9 +2407,14 @@ class GRPOTrainer(_BaseTrainer):
                 torch.no_grad(),
                 self._dist.summon_full_params(self.model_wrapped, recurse=False),
             ):
-                prompt_completion_ids = unwrapped_model.generate(
-                    **generate_inputs, generation_config=self.generation_config
+                score_options = (
+                    {"return_dict_in_generate": True, "output_scores": True}
+                    if return_generation_logprobs else {}
                 )
+                generated = unwrapped_model.generate(
+                    **generate_inputs, generation_config=self.generation_config, **score_options
+                )
+                prompt_completion_ids = generated.sequences if return_generation_logprobs else generated
             # Compute prompt length and extract completion ids
             prompt_length = generate_inputs["input_ids"].size(1)
             completion_ids = prompt_completion_ids[:, prompt_length:]
@@ -2416,7 +2428,23 @@ class GRPOTrainer(_BaseTrainer):
             completion_ids = [
                 c[m].tolist() for c, m in zip(completion_ids.cpu(), completion_mask.bool().cpu(), strict=True)
             ]
-            logprobs = None  # not used in this case
+            logprobs = None  # not used by the default trainer
+            if return_generation_logprobs:
+                if len(generated.scores) != prompt_completion_ids.size(1) - prompt_length:
+                    raise ValueError("generation scores are not aligned with generated tokens")
+                # Scores are post-processor/post-warper logits. Normalize those
+                # exact values in FP32; do not rescore with the training model.
+                sampled_scores = [
+                    scores.float().log_softmax(-1).gather(
+                        1, prompt_completion_ids[:, prompt_length + step].unsqueeze(1)
+                    ).squeeze(1)
+                    for step, scores in enumerate(generated.scores)
+                ]
+                sampled = torch.stack(sampled_scores, dim=1)
+                logprobs = [
+                    row[mask].tolist()
+                    for row, mask in zip(sampled.cpu(), completion_mask.bool().cpu(), strict=True)
+                ]
 
         return completion_ids, logprobs
 
