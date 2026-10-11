@@ -1570,13 +1570,16 @@ class DPOTrainer(_BaseTrainer):
                 )
 
             elif loss_type == "sft":
-                chosen_logits, _ = shift_logits.chunk(2, dim=0)
-                chosen_labels, _ = shift_labels.chunk(2, dim=0)
+                # Mean token negative log-likelihood over the chosen completion tokens. This equals
+                # `F.cross_entropy(chosen_logits[chosen_mask], chosen_labels[chosen_mask])`, but reuses the already
+                # gathered per-token log-probabilities (non-completion tokens are zeroed above) instead of copying the
+                # full-vocabulary chosen logits and their gradient, which dominated peak memory on long sequences.
+                chosen_per_token_logps, _ = per_token_logps.chunk(2, dim=0)
                 chosen_mask, _ = shift_completion_mask.chunk(2, dim=0)
-                batch_loss = F.cross_entropy(chosen_logits[chosen_mask.bool()], chosen_labels[chosen_mask.bool()])
+                batch_loss = -chosen_per_token_logps.sum() / chosen_mask.sum().clamp_min(1)
                 # Implementation convenience: expand the scalar SFT loss to a per-sequence tensor so it matches the
                 # shape of other losses; only the mean is used, so this is a no-op numerically.
-                per_sequence_loss = batch_loss.expand(chosen_logits.size(0))
+                per_sequence_loss = batch_loss.expand(chosen_per_token_logps.size(0))
 
             elif loss_type == "sigmoid_norm":
                 chosen_mask, rejected_mask = completion_mask.chunk(2, dim=0)

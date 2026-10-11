@@ -1,6 +1,16 @@
 # CarbonTeq TRL fork ledger
 
-Candidate distribution version `1.12.0.post14` is published as the GitHub
+Candidate distribution version `1.12.0.post15` is post14 plus one change: a
+memory-efficient DPO `sft` loss term (below). Branch `codex/dpo-sft-logps`
+starts at `092a8a01` (the post14 ledger record on top of the immutable post14
+source `09312dd1d96603587d1a24c3b714836cf67400f1`); its release commit, tag
+`carbonteq-v1.12.0.post15` and retained asset digests are recorded in the
+GitHub release. The maintainer checkout's `codex/bounded-vllm-waves` branch was
+inspected for post15 (2026-10-12): it is clean, does not descend from post14,
+and its three commits beyond their merge base (upstream #6439, #6024, #6380)
+are already contained in post14, so it contributes no additional delta.
+
+Previous release: candidate distribution version `1.12.0.post14` is published as the GitHub
 prerelease `carbonteq-v1.12.0.post14`, immutable source commit
 `09312dd1d96603587d1a24c3b714836cf67400f1` (2026-10-02). R129 qualifies
 the corrected Posttrain provenance contract and this candidate version together.
@@ -10,6 +20,40 @@ wheel `ef77a1f07154d3958d9f32eb90d2ce01e16048ff5d7e33bbf5be9e215666dc40`,
 sdist `ed6a99c71f950af7147367ec582fda65f7cf22933460c86b73b7aadeabbac2dd`.
 The release tag and retained assets must not be rewritten; subsequent fixes use
 a new version. Later historical candidate entries describe their original state.
+
+## Candidate: memory-efficient DPO `sft` loss term (2026-10-12, post15)
+
+`DPOTrainer._compute_loss`'s `sft` branch (used alone, or combined with
+`sigmoid` as RPO, or in MPO) computed `F.cross_entropy` over
+`chosen_logits[chosen_mask.bool()]`. Boolean indexing copies the chosen
+completion's full-vocabulary logits, and autograd keeps that copy plus its
+gradient. On a Posttrain LFM2.5-2.6B LoRA DPO run with pairs up to ~27K
+tokens on a 96 GB RTX PRO 6000, `loss_type=["sigmoid", "sft"]` failed in the
+first backward ("Tried to allocate 10.88 GiB") while plain `sigmoid` at the
+same lengths fit.
+
+The branch now reuses `per_token_logps`, which `selective_log_softmax` already
+gathered for the DPO log-ratios and whose non-completion tokens are already
+zeroed: `-(chosen_per_token_logps.sum() / chosen_mask.sum().clamp_min(1))`.
+This is the same mean-token negative log-likelihood over chosen completion
+tokens, with the same gradient, and allocates no vocabulary-sized tensor beyond
+what the DPO term already does. `ld_alpha` only reweights the summed sequence
+log-probabilities, not `per_token_logps`, so the SFT term is unaffected by it
+(as before). The scalar is still expanded to a per-sequence tensor, so
+`use_weighting` (WPO) and loss weights behave as before. One edge case differs:
+a batch with no chosen completion tokens now yields `0` instead of
+cross-entropy's `NaN`. The Liger path is unchanged: it supports one loss type
+only and has no `sft` branch.
+
+`tests/test_dpo_sft_loss.py` drives `_compute_loss` with fixed random logits
+and checks: loss and logits gradient equal the previous cross-entropy formula
+(float32/float64 exactly to rounding; bfloat16 within tolerance); prompt,
+padding and rejected positions receive zero gradient and do not affect the
+loss; `["sigmoid", "sft"]` with weights `[1.0, 0.25]` equals sigmoid plus the
+weighted reference NLL; and, using a dispatch-mode counter, adding the `sft`
+term creates no additional vocabulary-sized tensors (this last check fails on
+post14: 58,793 vs 44,141 vocabulary elements). Retire the change when upstream
+computes the DPO SFT term from gathered log-probabilities.
 
 ## Candidate: mixed PEFT checkpoint restoration (2026-10-02)
 
